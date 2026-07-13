@@ -1,4 +1,4 @@
-# 13. Preserving invoke identity across Snapshot/Restore, and resuming a real invocation instead of declaring it dead
+# 14. Preserving invoke identity across Snapshot/Restore, and resuming a real invocation instead of declaring it dead
 
 Date: 2026-07-13
 

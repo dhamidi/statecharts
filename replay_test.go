@@ -644,8 +644,8 @@ func TestRehydrateSuppressesInvokeStartAndSignalsCommErrorForMidInvokeState(t *t
 	}
 }
 
-// TestRestoreReconstructsActiveInvokeBookkeeping is ADR 0013 Gap 1's most
-// direct test: Restore alone -- not Rehydrate -- never calls
+// TestRestoreReconstructsActiveInvokeBookkeeping is the most direct test of
+// Snapshot.ActiveInvokes: Restore alone -- not Rehydrate -- never calls
 // enterStates/processInvokes, so ip.invokesByID/ip.activeInvokes can only be
 // populated here from snap.ActiveInvokes itself.
 func TestRestoreReconstructsActiveInvokeBookkeeping(t *testing.T) {
@@ -702,14 +702,13 @@ func TestRestoreReconstructsActiveInvokeBookkeeping(t *testing.T) {
 	}
 }
 
-// TestRehydrateResolvesInvokeCapturedInCheckpointWithNoLogToReplay reproduces
-// ADR 0013's Gap 1 exactly: a checkpoint captured while an invoke is
-// genuinely running, with nothing about entering the invoking state or
-// starting the invoke ever written to the log, so replaying from the
-// checkpoint's Seq+1 replays nothing at all. Before Snapshot.ActiveInvokes
-// existed, this left ip.invokesByID empty after Restore and the invocation
-// stuck forever, waiting on a done.invoke nothing would ever generate. This
-// is the regression test for that bug.
+// TestRehydrateResolvesInvokeCapturedInCheckpointWithNoLogToReplay covers a
+// checkpoint captured while an invoke is genuinely running, with nothing
+// about entering the invoking state or starting the invoke ever written to
+// the log, so replaying from the checkpoint's Seq+1 replays nothing at all.
+// Without Snapshot.ActiveInvokes, ip.invokesByID would be empty after
+// Restore, leaving the invocation stuck forever, waiting on a done.invoke
+// nothing would ever generate.
 func TestRehydrateResolvesInvokeCapturedInCheckpointWithNoLogToReplay(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
