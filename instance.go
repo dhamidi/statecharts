@@ -169,6 +169,9 @@ func (in *Instance) run() {
 	if !in.ip.restored {
 		in.ip.start()
 	}
+	if !in.ip.running {
+		in.ip.exitInterpreter()
+	}
 	in.publishConfig()
 	close(in.readyCh)
 
@@ -199,6 +202,9 @@ func (in *Instance) run() {
 		}
 		if in.ip.running {
 			in.ip.runToStable()
+		}
+		if !in.ip.running {
+			in.ip.exitInterpreter()
 		}
 		in.publishConfig()
 

@@ -357,3 +357,74 @@ func TestInterpreterTopLevelFinalStops(t *testing.T) {
 		t.Fatalf("expected running=false after entering top-level final state")
 	}
 }
+
+// SCXML Appendix D's exitInterpreter() procedure requires every state still
+// in the configuration -- not just the one whose entry flipped running to
+// false -- to run its onexit handlers, in exit order, once the machine
+// stops. A parallel region untouched by the transition into the top-level
+// final state is exactly the case a naive "just stop the loop"
+// implementation misses.
+func TestInterpreterExitInterpreterRunsRemainingOnExit(t *testing.T) {
+	var exitOrder []Identifier
+	record := func(id Identifier) ActionFunc {
+		return func(ec ExecContext) error {
+			exitOrder = append(exitOrder, id)
+			return nil
+		}
+	}
+
+	chart, err := Build(
+		Compound("root", "running",
+			Children(
+				Parallel("running",
+					Children(
+						Compound("a", "a1",
+							Children(
+								Atomic("a1", On("go", Target("aDone"))),
+								Final("aDone"),
+							),
+						),
+						Compound("b", "b1",
+							Children(
+								Atomic("b1", OnExit(record("b1"))),
+							),
+							OnExit(record("b")),
+						),
+					),
+					OnExit(record("running")),
+				),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	ip.enqueue(Event{Name: "go", Type: EventExternal})
+	ip.processNextExternal()
+
+	// Region "a" reached its final state, but "running" (parallel) isn't
+	// done since region "b" is still in "b1" -- nothing should have exited
+	// yet.
+	if len(exitOrder) != 0 {
+		t.Fatalf("exitOrder = %v, want empty -- chart is still running", exitOrder)
+	}
+	if !ip.running {
+		t.Fatalf("expected running=true; only one of two parallel regions reached final")
+	}
+
+	ip.running = false
+	ip.exitInterpreter()
+
+	want := []Identifier{"b1", "b", "running"}
+	if len(exitOrder) != len(want) {
+		t.Fatalf("exitOrder = %v, want %v", exitOrder, want)
+	}
+	for i, id := range want {
+		if exitOrder[i] != id {
+			t.Fatalf("exitOrder = %v, want %v", exitOrder, want)
+		}
+	}
+}

@@ -61,11 +61,15 @@ func TestInstanceBasicLifecycle(t *testing.T) {
 }
 
 func TestInstanceSendStopOrdering(t *testing.T) {
+	var enteredB bool
 	chart, err := Build(
 		Compound("m", "a",
 			Children(
 				Atomic("a", On("go", Target("b"))),
-				Atomic("b"),
+				Atomic("b", OnEntry(Action(func(d *struct{}, ec ExecContext) error {
+					enteredB = true
+					return nil
+				}))),
 			),
 		),
 	)
@@ -73,14 +77,17 @@ func TestInstanceSendStopOrdering(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil)
+	in := New(chart, &struct{}{})
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
 	// Send then immediately Stop: FIFO ordering through the same ingress
-	// path guarantees the Send's effect lands before Stop takes hold.
+	// path guarantees the Send's effect lands before Stop takes hold. Once
+	// Stop takes hold, exitInterpreter empties the configuration (SCXML
+	// Appendix D), so "b" was reached is checked via a side effect of
+	// entering it, not via a post-Stop Configuration() snapshot.
 	if err := in.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -91,8 +98,85 @@ func TestInstanceSendStopOrdering(t *testing.T) {
 		t.Fatalf("Wait: %v", err)
 	}
 
-	if !hasState(in.Configuration(), "b") {
-		t.Fatalf("configuration = %v, want 'b' (Send should be processed before Stop)", in.Configuration())
+	if !enteredB {
+		t.Fatalf("expected 'b' to have been entered before Stop took hold")
+	}
+}
+
+func TestInstanceStopRunsOnExitForRemainingStates(t *testing.T) {
+	var exited bool
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a", OnExit(Action(func(d *struct{}, ec ExecContext) error {
+					exited = true
+					return nil
+				}))),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, &struct{}{})
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if !exited {
+		t.Fatalf("Stop() must run onexit for every state still active (SCXML Appendix D exitInterpreter), but it did not run")
+	}
+}
+
+func TestInstanceNaturalTerminationRunsOnExitForRemainingStates(t *testing.T) {
+	// The chart's root StateSpec plays the role of SCXML's own <scxml>
+	// wrapper element -- never itself a member of the configuration (see
+	// interpretation.start(), which stops addAncestorStatesToEnter before
+	// reaching it) -- so "done" must be a direct child of root for
+	// reaching it to flip running to false at all; "app" is the
+	// intermediate, real ancestor whose onexit must still fire once it
+	// does.
+	var exitedApp, exitedFinal bool
+	chart, err := Build(
+		Compound("root", "app",
+			Children(
+				Compound("app", "a",
+					Children(
+						Atomic("a", On("go", Target("done"))),
+					),
+					OnExit(Action(func(d *struct{}, ec ExecContext) error {
+						exitedApp = true
+						return nil
+					})),
+				),
+				Final("done", OnExit(Action(func(d *struct{}, ec ExecContext) error {
+					exitedFinal = true
+					return nil
+				}))),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, &struct{}{})
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := in.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if err := in.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !exitedApp || !exitedFinal {
+		t.Fatalf("reaching a top-level final state must run onexit for every remaining active state (app=%v, done=%v)", exitedApp, exitedFinal)
 	}
 }
 

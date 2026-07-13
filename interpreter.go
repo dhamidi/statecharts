@@ -552,6 +552,22 @@ func (ip *interpretation) exitState(s *compiledState) {
 	delete(ip.configuration, s)
 }
 
+// exitInterpreter runs whenever running has just become false -- because a
+// top-level final state was entered, or because the caller cancelled
+// processing (Instance.Stop) -- and exits every state still left in the
+// configuration, in exit order, running each one's onexit handlers. This is
+// SCXML Appendix D's exitInterpreter() procedure: reaching a stable point
+// with running=false is not itself the end of processing, since states
+// other than the one whose entry flipped running (ancestors, and siblings
+// in an active parallel region) are typically still in the configuration
+// and their onexit content has never run. Calling this on an
+// already-empty configuration (e.g. a second, redundant call) is a no-op.
+func (ip *interpretation) exitInterpreter() {
+	for _, s := range sortDesc(ip.configuration) {
+		ip.exitState(s)
+	}
+}
+
 func (ip *interpretation) enterStates(transitions []*compiledTransition) {
 	ordered, forDefault := ip.computeEntrySet(transitions)
 	for _, s := range ordered {
