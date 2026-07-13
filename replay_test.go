@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"iter"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -561,6 +562,83 @@ func TestRehydrateWithNilLoggerDoesNotPanicOnceLive(t *testing.T) {
 	}
 	if err := in2.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestRehydrateSuppressesInvokeStartAndSignalsCommErrorForMidInvokeState
+// covers github issue #5: an <invoke> attached to a state present in the
+// restored configuration must never actually restart (its real goroutine
+// already ran once, live -- restarting it during Rehydrate's own bootstrap
+// would repeat that real-world side effect, see ADR 0010), and Rehydrate
+// must instead synthesize error.communication for it once replay catches
+// up, since there is no way to guarantee the original invocation's process
+// is still alive.
+func TestRehydrateSuppressesInvokeStartAndSignalsCommErrorForMidInvokeState(t *testing.T) {
+	ctx := context.Background()
+	log := newMemLog()
+	store := newMemSnapshotStore()
+	sessionID := SessionID("sess-invoke")
+
+	buildChart := func(t *testing.T, starts *int32, started chan struct{}) *Chart {
+		t.Helper()
+		chart, err := Build(
+			Compound("m", "a",
+				Children(
+					Atomic("a",
+						Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+							atomic.AddInt32(starts, 1)
+							if started != nil {
+								close(started)
+							}
+							<-ctx.Done()
+							return nil, nil
+						}),
+						On(string(ErrEventCommunication), Target("recovered")),
+					),
+					Atomic("recovered"),
+				),
+			),
+		)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return chart
+	}
+
+	// Live phase: the invoke genuinely starts once, entering "a" via
+	// Start's own initial-configuration bootstrap.
+	var liveStarts int32
+	started := make(chan struct{})
+	liveChart := buildChart(t, &liveStarts, started)
+	in := New(liveChart, nil)
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("live invoke never started")
+	}
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// Cold start: no checkpoint, nothing logged (entering "a" is itself the
+	// deterministic content replayed, exactly as Start's own bootstrap would
+	// produce it live) -- so Rehydrate's replay pass is just its Start call.
+	var replayStarts int32
+	replayChart := buildChart(t, &replayStarts, nil)
+	in2, err := Rehydrate(ctx, replayChart, nil, log, store, sessionID, NoopIOProcessor)
+	if err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	defer in2.Stop(ctx)
+
+	if got := atomic.LoadInt32(&replayStarts); got != 0 {
+		t.Fatalf("replay invoke start count = %d, want 0 (invoke must not restart during Rehydrate)", got)
+	}
+	if !hasState(in2.Configuration(), "recovered") {
+		t.Fatalf("configuration after Rehydrate = %v, want 'recovered' (mid-invoke error.communication must fire once replay catches up)", in2.Configuration())
 	}
 }
 

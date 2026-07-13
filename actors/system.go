@@ -445,7 +445,7 @@ func (s *System) admit(ctx context.Context, exclude *actorEntry) error {
 		return nil
 	}
 	for s.cfg.residencyLimit(s.residentCount()) {
-		victim := s.pickEvictionVictim(exclude)
+		victim := s.pickEvictionVictim(ctx, exclude)
 		if victim == nil {
 			return fmt.Errorf("actors: residency limit reached (resident=%d): %w", s.residentCount(), ErrResidencyExhausted)
 		}
@@ -477,8 +477,13 @@ func (s *System) residentCount() int {
 // evicting one would destroy it rather than hibernate it. An entry whose mu
 // is already held elsewhere (itself mid activation or eviction) is skipped
 // rather than waited on, so eviction never blocks on unrelated in-flight
-// work.
-func (s *System) pickEvictionVictim(exclude *actorEntry) *actorEntry {
+// work. An entry with at least one active <invoke> is also skipped, never
+// picked: Rehydrate cannot resume a real invocation (ADR 0010), so paging
+// one out would either strand it running orphaned or -- once Rehydrate's
+// own mid-invoke error.communication synthesis is in play -- force it into
+// recovery for no reason other than freeing up residency, rather than
+// because it actually went idle.
+func (s *System) pickEvictionVictim(ctx context.Context, exclude *actorEntry) *actorEntry {
 	s.tableMu.Lock()
 	candidates := make([]*actorEntry, 0, len(s.table))
 	for _, e := range s.table {
@@ -496,10 +501,16 @@ func (s *System) pickEvictionVictim(exclude *actorEntry) *actorEntry {
 		if !e.mu.TryLock() {
 			continue
 		}
-		if e.instance.Load() != nil {
-			return e
+		inst := e.instance.Load()
+		if inst == nil {
+			e.mu.Unlock()
+			continue
 		}
-		e.mu.Unlock()
+		if hasInvokes, err := inst.HasActiveInvokes(ctx); err != nil || hasInvokes {
+			e.mu.Unlock()
+			continue
+		}
+		return e
 	}
 	return nil
 }
@@ -689,10 +700,29 @@ func (s *System) runSweep() {
 		if !e.mu.TryLock() {
 			continue
 		}
-		if e.instance.Load() != nil {
-			if err := s.evictLocked(context.Background(), e); err != nil && s.cfg.onSweepError != nil {
+		inst := e.instance.Load()
+		if inst == nil {
+			e.mu.Unlock()
+			continue
+		}
+		// An actor with an active <invoke> is left resident regardless of
+		// idle time -- see pickEvictionVictim's own doc comment for why
+		// paging one out is never safe. A query failure is treated the same
+		// way (skip this round rather than risk evicting a possibly-active
+		// invocation), reported through the same onSweepError callback as
+		// any other sweep failure.
+		if hasInvokes, err := inst.HasActiveInvokes(context.Background()); err != nil {
+			if s.cfg.onSweepError != nil {
 				s.cfg.onSweepError(e.name, err)
 			}
+			e.mu.Unlock()
+			continue
+		} else if hasInvokes {
+			e.mu.Unlock()
+			continue
+		}
+		if err := s.evictLocked(context.Background(), e); err != nil && s.cfg.onSweepError != nil {
+			s.cfg.onSweepError(e.name, err)
 		}
 		e.mu.Unlock()
 	}

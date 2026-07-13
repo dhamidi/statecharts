@@ -1,6 +1,7 @@
 package actors
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -182,6 +183,30 @@ func buildCallerChart(sink *[]*callerModel, target statecharts.Identifier) *stat
 			*sink = append(*sink, d)
 			return d
 		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
+// buildInvokingChart returns a chart whose only state holds an <invoke>
+// that blocks until cancelled -- a stand-in for a long-running external
+// service, so a test can exercise the actor system's "don't evict while an
+// invoke is active" rule (System.pickEvictionVictim, System.runSweep)
+// without racing the invoke's own goroutine actually starting: recording it
+// in activeInvokes/invokesByID (what statecharts.Instance.HasActiveInvokes
+// observes) happens synchronously within the entering macrostep, before
+// Spawn/Start even returns.
+func buildInvokingChart() *statecharts.Chart {
+	chart, err := statecharts.Build(
+		statecharts.Atomic("invoking",
+			statecharts.Invoke(func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
+				<-ctx.Done()
+				return nil, nil
+			}),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
 	)
 	if err != nil {
 		panic(err)

@@ -3,6 +3,7 @@ package actors
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -420,6 +421,93 @@ func TestResidencyLimitEvictsLeastRecentlyActive(t *testing.T) {
 	}
 	if !testResident(sys, "a2") {
 		t.Fatalf("expected a2 resident after Tell")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestResidencyLimitNeverEvictsActorWithActiveInvoke confirms
+// pickEvictionVictim skips a durable resident actor with a running
+// <invoke>, even though it's the only eviction candidate and the least
+// recently active: Rehydrate cannot resume a real invocation (ADR 0010), so
+// paging one out and back in would strand or silently disrupt it.
+func TestResidencyLimitNeverEvictsActorWithActiveInvoke(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	clock := statecharts.NewManualClock(time.Unix(0, 0))
+
+	invokingChart := buildInvokingChart()
+	var dms []*counterModel
+	ladderChart := buildLadderChart(&dms)
+
+	sys := NewSystem(
+		WithLog(log), WithSnapshotStore(log),
+		WithMaxResident(1),
+		WithClock(clock),
+	)
+	if err := sys.Register(invokingChart); err != nil {
+		t.Fatalf("Register(invokingChart): %v", err)
+	}
+	if err := sys.Register(ladderChart); err != nil {
+		t.Fatalf("Register(ladderChart): %v", err)
+	}
+
+	if err := sys.Spawn(ctx, "invoker", invokingChart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn(invoker): %v", err)
+	}
+	inst := testInstanceFor(sys, "invoker")
+	if hasInvokes, err := inst.HasActiveInvokes(ctx); err != nil || !hasInvokes {
+		t.Fatalf("HasActiveInvokes(invoker) = (%v, %v), want (true, nil) right after Spawn", hasInvokes, err)
+	}
+
+	clock.Advance(time.Second) // distinct lastActive from "invoker"
+	err := sys.Spawn(ctx, "other", ladderChart.ID(), Durable())
+	if !errors.Is(err, ErrResidencyExhausted) {
+		t.Fatalf("Spawn(other) error = %v, want ErrResidencyExhausted (invoker is the only candidate, and it's not evictable)", err)
+	}
+	if !testResident(sys, "invoker") {
+		t.Fatalf("expected invoker to remain resident (never evicted while its invoke is active)")
+	}
+	if testResident(sys, "other") {
+		t.Fatalf("expected other to never have activated, given Spawn failed")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestIdleTimeoutNeverEvictsActorWithActiveInvoke is runSweep's counterpart
+// to TestResidencyLimitNeverEvictsActorWithActiveInvoke: an actor with a
+// running <invoke> stays resident past idleTimeout, however long the clock
+// advances.
+func TestIdleTimeoutNeverEvictsActorWithActiveInvoke(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	clock := statecharts.NewManualClock(time.Unix(0, 0))
+
+	invokingChart := buildInvokingChart()
+
+	sys := NewSystem(
+		WithLog(log), WithSnapshotStore(log),
+		WithIdleTimeout(time.Minute),
+		WithClock(clock),
+	)
+	if err := sys.Register(invokingChart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "invoker", invokingChart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if !testResident(sys, "invoker") {
+		t.Fatalf("expected invoker resident right after Spawn")
+	}
+
+	clock.Advance(2 * time.Minute) // well past idleTimeout; sweep fires synchronously
+	if !testResident(sys, "invoker") {
+		t.Fatalf("expected invoker to remain resident past idleTimeout while its invoke is still active")
 	}
 
 	if err := sys.Stop(ctx); err != nil {

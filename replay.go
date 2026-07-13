@@ -107,6 +107,14 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 		in = New(chart, datamodel, allOpts...)
 	}
 
+	// Suppressed for the whole bootstrap-plus-replay pass below, exactly
+	// like real IOProcessor dispatch and real Logger writes: entering an
+	// invoking state is deterministic replay of history and must still
+	// update activeInvokes/invokesByID (see startInvoke's own gate in
+	// instance.go), but actually starting the invocation's goroutine would
+	// repeat a real-world side effect that already happened once, live.
+	in.suppressInvoke.Store(true)
+
 	if err := in.Start(ctx); err != nil {
 		return nil, fmt.Errorf("statecharts: Rehydrate: start: %w", err)
 	}
@@ -120,6 +128,28 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 		}
 	}
 
+	in.suppressInvoke.Store(false)
 	gate.goLive()
+
+	// Whichever invocations are still active once replay catches up were
+	// running, or had been started and not yet cancelled, at the moment
+	// this session stopped being driven -- by definition, any event such an
+	// invocation had actually delivered by then is already in the log and
+	// was just replayed above. What Rehydrate cannot do is resume the
+	// invocation itself (ADR 0010) or confirm its external process survived
+	// the restart, so each one gets the same error.communication SCXML
+	// would give a communication failure, letting the chart's own
+	// <invoke>/<finalize> handling decide what to do next -- e.g. retry, or
+	// transition out of the invoking state -- rather than silently leaving
+	// it looking alive.
+	for _, id := range sortedInvokeIDs(in.ip.invokesByID) {
+		_ = in.Send(ctx, Event{
+			Name:     ErrEventCommunication,
+			Type:     EventPlatform,
+			InvokeID: id,
+			Data:     fmt.Errorf("statecharts: Rehydrate: invoke %q was active before restart; its continuation cannot be guaranteed", id),
+		})
+	}
+
 	return in, nil
 }

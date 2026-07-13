@@ -25,6 +25,14 @@ type Instance struct {
 	started     atomic.Bool
 	config      atomic.Pointer[[]Identifier]
 	terminalErr atomic.Pointer[error]
+
+	// suppressInvoke, while true, makes startInvoke record an invocation's
+	// bookkeeping (activeInvokes/invokesByID, via the interpreter core)
+	// without actually starting its real goroutine -- Rehydrate sets this
+	// for the whole bootstrap-plus-replay pass, so reconstructing history
+	// never re-triggers a real-world <invoke> side effect a second time
+	// (see replay.go). Untouched (always false) outside Rehydrate.
+	suppressInvoke atomic.Bool
 }
 
 type actorReqKind uint8
@@ -34,14 +42,16 @@ const (
 	reqStop
 	reqTimerFired
 	reqSnapshot
+	reqActiveInvokes
 )
 
 type actorRequest struct {
-	kind    actorReqKind
-	event   Event
-	fn      func()        // reqTimerFired only
-	reply   chan error    // reqSend/reqStop
-	snapOut chan Snapshot // reqSnapshot only
+	kind       actorReqKind
+	event      Event
+	fn         func()        // reqTimerFired only
+	reply      chan error    // reqSend/reqStop
+	snapOut    chan Snapshot // reqSnapshot only
+	invokesOut chan bool     // reqActiveInvokes only
 }
 
 // Option configures an Instance built by New or Restore.
@@ -181,6 +191,19 @@ const invokeIncomingBuffer = 16
 // returns generates neither done.invoke nor error.communication, per SCXML
 // 6.4.3.
 func (in *Instance) startInvoke(id Identifier, spec *compiledInvoke, params any) (cancel func(), incoming chan<- Event) {
+	// Rehydrate flips suppressInvoke for its whole bootstrap-plus-replay
+	// pass: entering an invoking state is deterministic replay of history
+	// (see enterState/processInvokes), so it must still happen -- and
+	// beginInvoke's caller still records the resulting runningInvoke in
+	// activeInvokes/invokesByID exactly as a live run would -- but actually
+	// starting spec.start's goroutine would repeat a real-world side effect
+	// that already happened once, live (ADR 0010). A no-op cancel and nil
+	// incoming are indistinguishable, from the interpreter core's side, from
+	// an invocation that simply never receives any "#_<invokeid>" traffic.
+	if in.suppressInvoke.Load() {
+		return func() {}, nil
+	}
+
 	ctx, cancelFn := context.WithCancel(context.Background())
 	inbound := make(chan Event, invokeIncomingBuffer)
 	io := InvokeIO{
@@ -289,6 +312,7 @@ func (in *Instance) run() {
 		}
 
 		var snapOut chan Snapshot
+		var invokesOut chan bool
 		switch req.kind {
 		case reqStop:
 			in.ip.running = false
@@ -303,6 +327,8 @@ func (in *Instance) run() {
 			}
 		case reqSnapshot:
 			snapOut = req.snapOut
+		case reqActiveInvokes:
+			invokesOut = req.invokesOut
 		}
 		for in.ip.running && in.ip.processNextExternal() {
 		}
@@ -316,6 +342,9 @@ func (in *Instance) run() {
 
 		if snapOut != nil {
 			snapOut <- in.buildSnapshot()
+		}
+		if invokesOut != nil {
+			invokesOut <- len(in.ip.invokesByID) > 0
 		}
 
 		// Reply only after the resulting macrostep(s) are fully processed
@@ -422,6 +451,34 @@ func (in *Instance) Configuration() []Identifier {
 		return *p
 	}
 	return nil
+}
+
+// HasActiveInvokes reports whether at least one <invoke> currently belongs
+// to this Instance's active configuration -- true for as long as its
+// invoking state remains entered, regardless of whether the invoked service
+// itself has already finished (SCXML 6.4.2: cancellation on state exit, not
+// on the service's own completion, is what ends an invocation). Snapshot
+// and Rehydrate cannot capture or restart a real invocation (ADR 0010), so
+// the actors package uses this to avoid paging out (and later Rehydrating)
+// an actor while one is running -- see System's eviction paths.
+func (in *Instance) HasActiveInvokes(ctx context.Context) (bool, error) {
+	req := actorRequest{kind: reqActiveInvokes, invokesOut: make(chan bool, 1)}
+	if err := in.submit(ctx, req); err != nil {
+		return false, err
+	}
+	select {
+	case v := <-req.invokesOut:
+		return v, nil
+	case <-in.doneCh:
+		select {
+		case v := <-req.invokesOut:
+			return v, nil
+		default:
+			return false, ErrInstanceStopped
+		}
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
 }
 
 // Err returns the sticky terminal error, or nil while the instance is

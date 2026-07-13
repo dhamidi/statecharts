@@ -707,6 +707,15 @@ The child's own `Send(name, statecharts.SendOptions{Target: "#_parent"})`
 reaches back into the invoking chart, tagged with the invocation's ID —
 the special `"#_parent"` target SCXML's Event I/O Processor defines.
 
+An invocation is a real-world side effect, so `Rehydrate` never restarts
+one: a state's `<invoke>` still counts as active for as long as that
+state stays in the restored configuration, but `Rehydrate` delivers
+`error.communication` for it instead of actually running it again, since
+there's no way to guarantee the original invocation's process survived
+the restart. An actor system built on `actors.System` also never pages
+out an actor with an active invocation — see
+[Automatic paging](#automatic-paging).
+
 </details>
 
 ### Persistence
@@ -737,7 +746,9 @@ in, err := statecharts.Rehydrate(ctx, chart, myDatamodel, log, snapshotStore, se
 `Rehydrate` loads the latest checkpoint if one exists, to avoid replaying
 from the very first message, then replays everything since. Real dispatch
 through the `IOProcessor` is suppressed until replay catches up, so
-reconstructing state never repeats a real-world effect.
+reconstructing state never repeats a real-world effect — and an `<invoke>`
+attached to a restored state is never actually restarted either, for the
+same reason (see [Invoke](#invoke)).
 
 </details>
 
@@ -1022,6 +1033,12 @@ to rebuild itself from, so evicting one from memory would destroy it
 rather than hibernate it; `actors` keeps non-durable actors resident for
 as long as the system itself runs, which is the right behavior for
 something meant to always be around, like a `"notifier"` singleton.
+
+A durable actor with an active `<invoke>` is likewise never paged out,
+by idle timeout or by residency pressure, however long it has been idle:
+`Rehydrate` cannot resume a real invocation on page-in (see
+[Invoke](#invoke)), so eviction leaves it resident until that invocation's
+owning state exits on its own.
 
 ### A full example
 
