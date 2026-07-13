@@ -121,6 +121,6 @@ func (p *routingProcessor) Cancel(ctx context.Context, sendID statecharts.Identi
 // namespace is not something routingProcessor itself knows.
 func (p *routingProcessor) IOProcessors() []statecharts.IOProcessorInfo {
 	return []statecharts.IOProcessorInfo{
-		{Type: originTypeActors, Location: string(p.self)},
+		{Type: originTypeActors, Location: statecharts.LocationFromIdentifier(p.self)},
 	}
 }

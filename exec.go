@@ -80,14 +80,15 @@ func (ec ExecContext) IOProcessors() []IOProcessorInfo {
 // IOProcessors(), the common case of wanting one specific processor's own
 // address (e.g. to embed in outgoing event data so a peer can reply) --
 // callers don't need to write that lookup loop themselves. ok is false if no
-// processor of that Type is advertised.
-func (ec ExecContext) IOProcessorLocation(typ Identifier) (location string, ok bool) {
+// processor of that Type is advertised, in which case location is the zero
+// Location.
+func (ec ExecContext) IOProcessorLocation(typ Identifier) (location Location, ok bool) {
 	for _, info := range ec.IOProcessors() {
 		if info.Type == typ {
 			return info.Location, true
 		}
 	}
-	return "", false
+	return Location{}, false
 }
 
 // Send schedules delivery of an event, mirroring <send>: immediately (if

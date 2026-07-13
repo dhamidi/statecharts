@@ -57,7 +57,7 @@ type IOProcessor interface {
 // session through that processor.
 type IOProcessorInfo struct {
 	Type     Identifier
-	Location string
+	Location Location
 }
 
 // IOProcessorDescriber is implemented by an IOProcessor that has an address

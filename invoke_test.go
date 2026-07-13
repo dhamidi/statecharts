@@ -780,7 +780,7 @@ func TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry(t *testing.
 		t.Fatalf("Build(child): %v", err)
 	}
 
-	baseIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://base"}}}
+	baseIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://base")}}}
 	parentChart, err := Build(
 		Compound("m", "a",
 			Children(
@@ -801,7 +801,7 @@ func TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry(t *testing.
 
 	select {
 	case got := <-seen:
-		if len(got) != 1 || got[0].Type != "mock" || got[0].Location != "mock://base" {
+		if len(got) != 1 || got[0].Type != "mock" || got[0].Location.String() != "mock://base" {
 			t.Fatalf("child ExecContext.IOProcessors() = %v, want [{mock mock://base}] (baseIO's entries, no synthetic #_parent entry)", got)
 		}
 	case <-time.After(2 * time.Second):

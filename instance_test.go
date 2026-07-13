@@ -369,9 +369,22 @@ func (p *describingIOProcessor) Cancel(context.Context, Identifier) error { retu
 
 func (p *describingIOProcessor) IOProcessors() []IOProcessorInfo { return p.infos }
 
+// mustLocation parses s as a Location, failing the test immediately if s is
+// malformed -- every literal this helper is called with in this test suite
+// is a well-formed URL, so a parse failure here means the test fixture
+// itself is broken.
+func mustLocation(t *testing.T, s string) Location {
+	t.Helper()
+	loc, err := NewLocation(s)
+	if err != nil {
+		t.Fatalf("NewLocation(%q): %v", s, err)
+	}
+	return loc
+}
+
 func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
 	var gotList []IOProcessorInfo
-	var gotLocation string
+	var gotLocation Location
 	var gotOK bool
 
 	recordAndOpen := Action(func(d *Door, ec ExecContext) error {
@@ -393,7 +406,7 @@ func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://door-1"}}}
+	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://door-1")}}}
 	d := &Door{}
 	in := New(chart, d, WithIOProcessor(io))
 	ctx := context.Background()
@@ -404,10 +417,10 @@ func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	if len(gotList) != 1 || gotList[0].Type != "mock" || gotList[0].Location != "mock://door-1" {
+	if len(gotList) != 1 || gotList[0].Type != "mock" || gotList[0].Location.String() != "mock://door-1" {
 		t.Fatalf("ExecContext.IOProcessors() = %v, want [{mock mock://door-1}]", gotList)
 	}
-	if !gotOK || gotLocation != "mock://door-1" {
+	if !gotOK || gotLocation.String() != "mock://door-1" {
 		t.Fatalf("ExecContext.IOProcessorLocation(%q) = (%q, %v), want (%q, true)", "mock", gotLocation, gotOK, "mock://door-1")
 	}
 
@@ -484,7 +497,7 @@ func TestExecContextIOProcessorLocationUnknownTypeReturnsNotOK(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://door-1"}}}
+	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://door-1")}}}
 	d := &Door{}
 	in := New(chart, d, WithIOProcessor(io))
 	ctx := context.Background()

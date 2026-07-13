@@ -108,7 +108,8 @@ type locationModel struct {
 // "checked". Every datamodel value produced is appended to sink.
 func buildLocationChart(sink *[]*locationModel) *statecharts.Chart {
 	record := statecharts.Action(func(d *locationModel, ec statecharts.ExecContext) error {
-		d.Location, d.OK = ec.IOProcessorLocation(originTypeActors)
+		loc, ok := ec.IOProcessorLocation(originTypeActors)
+		d.Location, d.OK = loc.String(), ok
 		return nil
 	})
 	chart, err := statecharts.Build(

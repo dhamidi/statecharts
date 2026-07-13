@@ -471,7 +471,7 @@ func TestRehydrateIOProcessorsReportedDuringAndAfterReplay(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	liveIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://live"}}}
+	liveIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://live")}}}
 	in := New(chart, nil, WithIOProcessor(liveIO))
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -491,7 +491,7 @@ func TestRehydrateIOProcessorsReportedDuringAndAfterReplay(t *testing.T) {
 	// the replay below, not the live phase above.
 	seen = nil
 
-	replayIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://replayed"}}}
+	replayIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://replayed")}}}
 	in2, err := Rehydrate(ctx, chart, nil, log, store, sessionID, replayIO)
 	if err != nil {
 		t.Fatalf("Rehydrate: %v", err)
@@ -500,7 +500,7 @@ func TestRehydrateIOProcessorsReportedDuringAndAfterReplay(t *testing.T) {
 	// The single logged "go" event replays during Rehydrate itself, before
 	// goLive is called -- so this observation is from inside replay, while
 	// the gate is still suppressing Send/Cancel/Log.
-	if len(seen) != 1 || seen[0].Location != "mock://replayed" {
+	if len(seen) != 1 || seen[0].Location.String() != "mock://replayed" {
 		t.Fatalf("ExecContext.IOProcessors() during replay = %v, want [{mock mock://replayed}]", seen)
 	}
 
@@ -510,7 +510,7 @@ func TestRehydrateIOProcessorsReportedDuringAndAfterReplay(t *testing.T) {
 	if err := in2.Send(ctx, ev); err != nil {
 		t.Fatalf("Send (live): %v", err)
 	}
-	if len(seen) != 1 || seen[0].Location != "mock://replayed" {
+	if len(seen) != 1 || seen[0].Location.String() != "mock://replayed" {
 		t.Fatalf("ExecContext.IOProcessors() after goLive = %v, want [{mock mock://replayed}]", seen)
 	}
 
