@@ -214,6 +214,49 @@ func buildInvokingChart() *statecharts.Chart {
 	return chart
 }
 
+// buildFinishingChart returns a chart that reaches its own top-level final
+// state ("done") on "finish", for exercising the actor system's eviction of
+// an actor that has stopped on its own (System.reapFinished).
+func buildFinishingChart() *statecharts.Chart {
+	chart, err := statecharts.Build(
+		statecharts.Compound("finisher", "running",
+			statecharts.Children(
+				statecharts.Atomic("running", statecharts.On("finish", statecharts.Target("done"))),
+				statecharts.Final("done"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
+// buildDelayedFinishingChart is buildFinishingChart's counterpart for
+// reaching the final state entirely from an internal delayed <send> --
+// with delay -- rather than from an externally Told event, so a test can
+// confirm System's periodic sweep (not just its inline post-Deliver check)
+// is what eventually reaps it.
+func buildDelayedFinishingChart(delay time.Duration) *statecharts.Chart {
+	chart, err := statecharts.Build(
+		statecharts.Compound("delayedFinisher", "running",
+			statecharts.Children(
+				statecharts.Atomic("running",
+					statecharts.OnEntry(statecharts.SendEvent("finish", statecharts.SendOptions{Delay: delay})),
+					statecharts.On("finish", statecharts.Target("done")),
+				),
+				statecharts.Final("done"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
 // buildCommTestChart returns a chart that sends to an unaddressable target
 // on "go" and reacts to the resulting error.communication with an
 // observable state transition, for tests that need to see a dispatch

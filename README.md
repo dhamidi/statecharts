@@ -376,10 +376,16 @@ if err := in.Wait(ctx); err != nil {
 }
 ```
 
-No channel ever appears in this API. Internally, `Send` and `Stop` hand a
-request to the instance's own goroutine and wait for the resulting
-transition (if any) to finish processing before returning, so
-`Configuration()` is always current immediately afterward.
+No channel ever appears in this API, except `Done`, which returns the same
+channel `Wait` blocks on for a non-blocking check instead: `select { case
+<-in.Done(): default: }` reports whether the instance has already stopped
+-- a top-level final state was reached, `Stop` was called, or it
+terminated with an error -- without waiting for it.
+
+Internally, `Send` and `Stop` hand a request to the instance's own
+goroutine and wait for the resulting transition (if any) to finish
+processing before returning, so `Configuration()` is always current
+immediately afterward.
 
 A callback running inside an `Instance` (an `ActionFunc` or `CondFunc`)
 must never call `Send`, `Stop`, or `Wait` on that same instance — that
@@ -1039,6 +1045,14 @@ by idle timeout or by residency pressure, however long it has been idle:
 `Rehydrate` cannot resume a real invocation on page-in (see
 [Invoke](#invoke)), so eviction leaves it resident until that invocation's
 owning state exits on its own.
+
+An actor that reaches its own top-level final state, by contrast, is
+always freed -- durable or not, regardless of idle time or residency
+pressure -- since SCXML has no way back out of a final configuration:
+there is nothing left for it to ever do. This happens as soon as the
+system notices, which is immediately for the common case of reaching the
+final state while processing a message, and no later than the next
+`Spawn`/page-in elsewhere or idle-timeout sweep otherwise.
 
 ### A full example
 

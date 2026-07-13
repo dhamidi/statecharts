@@ -441,6 +441,12 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 // first. exclude is the entry being activated -- never itself a candidate,
 // since it is not yet resident.
 func (s *System) admit(ctx context.Context, exclude *actorEntry) error {
+	// Free, no-selection-heuristic-needed room: an actor that has already
+	// reached a top-level final configuration (or terminated with an
+	// error) needs no residency-limit pressure to justify evicting it --
+	// see reapFinished's own doc comment.
+	s.reapFinished()
+
 	if s.cfg.residencyLimit == nil {
 		return nil
 	}
@@ -468,6 +474,54 @@ func (s *System) residentCount() int {
 		}
 	}
 	return n
+}
+
+// instanceFinished reports, without blocking, whether inst's actor
+// goroutine has already exited on its own -- it reached a top-level final
+// configuration, was Stopped, or terminated with a fatal error. A chart
+// that has finished this way will never do anything else: there is nothing
+// left worth holding its Instance (and its datamodel, and its interpreter
+// state) resident for.
+func instanceFinished(inst *statecharts.Instance) bool {
+	select {
+	case <-inst.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// reapFinished frees every resident actor -- durable or not -- whose
+// Instance has already finished (see instanceFinished), immediately
+// rather than waiting for idle-timeout or residency pressure to notice.
+// Without this, an actor that reaches its own top-level final state stays
+// resident (and keeps hogging memory) forever unless something else
+// happens to evict it, since nothing else in the system ever asks whether
+// a resident actor is actually still doing anything.
+//
+// Called from admit (opportunistically, before any residency-limit
+// decision) and from runSweep (once a sweep round runs at all); the
+// overwhelmingly common case -- a chart reaching its final state while
+// processing a message -- is instead caught inline by deliver, immediately
+// after the Deliver call that (maybe) triggered it, rather than waiting for
+// either of those.
+func (s *System) reapFinished() {
+	s.tableMu.Lock()
+	entries := make([]*actorEntry, 0, len(s.table))
+	for _, e := range s.table {
+		entries = append(entries, e)
+	}
+	s.tableMu.Unlock()
+
+	for _, e := range entries {
+		if !e.mu.TryLock() {
+			continue
+		}
+		if inst := e.instance.Load(); inst != nil && instanceFinished(inst) {
+			_ = s.evictLocked(context.Background(), e)
+		}
+		e.mu.Unlock()
+	}
 }
 
 // pickEvictionVictim returns the least-recently-active durable resident
@@ -520,11 +574,23 @@ func (s *System) pickEvictionVictim(ctx context.Context, exclude *actorEntry) *a
 // then Instance.Stop -- in that order, so a crash between any two steps
 // still leaves a durable, replayable record, and so Snapshot is never
 // called on an already-stopped Instance (which would return
-// statecharts.ErrInstanceStopped). Callers must hold entry.mu and know
-// entry.durable is true.
+// statecharts.ErrInstanceStopped). Callers must hold entry.mu; for a
+// still-running entry, callers must also know entry.durable is true (the
+// snapshot/log path below has no meaning for a non-durable actor, which
+// has no Log to check it against). An entry whose Instance has already
+// finished on its own (instanceFinished) is freed the same way regardless
+// of durability, skipping Snapshot/Log entirely: there is nothing left to
+// capture that isn't already durably reflected in the Log that led here,
+// and Instance.Snapshot only works against a still-live actor goroutine
+// anyway.
 func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 	inst := entry.instance.Load()
 	if inst == nil {
+		return nil
+	}
+	if instanceFinished(inst) {
+		_ = inst.Stop(ctx)
+		entry.instance.Store(nil)
 		return nil
 	}
 	snap, err := inst.Snapshot(ctx)
@@ -617,7 +683,18 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 	}
 
 	entry.lastActive.Store(s.cfg.clock.Now().UnixNano())
-	return inst.Deliver(ctx, ev)
+	err := inst.Deliver(ctx, ev)
+
+	// The overwhelmingly common way an actor reaches its own top-level
+	// final state is by processing a message -- catching it right here,
+	// still holding entry.mu, frees it immediately rather than leaving it
+	// resident until the next admit or sweep round happens to notice (see
+	// reapFinished).
+	if instanceFinished(inst) {
+		_ = s.evictLocked(context.Background(), entry)
+	}
+
+	return err
 }
 
 // Tell delivers ev to the actor named name, paging it in first if it names
@@ -676,11 +753,17 @@ func (s *System) armSweep() {
 }
 
 // runSweep evicts every durable resident actor idle for at least
-// idleTimeout, then reschedules itself.
+// idleTimeout, then reschedules itself. It also reaps every resident actor
+// (durable or not) that has already finished on its own, regardless of
+// idle time -- the periodic-sweep counterpart to deliver's inline check and
+// admit's opportunistic one (see reapFinished), for a finished actor that
+// nothing else happens to touch again.
 func (s *System) runSweep() {
 	if s.stopped.Load() {
 		return
 	}
+	s.reapFinished()
+
 	now := s.cfg.clock.Now()
 
 	s.tableMu.Lock()

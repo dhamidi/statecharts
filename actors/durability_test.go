@@ -514,3 +514,172 @@ func TestIdleTimeoutNeverEvictsActorWithActiveInvoke(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 }
+
+// TestDurableActorReachingFinalStateIsEvictedImmediately covers github
+// issue #6: a durable actor that reaches its own top-level final state
+// while processing a Tell is freed right away -- not left resident
+// hogging memory until idle-timeout or residency pressure happens to
+// notice -- and Stop afterward reports no error for it (Instance.Snapshot
+// only works on a still-running actor, so evicting an already-finished one
+// must not go through the normal checkpoint path).
+func TestDurableActorReachingFinalStateIsEvictedImmediately(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+
+	chart := buildFinishingChart()
+	sys := NewSystem(WithLog(log), WithSnapshotStore(log))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "finisher", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if !testResident(sys, "finisher") {
+		t.Fatalf("expected finisher resident right after Spawn")
+	}
+
+	if err := sys.Tell(ctx, "finisher", statecharts.Event{Name: "finish", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+	if testResident(sys, "finisher") {
+		t.Fatalf("expected finisher evicted immediately after reaching its top-level final state")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestNonDurableActorReachingFinalStateIsEvictedImmediately is the
+// non-durable counterpart: even though non-durable actors are otherwise
+// kept resident for the system's whole lifetime (they have no Log to
+// rebuild themselves from), one that finishes on its own is still freed --
+// there is nothing left to lose by doing so.
+func TestNonDurableActorReachingFinalStateIsEvictedImmediately(t *testing.T) {
+	ctx := context.Background()
+	chart := buildFinishingChart()
+	sys := NewSystem()
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "finisher", chart.ID()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if !testResident(sys, "finisher") {
+		t.Fatalf("expected finisher resident right after Spawn")
+	}
+
+	if err := sys.Tell(ctx, "finisher", statecharts.Event{Name: "finish", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+	if testResident(sys, "finisher") {
+		t.Fatalf("expected finisher evicted immediately after reaching its top-level final state")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestSweepReapsActorThatFinishedViaInternalTimerWithNoFurtherTell
+// confirms runSweep's own reaping catches a finished actor that deliver's
+// inline check never had a chance to: one that reaches its top-level final
+// state entirely from an internal delayed <send>, with nothing ever Told
+// to it afterward.
+func TestSweepReapsActorThatFinishedViaInternalTimerWithNoFurtherTell(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	clock := statecharts.NewManualClock(time.Unix(0, 0))
+
+	chart := buildDelayedFinishingChart(30 * time.Second)
+	sys := NewSystem(
+		WithLog(log), WithSnapshotStore(log),
+		WithIdleTimeout(time.Minute),
+		WithClock(clock),
+	)
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "delayed", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	// Past the delayed send's own 30s delay, but short of idleTimeout (1m):
+	// the internal timer fires and the machine reaches "done" entirely
+	// inside the actor's own goroutine, with no System.deliver call
+	// involved at all, so it's still resident until a sweep notices.
+	// Firing the timer only enqueues onto the actor's own inbox (see
+	// actorClock.AfterFunc) -- Advance returns as soon as that enqueue
+	// succeeds, before the actor's goroutine has necessarily processed it
+	// -- so wait for Instance.Done() directly rather than racing it.
+	clock.Advance(35 * time.Second)
+	inst := testInstanceFor(sys, "delayed")
+	if inst == nil {
+		t.Fatalf("expected delayed still resident right after Advance")
+	}
+	select {
+	case <-inst.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("delayed's internal timer never fired / never reached its final state")
+	}
+	if !testResident(sys, "delayed") {
+		t.Fatalf("expected delayed still resident right after reaching its final state (nothing has reaped it yet)")
+	}
+
+	// Past idleTimeout: the periodic sweep fires and reaps it regardless
+	// of its actual idle time, since it has already finished.
+	clock.Advance(30 * time.Second)
+	if testResident(sys, "delayed") {
+		t.Fatalf("expected delayed reaped once the periodic sweep ran")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestStopDoesNotErrorForActorThatAlreadyFinished is a regression test for
+// a bug evictLocked's finished-instance fast path also fixes: before it,
+// evicting a durable actor whose Instance had already stopped on its own
+// went through the normal Snapshot-then-checkpoint path, and
+// Instance.Snapshot always fails (ErrInstanceStopped) against an
+// already-stopped Instance -- so Stop would have reported a spurious
+// failure for an actor that had simply, legitimately finished. Idle-timeout
+// sweeping is disabled here so nothing reaps the actor before Stop itself
+// does, isolating that path specifically.
+func TestStopDoesNotErrorForActorThatAlreadyFinished(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	clock := statecharts.NewManualClock(time.Unix(0, 0))
+
+	chart := buildDelayedFinishingChart(time.Second)
+	sys := NewSystem(
+		WithLog(log), WithSnapshotStore(log),
+		WithIdleTimeout(0), // disables sweeping entirely
+		WithClock(clock),
+	)
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "delayed", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	clock.Advance(2 * time.Second)
+	inst := testInstanceFor(sys, "delayed")
+	if inst == nil {
+		t.Fatalf("expected delayed resident right after Advance")
+	}
+	select {
+	case <-inst.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("delayed never reached its final state")
+	}
+	if !testResident(sys, "delayed") {
+		t.Fatalf("expected delayed still resident (sweeping disabled, nothing else has touched it)")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v, want nil (an already-finished durable actor must not error Stop)", err)
+	}
+}

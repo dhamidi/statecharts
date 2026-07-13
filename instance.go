@@ -444,6 +444,17 @@ func (in *Instance) Wait(ctx context.Context) error {
 	}
 }
 
+// Done returns a channel that's closed once the interpreter goroutine has
+// exited -- a top-level final state was reached, Stop was called, or a
+// fatal error occurred -- the same condition Wait blocks on. Unlike Wait,
+// Done never blocks by itself: it's meant for a non-blocking check (a
+// select against it with a default case) or as one case among several in a
+// larger select, e.g. an embedder deciding whether an Instance that has
+// stopped on its own is now safe to discard.
+func (in *Instance) Done() <-chan struct{} {
+	return in.doneCh
+}
+
 // Configuration returns the active state IDs as of the last completed
 // macrostep.
 func (in *Instance) Configuration() []Identifier {
