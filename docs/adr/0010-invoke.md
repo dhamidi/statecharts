@@ -1,4 +1,4 @@
-# 10. `<invoke>` as a plain Go goroutine, not a child session
+# 10. `<invoke>` as a plain Go goroutine, with child sessions built on top
 
 Date: 2026-07-13
 
@@ -49,13 +49,20 @@ interpreter.go, alongside the rest of the SCXML D algorithm it mirrors:
   cleanup (ADR/fix for `exitInterpreter`, same commit series) -- matching
   6.4.2's "cancel operation MUST act as if it were the final onexit
   handler."
-- `applyFinalize` matches an arriving event's `InvokeID` against
-  `invokesByID` and runs that invocation's finalize content before
-  `selectTransitions` ever sees the event (6.5) -- with no special
-  exemption for the synthesized `done.invoke.<id>`/`error.communication`
-  events, since 6.5 matches by invokeid alone; a finalize handler that
-  cares about payload shape must check it itself; the built-in clock
-  test in invoke_test.go does exactly this.
+- `applyInvokeSideEffects` -- run for every external event, right after
+  it's dequeued and before `selectTransitions` ever sees it -- does both
+  halves of mainEventLoop's per-invoke step in one pass over
+  `invokesByID` (already scoped to "for state in configuration", since
+  `cancelInvokes` removes an entry the instant its state exits): the
+  invocation whose `InvokeID` matches the event gets its `<finalize>`
+  content run (6.5), and every invocation configured with
+  `WithAutoForward` gets an unconditional copy of the event on its
+  `Incoming` channel (6.4.1) -- regardless of whether the event's own
+  `InvokeID` matches it, since the spec draws no such exception. A
+  finalize handler that cares about a specific payload shape must check
+  it itself (6.5 matches by invokeid alone, with no exemption for the
+  synthesized `done.invoke.<id>`); the built-in clock test in
+  invoke_test.go does exactly this.
 
 What's genuinely an actor concern, not a core-interpreter one, is spawning
 the goroutine and delivering its result back through the actor's own
@@ -65,15 +72,36 @@ inbox -- the same seam `actorClock` already uses for `<send delay="...">`.
 `interpretation` with no owning `Instance` gets a no-op runner, the same
 default posture as `NoopIOProcessor`.
 
+**A child SCXML session is additive on top of this, not a special case
+inside it.** `InvokeChart` (invoke.go) is an `InvokeFunc` like any
+other -- it just happens to spend its goroutine running a second, real
+`Instance` of another `*Chart`. It needs no new interpreter-core
+machinery because the pieces already described cover it completely: the
+child's own `Send(name, SendOptions{Target: "#_parent"})` reaches back
+into the invoking chart through `parentIOProcessor`, a small `IOProcessor`
+that recognizes Appendix C.1's `"#_parent"` special target and routes it
+to this invocation's own `InvokeIO.Deliver` -- the exact mechanism ADR
+0005 predicted ("the existing `IOProcessor`/`SendRequest`/`Dispatcher`
+design already represents arbitrary target `Identifier`s including the
+`#_parent`/`#_<invokeid>` special forms"). Autoforwarding to the child is
+the same `WithAutoForward` path any other invocation uses; `InvokeChart`
+just happens to forward what it receives on `Incoming` into `child.Send`
+instead of interpreting it itself. Cancelling the child on state exit is
+`context.Context` cancellation causing `child.Stop`, which runs the
+child's own `exitInterpreter` cleanup exactly as it would for any
+directly-driven `Instance`.
+
 ## Consequences
 
-- Only the invoking-chart-is-the-parent half of `<invoke>` exists.
-  There is still no child-SCXML-session registry, `#_parent` addressing,
-  or autoforwarding of every external event (SCXML 6.4's `autoforward`
-  attribute) -- those remain the ADR 0005 boundary, now narrower: they're
-  about *spawning and naming other chart instances*, which is a
-  deployment/actors-layer concern (see ADR 0009), not about the
-  invoke/finalize/cancel algorithm itself.
+- What's still not modeled is a *named, addressable-by-multiple-parents*
+  session registry -- an invocation's child, however it's implemented, is
+  owned by exactly the one invocation that started it, reachable only
+  through that invocation's own `InvokeID`/`"#_parent"` pair, never by a
+  session ID meaningful outside that relationship. Naming, paging, and
+  durability for a *pool* of independently-addressable chart instances
+  remain the actors-layer concern ADR 0009 describes; `InvokeChart`
+  composes with that layer (an actor's own goroutine can itself invoke
+  further children) rather than duplicating it.
 - `done.invoke.<id>` is synthesized by the interpreter on `InvokeFunc`'s
   own (non-cancelled) return, carrying whatever data it returns; a
   service that wants to signal completion with specific donedata just

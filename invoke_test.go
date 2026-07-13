@@ -435,3 +435,328 @@ func TestInvokeClockDoneEventOnFeedClose(t *testing.T) {
 		t.Fatalf("Err() = %v, want nil", err)
 	}
 }
+
+// --- Completing <invoke>: autoforward (SCXML 6.4.1) and "#_parent"
+// (Appendix C.1), including a real child SCXML session via InvokeChart. --
+
+func TestInvokeAutoForwardDeliversEveryExternalEvent(t *testing.T) {
+	received := make(chan Event, 8)
+	chart, err := Build(
+		// "a" has no transitions at all: autoforward must still copy
+		// every external event to the invocation regardless of whether
+		// the chart itself has a matching transition for it.
+		Atomic("a",
+			Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+				for {
+					select {
+					case ev, ok := <-io.Incoming:
+						if !ok {
+							return nil, nil
+						}
+						received <- ev
+					case <-ctx.Done():
+						return nil, nil
+					}
+				}
+			}, WithAutoForward()),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+
+	if err := in.Send(ctx, Event{Name: "one", Type: EventExternal, Data: 1}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if err := in.Send(ctx, Event{Name: "two", Type: EventExternal, Data: 2}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	want := []struct {
+		name Identifier
+		data int
+	}{{"one", 1}, {"two", 2}}
+	for _, w := range want {
+		select {
+		case ev := <-received:
+			if ev.Name != w.name || ev.Data != w.data {
+				t.Fatalf("forwarded event = %+v, want Name=%q Data=%d", ev, w.name, w.data)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("never received autoforwarded event %q", w.name)
+		}
+	}
+}
+
+func TestInvokeAutoForwardStopsAfterCancellation(t *testing.T) {
+	received := make(chan Event, 8)
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a",
+					Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+						for {
+							select {
+							case ev, ok := <-io.Incoming:
+								if !ok {
+									return nil, nil
+								}
+								received <- ev
+							case <-ctx.Done():
+								return nil, nil
+							}
+						}
+					}, WithAutoForward()),
+					On("go", Target("b")),
+				),
+				Atomic("b"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+
+	if err := in.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !hasState(in.Configuration(), "b") {
+		t.Fatalf("configuration = %v, want 'b'", in.Configuration())
+	}
+
+	// Whether "go" itself -- copied to the invocation as it was dequeued,
+	// before the transition it triggered was even selected -- actually
+	// got read by the invocation's own goroutine before that goroutine
+	// noticed ctx cancelled is a genuine race (Go's select makes no
+	// ordering promise between two simultaneously-ready cases), so it's
+	// deliberately not asserted here. What must be deterministic is that
+	// nothing sent after the invoking state is gone ever reaches it: by
+	// the time "after" is processed, this invocation no longer appears in
+	// invokesByID at all, so it's never even considered for forwarding,
+	// regardless of goroutine scheduling on the reading side.
+	if err := in.Send(ctx, Event{Name: "after", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	drainDeadline := time.After(200 * time.Millisecond)
+	for {
+		select {
+		case ev := <-received:
+			if ev.Name == "after" {
+				t.Fatalf("received %+v after the invoking state was exited; autoforward should have stopped", ev)
+			}
+		case <-drainDeadline:
+			return
+		}
+	}
+}
+
+// childPingPongChart is a small, complete SCXML session in its own right:
+// it greets whatever invoked it over "#_parent" on entry, and replies
+// "pong" the same way once it's forwarded a "ping".
+func childPingPongChart(t *testing.T) *Chart {
+	t.Helper()
+	chart, err := Build(
+		Compound("croot", "start",
+			Children(
+				Atomic("start",
+					OnEntry(Action(func(d *struct{}, ec ExecContext) error {
+						ec.Send("hello", SendOptions{Target: "#_parent", Data: "hi"})
+						return nil
+					})),
+					On("ping", Target("pinged")),
+				),
+				Atomic("pinged",
+					OnEntry(Action(func(d *struct{}, ec ExecContext) error {
+						ec.Send("pong", SendOptions{Target: "#_parent"})
+						return nil
+					})),
+				),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(child): %v", err)
+	}
+	return chart
+}
+
+// TestInvokeChartRoundTripsThroughParentAndAutoForward reproduces SCXML
+// 6.4's full invoking-chart-is-the-parent picture end to end: a real
+// child *Chart* is invoked as a genuine child session (InvokeChart), its
+// own <send target="#_parent"> reaches back into the parent (Appendix
+// C.1), and the parent's autoforward relays an external event down to the
+// child with no explicit "#_<invokeid>" addressing needed.
+func TestInvokeChartRoundTripsThroughParentAndAutoForward(t *testing.T) {
+	childChart := childPingPongChart(t)
+
+	parentChart, err := Build(
+		Compound("proot", "invoking",
+			Children(
+				// "invoking" (not its inner children) holds the Invoke,
+				// so the child session's lifetime spans the whole
+				// hello/ping/pong handshake -- only the final transition
+				// to "done" (which leaves "invoking" altogether) cancels
+				// it.
+				Compound("invoking", "waitingHello",
+					Children(
+						Atomic("waitingHello", On("hello", Target("waitingPong"))),
+						Atomic("waitingPong", On("pong", Target("done"))),
+					),
+					Invoke(
+						InvokeChart(childChart, func(params any) any { return &struct{}{} }, nil),
+						WithInvokeID("child"),
+						WithAutoForward(),
+					),
+				),
+				Atomic("done"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(parent): %v", err)
+	}
+
+	parent := New(parentChart, nil)
+	ctx := context.Background()
+	if err := parent.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer parent.Stop(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !hasState(parent.Configuration(), "waitingPong") {
+		if time.Now().After(deadline) {
+			t.Fatalf("configuration = %v, want 'waitingPong' after the child's #_parent 'hello'", parent.Configuration())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The parent has no transition of its own for "ping" -- it only
+	// reaches the child via autoforward, with no explicit
+	// "#_<invokeid>" addressing on the parent's part.
+	if err := parent.Send(ctx, Event{Name: "ping", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for !hasState(parent.Configuration(), "done") {
+		if time.Now().After(deadline) {
+			t.Fatalf("configuration = %v, want 'done' after the child's #_parent 'pong'", parent.Configuration())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestInvokeChartExplicitSendReachesChildWithoutAutoForward exercises the
+// other half of SCXML 6.4.4's addressing -- SendOptions{Target:
+// "#_<invokeid>"} without WithAutoForward -- against the same real child
+// session.
+func TestInvokeChartExplicitSendReachesChildWithoutAutoForward(t *testing.T) {
+	childChart := childPingPongChart(t)
+
+	parentChart, err := Build(
+		Compound("proot", "invoking",
+			Children(
+				Compound("invoking", "waitingHello",
+					Children(
+						Atomic("waitingHello",
+							On("hello", Target("waitingPong"), Then(Action(func(d *struct{}, ec ExecContext) error {
+								ec.Send("ping", SendOptions{Target: "#_child"})
+								return nil
+							}))),
+						),
+						Atomic("waitingPong", On("pong", Target("done"))),
+					),
+					Invoke(
+						InvokeChart(childChart, func(params any) any { return &struct{}{} }, nil),
+						WithInvokeID("child"),
+					),
+				),
+				Atomic("done"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(parent): %v", err)
+	}
+
+	parent := New(parentChart, &struct{}{})
+	ctx := context.Background()
+	if err := parent.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer parent.Stop(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !hasState(parent.Configuration(), "done") {
+		if time.Now().After(deadline) {
+			t.Fatalf("configuration = %v, want 'done' (hello -> explicit #_child ping -> child's #_parent pong)", parent.Configuration())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestInvokeChartCancelledOnStateExitStopsChildSession confirms the child
+// session is a real Instance subject to the same exitInterpreter cleanup
+// as any other -- cancelling the invocation must actually stop it, not
+// leave it running orphaned.
+func TestInvokeChartCancelledOnStateExitStopsChildSession(t *testing.T) {
+	childExited := make(chan struct{})
+	childChart, err := Build(
+		Atomic("only",
+			OnExit(Action(func(d *struct{}, ec ExecContext) error {
+				close(childExited)
+				return nil
+			})),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(child): %v", err)
+	}
+
+	parentChart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a",
+					Invoke(InvokeChart(childChart, func(params any) any { return &struct{}{} }, nil)),
+					On("go", Target("b")),
+				),
+				Atomic("b"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(parent): %v", err)
+	}
+
+	parent := New(parentChart, nil)
+	ctx := context.Background()
+	if err := parent.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer parent.Stop(ctx)
+
+	if err := parent.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case <-childExited:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("child session was never stopped when the invoking state was exited")
+	}
+}

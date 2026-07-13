@@ -379,7 +379,25 @@ A finished invocation's own (non-cancelled) return generates
 carrying that invocation's ID, before any transition's guard sees it —
 useful for normalizing a returned payload first. `SendOptions{Target:
 "#_" + id}` addresses a specific running invocation, delivered to it via
-`InvokeIO.Incoming`.
+`InvokeIO.Incoming`; `WithAutoForward` instead forwards a copy of *every*
+external event the chart processes there automatically.
+
+`InvokeChart` runs another `*Chart` as a real child SCXML session instead
+of a hand-written `InvokeFunc`:
+
+```go
+statecharts.Invoke(
+	statecharts.InvokeChart(childChart, func(params any) any {
+		return &ChildDatamodel{}
+	}, nil),
+	statecharts.WithInvokeID("child"),
+	statecharts.WithAutoForward(),
+)
+```
+
+The child's own `Send(name, statecharts.SendOptions{Target: "#_parent"})`
+reaches back into the invoking chart, tagged with the invocation's ID —
+the special `"#_parent"` target SCXML's Event I/O Processor defines.
 
 </details>
 

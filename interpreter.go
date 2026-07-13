@@ -647,27 +647,59 @@ func (ip *interpretation) beginInvoke(s *compiledState, spec *compiledInvoke) {
 		params = spec.params(ip.execContext())
 	}
 	cancel, incoming := ip.startInvoke(id, spec, params)
-	ri := &runningInvoke{id: id, state: s, finalize: spec.finalize, cancel: cancel, incoming: incoming}
+	ri := &runningInvoke{id: id, state: s, finalize: spec.finalize, autoForward: spec.autoForward, cancel: cancel, incoming: incoming}
 	ip.activeInvokes[s] = append(ip.activeInvokes[s], ri)
 	ip.invokesByID[id] = ri
 }
 
-// applyFinalize runs the <finalize> handler of whichever active invocation
-// produced ev (matched by ev.InvokeID), if any, immediately before
-// transitions are selected for it -- SCXML 6.5: finalize content "MUST"
-// execute "right before it removes the event from the external event
-// queue for processing", so it can normalize returned data before any
-// transition's cond inspects it. An event with no InvokeID, or one that
-// doesn't match any currently active invocation, is unaffected.
-func (ip *interpretation) applyFinalize(ev Event) {
-	if ev.InvokeID == "" {
+// applyInvokeSideEffects runs whichever of two per-invocation side effects
+// apply to an external event, for every currently active invocation --
+// SCXML mainEventLoop's "for state in configuration: for inv in
+// state.invoke: if inv.invokeid == externalEvent.invokeid:
+// applyFinalize(...); if inv.autoforward: send(inv.id, externalEvent)",
+// run once the event is dequeued, before transitions are selected for it:
+//
+//   - <finalize> (SCXML 6.5): the invocation whose InvokeID matches ev's
+//     gets its finalize content run, so it can normalize returned data
+//     before any transition's cond inspects it.
+//   - autoforward (SCXML 6.4.1): every invocation configured with it gets
+//     an exact copy of ev on its Incoming channel, regardless of ev's own
+//     InvokeID -- including, potentially, its own, since the spec draws
+//     no such exception.
+//
+// ip.invokesByID only ever holds invocations belonging to a currently
+// active state (cancelInvokes removes them the moment their state exits),
+// so this is already scoped to "for state in configuration" without
+// walking the configuration separately.
+func (ip *interpretation) applyInvokeSideEffects(ev Event) {
+	if len(ip.invokesByID) == 0 {
 		return
 	}
-	ri, ok := ip.invokesByID[ev.InvokeID]
-	if !ok {
-		return
+	for _, id := range sortedInvokeIDs(ip.invokesByID) {
+		ri := ip.invokesByID[id]
+		if ev.InvokeID != "" && ri.id == ev.InvokeID {
+			ip.runActions(ri.finalize)
+		}
+		if ri.autoForward && ri.incoming != nil {
+			select {
+			case ri.incoming <- ev:
+			default: // never block the interpreter on a slow/absent reader
+			}
+		}
 	}
-	ip.runActions(ri.finalize)
+}
+
+// sortedInvokeIDs returns m's keys in a deterministic order, so
+// applyInvokeSideEffects's side effects (running <finalize>, forwarding to
+// autoforwarding invocations) happen in a repeatable sequence across runs
+// rather than following Go's randomized map iteration.
+func sortedInvokeIDs(m map[Identifier]*runningInvoke) []Identifier {
+	ids := make([]Identifier, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // exitInterpreter runs whenever running has just become false -- because a
@@ -921,7 +953,7 @@ func (ip *interpretation) processNextExternal() bool {
 	ev := ip.externalQueue[0]
 	ip.externalQueue = ip.externalQueue[1:]
 	ip.lastEvent, ip.hasLastEvent = ev, true
-	ip.applyFinalize(ev)
+	ip.applyInvokeSideEffects(ev)
 
 	transitions := ip.selectTransitions(ev)
 	if len(transitions) > 0 {

@@ -1,6 +1,9 @@
 package statecharts
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // InvokeIO is an invoked service's only channel back into (and, for
 // services that accept forwarded events, in from) the chart that invoked
@@ -41,10 +44,11 @@ type InvokeFunc func(ctx context.Context, params any, io InvokeIO) (data any, er
 // InvokeSpec is the uncompiled description of one <invoke> attached to a
 // state, built via Invoke and InvokeOptions.
 type InvokeSpec struct {
-	ID       Identifier // empty = auto-generated ("<stateid>.invoke<n>") at invoke time
-	Start    InvokeFunc
-	Params   func(ExecContext) any // evaluated once, synchronously, when the invocation starts; nil => nil params
-	Finalize []ActionFunc
+	ID          Identifier // empty = auto-generated ("<stateid>.invoke<n>") at invoke time
+	Start       InvokeFunc
+	Params      func(ExecContext) any // evaluated once, synchronously, when the invocation starts; nil => nil params
+	Finalize    []ActionFunc
+	AutoForward bool
 }
 
 // InvokeOption configures an InvokeSpec being built by Invoke.
@@ -72,10 +76,20 @@ func WithFinalize(actions ...ActionFunc) InvokeOption {
 	return func(s *InvokeSpec) { s.Finalize = append(s.Finalize, actions...) }
 }
 
-// Invoke attaches an external service instance to a state: SCXML's
-// <invoke>, minus the child-SCXML-session-specific machinery (ADR 0005)
-// that's out of scope here -- fn is any Go function willing to run in its
-// own goroutine and talk back through InvokeIO.
+// WithAutoForward makes the chart forward an exact copy of every external
+// event it processes to this invocation's InvokeIO.Incoming, for as long
+// as it's active -- SCXML 6.4.1's 'autoforward' attribute. The copy is
+// unconditional: unlike <finalize>, it happens whether or not the event's
+// own InvokeID matches this invocation.
+func WithAutoForward() InvokeOption {
+	return func(s *InvokeSpec) { s.AutoForward = true }
+}
+
+// Invoke attaches an external service instance to a state (SCXML's
+// <invoke>) -- fn is any Go function willing to run in its own goroutine
+// and talk back through InvokeIO. Use InvokeChart to run another *Chart as
+// a full child SCXML session (SCXML 6.4's
+// type="http://www.w3.org/TR/scxml/" case) rather than writing fn by hand.
 func Invoke(fn InvokeFunc, opts ...InvokeOption) StateOption {
 	return func(s *StateSpec) {
 		spec := InvokeSpec{Start: fn}
@@ -89,25 +103,28 @@ func Invoke(fn InvokeFunc, opts ...InvokeOption) StateOption {
 // compiledInvoke is the compiled form of one InvokeSpec, owned by the
 // compiledState it was declared on.
 type compiledInvoke struct {
-	id       Identifier
-	start    InvokeFunc
-	params   func(ExecContext) any
-	finalize []ActionFunc
+	id          Identifier
+	start       InvokeFunc
+	params      func(ExecContext) any
+	finalize    []ActionFunc
+	autoForward bool
 }
 
 // runningInvoke is the interpreter-core bookkeeping for one active
-// invocation -- enough to cancel it (SCXML 6.4.2) and to route a matching
-// finalize handler when a reply carrying its InvokeID arrives (SCXML 6.5).
-// It is deliberately independent of however the invoked service was
-// actually started (see invokeRunnerFunc): cancel and incoming are plain
-// callbacks/channels, not a reference back to whatever goroutine or
-// Instance is on the other end.
+// invocation -- enough to cancel it (SCXML 6.4.2), to route a matching
+// finalize handler when a reply carrying its InvokeID arrives (SCXML 6.5),
+// and to forward it a copy of every external event if it autoforwards
+// (SCXML 6.4.1). It is deliberately independent of however the invoked
+// service was actually started (see invokeRunnerFunc): cancel and
+// incoming are plain callbacks/channels, not a reference back to whatever
+// goroutine or Instance is on the other end.
 type runningInvoke struct {
-	id       Identifier
-	state    *compiledState
-	finalize []ActionFunc
-	cancel   func()
-	incoming chan<- Event
+	id          Identifier
+	state       *compiledState
+	finalize    []ActionFunc
+	autoForward bool
+	cancel      func()
+	incoming    chan<- Event
 }
 
 // invokeRunnerFunc starts one instance of spec's external service and
@@ -121,4 +138,98 @@ type invokeRunnerFunc func(id Identifier, spec *compiledInvoke, params any) (can
 
 func noopInvokeRunner(Identifier, *compiledInvoke, any) (func(), chan<- Event) {
 	return func() {}, nil
+}
+
+// parentIOProcessor is the IOProcessor InvokeChart gives a child session:
+// it recognizes SCXML Appendix C.1's "#_parent" special send target,
+// routing it to this invocation's own InvokeIO.Deliver (exactly SCXML
+// 6.4.4's "it can use <send> with target '_parent' ... to send events ...
+// to the invoking session"), and defers every other target to next --
+// nil reports an honest "no transport" error for those, the same posture
+// as LocalIOProcessor.
+type parentIOProcessor struct {
+	deliver func(Event)
+	next    IOProcessor
+}
+
+func (p *parentIOProcessor) Attach(d Dispatcher) {
+	if p.next != nil {
+		p.next.Attach(d)
+	}
+}
+
+func (p *parentIOProcessor) Send(ctx context.Context, req SendRequest) error {
+	if req.Target == "#_parent" {
+		p.deliver(Event{Name: req.Event, Data: req.Data, OriginType: "scxml"})
+		return nil
+	}
+	if p.next == nil {
+		return fmt.Errorf("statecharts: no IOProcessor configured for send target %q", req.Target)
+	}
+	return p.next.Send(ctx, req)
+}
+
+func (p *parentIOProcessor) Cancel(ctx context.Context, sendID Identifier) error {
+	if p.next == nil {
+		return nil
+	}
+	return p.next.Cancel(ctx, sendID)
+}
+
+// InvokeChart returns an InvokeFunc that runs chart as a full child SCXML
+// session -- SCXML 6.4's type="http://www.w3.org/TR/scxml/" case -- rather
+// than an arbitrary external service. newDatamodel builds the child's
+// datamodel from whatever Params produced (SCXML's <param>/namelist
+// equivalent); baseIO is used for any send target other than "#_parent"
+// (nil defaults to NoopIOProcessor, matching a bare Instance's own
+// default).
+//
+// The child's own Send(name, SendOptions{Target: "#_parent"}) reaches
+// back into this invocation's InvokeIO.Deliver, tagged with this
+// invocation's InvokeID by the interpreter as usual (Appendix C.1: "the
+// Processor MUST add the event to the external event queue of the SCXML
+// session that invoked the sending session"). Every event the parent
+// forwards to this invocation -- an explicit SendOptions{Target:
+// "#_<invokeid>"}, or, with WithAutoForward, a copy of every external
+// event the parent processes -- is delivered to the child exactly as an
+// application calling Send on it directly would (SCXML 6.4's
+// autoforwarding). The child is stopped, and its own onexit handlers run
+// via exitInterpreter, when this invocation is cancelled; reaching its
+// own top-level final state is this invocation's own natural completion,
+// generating done.invoke.<id> on the parent exactly as for any other
+// InvokeFunc.
+func InvokeChart(chart *Chart, newDatamodel func(params any) any, baseIO IOProcessor) InvokeFunc {
+	return func(ctx context.Context, params any, io InvokeIO) (any, error) {
+		datamodel := newDatamodel(params)
+		child := New(chart, datamodel, WithIOProcessor(&parentIOProcessor{deliver: io.Deliver, next: baseIO}))
+
+		// Start's own actor goroutine runs regardless of whether Start
+		// itself returns early because ctx raced its way to already
+		// being cancelled (e.g. the invoking state was exited again
+		// immediately) -- so the child must always be stopped, even when
+		// Start reports an error, or it would keep running orphaned.
+		defer child.Stop(context.Background())
+
+		if err := child.Start(ctx); err != nil {
+			return nil, err
+		}
+
+		go func() {
+			for {
+				select {
+				case ev, ok := <-io.Incoming:
+					if !ok {
+						return
+					}
+					if child.Send(ctx, ev) != nil {
+						return
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
+		return nil, child.Wait(ctx)
+	}
 }

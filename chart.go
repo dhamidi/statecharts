@@ -96,10 +96,11 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 
 	for _, inv := range spec.Invokes {
 		cs.invokes = append(cs.invokes, &compiledInvoke{
-			id:       inv.ID,
-			start:    inv.Start,
-			params:   inv.Params,
-			finalize: inv.Finalize,
+			id:          inv.ID,
+			start:       inv.Start,
+			params:      inv.Params,
+			finalize:    inv.Finalize,
+			autoForward: inv.AutoForward,
 		})
 	}
 
