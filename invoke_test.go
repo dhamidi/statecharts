@@ -760,3 +760,97 @@ func TestInvokeChartCancelledOnStateExitStopsChildSession(t *testing.T) {
 		t.Fatalf("child session was never stopped when the invoking state was exited")
 	}
 }
+
+// TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry confirms
+// parentIOProcessor.IOProcessors forwards baseIO's advertised entries into
+// the child session's own ExecContext, and never synthesizes a "#_parent"
+// entry -- _ioprocessors describes how others reach this session, and
+// "#_parent" is the reverse (how the child reaches its parent).
+func TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry(t *testing.T) {
+	seen := make(chan []IOProcessorInfo, 1)
+	childChart, err := Build(
+		Atomic("only",
+			OnEntry(Action(func(d *struct{}, ec ExecContext) error {
+				seen <- ec.IOProcessors()
+				return nil
+			})),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(child): %v", err)
+	}
+
+	baseIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://base"}}}
+	parentChart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a", Invoke(InvokeChart(childChart, func(params any) any { return &struct{}{} }, baseIO))),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(parent): %v", err)
+	}
+
+	parent := New(parentChart, nil)
+	ctx := context.Background()
+	if err := parent.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer parent.Stop(ctx)
+
+	select {
+	case got := <-seen:
+		if len(got) != 1 || got[0].Type != "mock" || got[0].Location != "mock://base" {
+			t.Fatalf("child ExecContext.IOProcessors() = %v, want [{mock mock://base}] (baseIO's entries, no synthetic #_parent entry)", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("child's OnEntry action never ran")
+	}
+}
+
+// TestInvokeChartChildIOProcessorsEmptyWithNilBaseIO confirms a nil baseIO
+// (InvokeChart's own "defer to NoopIOProcessor" default) leaves the child
+// with nothing to advertise, mirroring a bare Instance with no IOProcessor
+// configured.
+func TestInvokeChartChildIOProcessorsEmptyWithNilBaseIO(t *testing.T) {
+	seen := make(chan []IOProcessorInfo, 1)
+	childChart, err := Build(
+		Atomic("only",
+			OnEntry(Action(func(d *struct{}, ec ExecContext) error {
+				seen <- ec.IOProcessors()
+				return nil
+			})),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(child): %v", err)
+	}
+
+	parentChart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a", Invoke(InvokeChart(childChart, func(params any) any { return &struct{}{} }, nil))),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build(parent): %v", err)
+	}
+
+	parent := New(parentChart, nil)
+	ctx := context.Background()
+	if err := parent.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer parent.Stop(ctx)
+
+	select {
+	case got := <-seen:
+		if len(got) != 0 {
+			t.Fatalf("child ExecContext.IOProcessors() = %v, want empty (nil baseIO has nothing to advertise)", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("child's OnEntry action never ran")
+	}
+}

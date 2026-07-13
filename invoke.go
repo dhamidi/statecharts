@@ -176,6 +176,23 @@ func (p *parentIOProcessor) Cancel(ctx context.Context, sendID Identifier) error
 	return p.next.Cancel(ctx, sendID)
 }
 
+// IOProcessors implements IOProcessorDescriber by forwarding straight
+// through to next, if it implements the interface itself; nil if next is
+// nil. It deliberately does not synthesize a "#_parent" entry: _ioprocessors
+// describes how *other* sessions reach *this* one, and "#_parent" is the
+// reverse -- how this child reaches its own parent -- so adding it here
+// would misrepresent the direction.
+func (p *parentIOProcessor) IOProcessors() []IOProcessorInfo {
+	if p.next == nil {
+		return nil
+	}
+	d, ok := p.next.(IOProcessorDescriber)
+	if !ok {
+		return nil
+	}
+	return d.IOProcessors()
+}
+
 // InvokeChart returns an InvokeFunc that runs chart as a full child SCXML
 // session -- SCXML 6.4's type="http://www.w3.org/TR/scxml/" case -- rather
 // than an arbitrary external service. newDatamodel builds the child's

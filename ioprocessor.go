@@ -49,6 +49,26 @@ type IOProcessor interface {
 	Cancel(ctx context.Context, sendID Identifier) error
 }
 
+// IOProcessorInfo describes one Event I/O Processor available to the
+// current session, per SCXML 5.10's _ioprocessors: Type is the same value
+// an action would put in SendOptions.Type / that arrives as SendRequest.Type
+// to select this processor, and Location is the address a *different*
+// session must set as its own SendOptions.Target in order to reach this
+// session through that processor.
+type IOProcessorInfo struct {
+	Type     Identifier
+	Location string
+}
+
+// IOProcessorDescriber is implemented by an IOProcessor that has an address
+// to advertise for the current session -- one another session could use to
+// reach it. An IOProcessor with no transport of its own (NoopIOProcessor,
+// LocalIOProcessor) simply doesn't implement this: ExecContext.IOProcessors
+// reports no entries for it rather than guessing at an address.
+type IOProcessorDescriber interface {
+	IOProcessors() []IOProcessorInfo
+}
+
 type noopIOProcessor struct{}
 
 func (noopIOProcessor) Attach(Dispatcher) {}

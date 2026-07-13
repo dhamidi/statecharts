@@ -185,6 +185,82 @@ func TestSpawnDurableInstanceIDMatchesName(t *testing.T) {
 	}
 }
 
+// TestSpawnNonDurableActionSeesOwnIOProcessorLocation confirms
+// routingProcessor.IOProcessors surfaces the actor's own spawned name as its
+// _ioprocessors "actors" Location -- the same name any other actor in sys
+// already reaches it by (see routingProcessor.Send).
+func TestSpawnNonDurableActionSeesOwnIOProcessorLocation(t *testing.T) {
+	ctx := context.Background()
+	var dms []*locationModel
+	chart := buildLocationChart(&dms)
+
+	sys := NewSystem()
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "locator-1", chart.ID()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	inst := testInstanceFor(sys, "locator-1")
+	if inst == nil {
+		t.Fatalf("locator-1 not resident after Spawn")
+	}
+
+	if err := sys.Tell(ctx, "locator-1", statecharts.Event{Name: "check", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return hasStateID(inst.Configuration(), "checked") })
+
+	live := dms[len(dms)-1]
+	if !live.OK || live.Location != "locator-1" {
+		t.Fatalf("ec.IOProcessorLocation(%q) = (%q, %v), want (%q, true)", originTypeActors, live.Location, live.OK, "locator-1")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestSpawnDurableActionSeesOwnIOProcessorLocation is the Durable() twin of
+// TestSpawnNonDurableActionSeesOwnIOProcessorLocation -- a durable actor's
+// routingProcessor is wrapped by replayGate (via Rehydrate), so this also
+// exercises that wrapper's own IOProcessors forwarding.
+func TestSpawnDurableActionSeesOwnIOProcessorLocation(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+
+	var dms []*locationModel
+	chart := buildLocationChart(&dms)
+
+	sys := NewSystem(WithLog(log), WithSnapshotStore(log))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "durable-locator", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	inst := testInstanceFor(sys, "durable-locator")
+	if inst == nil {
+		t.Fatalf("durable-locator not resident after Spawn")
+	}
+
+	if err := sys.Tell(ctx, "durable-locator", statecharts.Event{Name: "check", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return hasStateID(inst.Configuration(), "checked") })
+
+	live := dms[len(dms)-1]
+	if !live.OK || live.Location != "durable-locator" {
+		t.Fatalf("ec.IOProcessorLocation(%q) = (%q, %v), want (%q, true)", originTypeActors, live.Location, live.OK, "durable-locator")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestSendToUnknownActorSurfacesAsCommunicationError(t *testing.T) {
 	ctx := context.Background()
 	chart := buildCommTestChart("nobody-home")

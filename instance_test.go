@@ -354,6 +354,156 @@ func TestExecContextSessionIDAndNameInsideActionAndGuard(t *testing.T) {
 	}
 }
 
+// describingIOProcessor is a minimal IOProcessor that also implements
+// IOProcessorDescriber, for exercising ExecContext.IOProcessors() /
+// IOProcessorLocation() end to end.
+type describingIOProcessor struct {
+	infos []IOProcessorInfo
+}
+
+func (p *describingIOProcessor) Attach(Dispatcher) {}
+
+func (p *describingIOProcessor) Send(context.Context, SendRequest) error { return nil }
+
+func (p *describingIOProcessor) Cancel(context.Context, Identifier) error { return nil }
+
+func (p *describingIOProcessor) IOProcessors() []IOProcessorInfo { return p.infos }
+
+func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
+	var gotList []IOProcessorInfo
+	var gotLocation string
+	var gotOK bool
+
+	recordAndOpen := Action(func(d *Door, ec ExecContext) error {
+		gotList = ec.IOProcessors()
+		gotLocation, gotOK = ec.IOProcessorLocation("mock")
+		d.OpenCount++
+		return nil
+	})
+
+	chart, err := Build(
+		Compound("door", "closed",
+			Children(
+				Atomic("closed", On("open.request", Target("open"), Then(recordAndOpen))),
+				Atomic("open"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://door-1"}}}
+	d := &Door{}
+	in := New(chart, d, WithIOProcessor(io))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := in.Send(ctx, Event{Name: "open.request", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if len(gotList) != 1 || gotList[0].Type != "mock" || gotList[0].Location != "mock://door-1" {
+		t.Fatalf("ExecContext.IOProcessors() = %v, want [{mock mock://door-1}]", gotList)
+	}
+	if !gotOK || gotLocation != "mock://door-1" {
+		t.Fatalf("ExecContext.IOProcessorLocation(%q) = (%q, %v), want (%q, true)", "mock", gotLocation, gotOK, "mock://door-1")
+	}
+
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestExecContextIOProcessorsEmptyForNonDescriber(t *testing.T) {
+	var gotList []IOProcessorInfo
+	var gotOK bool
+
+	record := Action(func(d *Door, ec ExecContext) error {
+		gotList = ec.IOProcessors()
+		_, gotOK = ec.IOProcessorLocation("mock")
+		d.OpenCount++
+		return nil
+	})
+
+	chart, err := Build(
+		Compound("door", "closed",
+			Children(
+				Atomic("closed", On("open.request", Target("open"), Then(record))),
+				Atomic("open"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	d := &Door{}
+	// No WithIOProcessor: the default is NoopIOProcessor, which has no
+	// transport and therefore nothing to advertise.
+	in := New(chart, d)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := in.Send(ctx, Event{Name: "open.request", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if len(gotList) != 0 {
+		t.Fatalf("ExecContext.IOProcessors() = %v, want empty (NoopIOProcessor has nothing to advertise)", gotList)
+	}
+	if gotOK {
+		t.Fatalf("ExecContext.IOProcessorLocation(%q) ok = true, want false", "mock")
+	}
+
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestExecContextIOProcessorLocationUnknownTypeReturnsNotOK(t *testing.T) {
+	var gotOK bool
+
+	record := Action(func(d *Door, ec ExecContext) error {
+		_, gotOK = ec.IOProcessorLocation("does-not-exist")
+		d.OpenCount++
+		return nil
+	})
+
+	chart, err := Build(
+		Compound("door", "closed",
+			Children(
+				Atomic("closed", On("open.request", Target("open"), Then(record))),
+				Atomic("open"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://door-1"}}}
+	d := &Door{}
+	in := New(chart, d, WithIOProcessor(io))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := in.Send(ctx, Event{Name: "open.request", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if gotOK {
+		t.Fatalf("ExecContext.IOProcessorLocation(%q) ok = true, want false (not among the advertised entries)", "does-not-exist")
+	}
+
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestInstanceCancelledSendNeverFires(t *testing.T) {
 	scheduleAndCancel := Action(func(d *struct{}, ec ExecContext) error {
 		ec.Send("timeout", SendOptions{SendID: "t1", Delay: 5 * time.Second})

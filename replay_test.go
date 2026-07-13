@@ -443,6 +443,82 @@ func TestRehydrateSuppressesRealDispatchDuringReplayThenGoesLive(t *testing.T) {
 	}
 }
 
+// TestRehydrateIOProcessorsReportedDuringAndAfterReplay confirms
+// replayGate.IOProcessors forwards to the wrapped IOProcessor even while
+// !live -- unlike Send/Cancel/Log, reading an already-advertised address has
+// no real-world side effect to suppress during replay.
+func TestRehydrateIOProcessorsReportedDuringAndAfterReplay(t *testing.T) {
+	ctx := context.Background()
+	log := newMemLog()
+	store := newMemSnapshotStore()
+	sessionID := "sess-ioprocessors"
+
+	var seen []IOProcessorInfo
+	record := func(ec ExecContext) error {
+		seen = ec.IOProcessors()
+		return nil
+	}
+
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a", On("go", Target("b"), Then(record))),
+				Atomic("b", On("go", Target("a"), Then(record))),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	liveIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://live"}}}
+	in := New(chart, nil, WithIOProcessor(liveIO))
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ev := Event{Name: "go", Type: EventExternal}
+	if _, err := log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(), Event: ev}); err != nil {
+		t.Fatalf("log.Append: %v", err)
+	}
+	if err := in.Send(ctx, ev); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// Reset before Rehydrate so the next observation is unambiguously from
+	// the replay below, not the live phase above.
+	seen = nil
+
+	replayIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: "mock://replayed"}}}
+	in2, err := Rehydrate(ctx, chart, nil, log, store, sessionID, replayIO)
+	if err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+
+	// The single logged "go" event replays during Rehydrate itself, before
+	// goLive is called -- so this observation is from inside replay, while
+	// the gate is still suppressing Send/Cancel/Log.
+	if len(seen) != 1 || seen[0].Location != "mock://replayed" {
+		t.Fatalf("ExecContext.IOProcessors() during replay = %v, want [{mock mock://replayed}]", seen)
+	}
+
+	// Now live: a fresh Send should see the same wrapped processor's
+	// entries, proving IOProcessors() keeps working once the gate flips.
+	seen = nil
+	if err := in2.Send(ctx, ev); err != nil {
+		t.Fatalf("Send (live): %v", err)
+	}
+	if len(seen) != 1 || seen[0].Location != "mock://replayed" {
+		t.Fatalf("ExecContext.IOProcessors() after goLive = %v, want [{mock mock://replayed}]", seen)
+	}
+
+	if err := in2.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 // TestRehydrateWithNilLoggerDoesNotPanicOnceLive reproduces a nil-pointer
 // panic in replayGate.Log: Rehydrate always wraps whatever Logger it finds
 // in a non-nil *replayGate, so doLog's own "logger != nil" guard always

@@ -111,3 +111,16 @@ func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest
 func (p *routingProcessor) Cancel(ctx context.Context, sendID statecharts.Identifier) error {
 	return nil
 }
+
+// IOProcessors implements statecharts.IOProcessorDescriber, advertising
+// self's own name as the address any other actor in sys can already reach
+// it at -- see Send's own resolution of req.Target against sys, which
+// treats an actor's name as its address directly. This does not attempt to
+// account for a Bridge-qualified cross-system address (see WithFallback):
+// which Bridge, if any, exposes this actor to which peer under what
+// namespace is not something routingProcessor itself knows.
+func (p *routingProcessor) IOProcessors() []statecharts.IOProcessorInfo {
+	return []statecharts.IOProcessorInfo{
+		{Type: originTypeActors, Location: string(p.self)},
+	}
+}

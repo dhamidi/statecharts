@@ -323,6 +323,18 @@ func (ip *interpretation) doLog(label string, data any) {
 	}
 }
 
+// ioProcessors reports the current IOProcessor's advertised addresses, per
+// SCXML 5.10's _ioprocessors, if it implements IOProcessorDescriber -- nil
+// otherwise (e.g. NoopIOProcessor/LocalIOProcessor, neither of which has a
+// transport to advertise an address for).
+func (ip *interpretation) ioProcessors() []IOProcessorInfo {
+	d, ok := ip.io.(IOProcessorDescriber)
+	if !ok {
+		return nil
+	}
+	return d.IOProcessors()
+}
+
 func (ip *interpretation) execContext() ExecContext {
 	return ExecContext{
 		event:     ip.lastEvent,
@@ -334,10 +346,11 @@ func (ip *interpretation) execContext() ExecContext {
 			s := ip.chart.byID[id]
 			return s != nil && ip.configuration[s]
 		},
-		raise:  ip.enqueueInternal,
-		send:   ip.doSend,
-		cancel: ip.doCancel,
-		log:    ip.doLog,
+		raise:        ip.enqueueInternal,
+		send:         ip.doSend,
+		cancel:       ip.doCancel,
+		log:          ip.doLog,
+		ioProcessors: ip.ioProcessors,
 	}
 }
 

@@ -95,6 +95,41 @@ func buildLadderChart(sink *[]*counterModel) *statecharts.Chart {
 	return chart
 }
 
+// locationModel records the address (via ExecContext.IOProcessorLocation) an
+// action observed while running inside a System, for tests confirming an
+// actor discovers its own routingProcessor-advertised name.
+type locationModel struct {
+	Location string
+	OK       bool
+}
+
+// buildLocationChart returns a chart that, on "check", records
+// ec.IOProcessorLocation(originTypeActors) into its datamodel and moves to
+// "checked". Every datamodel value produced is appended to sink.
+func buildLocationChart(sink *[]*locationModel) *statecharts.Chart {
+	record := statecharts.Action(func(d *locationModel, ec statecharts.ExecContext) error {
+		d.Location, d.OK = ec.IOProcessorLocation(originTypeActors)
+		return nil
+	})
+	chart, err := statecharts.Build(
+		statecharts.Compound("locator", "idle",
+			statecharts.Children(
+				statecharts.Atomic("idle", statecharts.On("check", statecharts.Target("checked"), statecharts.Then(record))),
+				statecharts.Atomic("checked"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any {
+			d := &locationModel{}
+			*sink = append(*sink, d)
+			return d
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
 // callerModel is the datamodel for buildCallerChart, recording who replied.
 type callerModel struct {
 	ReceivedFrom statecharts.Identifier

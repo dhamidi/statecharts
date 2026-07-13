@@ -8,16 +8,17 @@ import "fmt"
 // only supported datamodel is Go itself, these become plain method calls
 // instead.
 type ExecContext struct {
-	event     Event
-	hasEvent  bool
-	datamodel any
-	sessionID string
-	name      Identifier
-	active    func(Identifier) bool
-	raise     func(Event)
-	send      func(name Identifier, opts SendOptions)
-	cancel    func(sendID Identifier)
-	log       func(label string, data any)
+	event        Event
+	hasEvent     bool
+	datamodel    any
+	sessionID    string
+	name         Identifier
+	active       func(Identifier) bool
+	raise        func(Event)
+	send         func(name Identifier, opts SendOptions)
+	cancel       func(sendID Identifier)
+	log          func(label string, data any)
+	ioProcessors func() []IOProcessorInfo
 }
 
 // Event returns the event currently being processed, if any. Per SCXML
@@ -62,6 +63,31 @@ func (ec ExecContext) SessionID() string {
 // entire lifetime, per SCXML 5.10's _name.
 func (ec ExecContext) Name() string {
 	return string(ec.name)
+}
+
+// IOProcessors reports every Event I/O Processor available to this session,
+// per SCXML 5.10's _ioprocessors -- specifically, the ones with an address
+// another session could use to reach this one (see IOProcessorDescriber).
+// It is empty/nil if the configured IOProcessor has nothing to advertise.
+func (ec ExecContext) IOProcessors() []IOProcessorInfo {
+	if ec.ioProcessors == nil {
+		return nil
+	}
+	return ec.ioProcessors()
+}
+
+// IOProcessorLocation returns the Location advertised for typ among
+// IOProcessors(), the common case of wanting one specific processor's own
+// address (e.g. to embed in outgoing event data so a peer can reply) --
+// callers don't need to write that lookup loop themselves. ok is false if no
+// processor of that Type is advertised.
+func (ec ExecContext) IOProcessorLocation(typ Identifier) (location string, ok bool) {
+	for _, info := range ec.IOProcessors() {
+		if info.Type == typ {
+			return info.Location, true
+		}
+	}
+	return "", false
 }
 
 // Send schedules delivery of an event, mirroring <send>: immediately (if

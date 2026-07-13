@@ -47,6 +47,19 @@ func (g *replayGate) Log(label string, data any) {
 	g.logger.Log(label, data)
 }
 
+// IOProcessors implements IOProcessorDescriber by forwarding straight
+// through to the wrapped io, if it implements the interface itself.
+// Unlike Send/Cancel/Log, reading an already-advertised address has no
+// real-world side effect to suppress during replay, so this is never gated
+// behind g.live.
+func (g *replayGate) IOProcessors() []IOProcessorInfo {
+	d, ok := g.io.(IOProcessorDescriber)
+	if !ok {
+		return nil
+	}
+	return d.IOProcessors()
+}
+
 func (g *replayGate) goLive() { g.live.Store(true) }
 
 // Rehydrate reconstructs a running Instance for sessionID: it loads the
