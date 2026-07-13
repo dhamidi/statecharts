@@ -232,6 +232,15 @@ func Durable() SpawnOption {
 	return func(c *spawnConfig) { c.durable = true }
 }
 
+// ErrSystemStopped is returned by Spawn and by deliver (and so by Tell and
+// deliverAsync, which both call it) once Stop has been called on the
+// System, or is running concurrently and wins the race. s.stopped only
+// ever transitions false->true, never back, so once a caller observes this
+// error no later call for any name will succeed either. Callers that only
+// care whether the system is gone, not which specific call observed it,
+// can test for this with errors.Is.
+var ErrSystemStopped = errors.New("actors: system is stopped")
+
 // Spawn gives an actor a name -- its address within the system -- and
 // starts it running under the Chart registered for kind. Spawn is
 // idempotent for a name that is already resident: calling it again for the
@@ -249,7 +258,7 @@ func (s *System) Spawn(ctx context.Context, name, kind statecharts.Identifier, o
 	// authoritative check that actually prevents a Spawn/Stop race
 	// (entryFor, under tableMu) runs regardless of what this observes.
 	if s.stopped.Load() {
-		return fmt.Errorf("actors: Spawn: system is stopped")
+		return fmt.Errorf("actors: Spawn: %w", ErrSystemStopped)
 	}
 
 	var cfg spawnConfig
@@ -288,7 +297,7 @@ func (s *System) entryFor(name, kind statecharts.Identifier, durable bool) (*act
 	s.tableMu.Lock()
 	defer s.tableMu.Unlock()
 	if s.stopped.Load() {
-		return nil, fmt.Errorf("actors: Spawn: system is stopped")
+		return nil, fmt.Errorf("actors: Spawn: %w", ErrSystemStopped)
 	}
 	if e, ok := s.table[name]; ok {
 		if e.kind != kind {
@@ -341,7 +350,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 		return nil
 	}
 	if s.stopped.Load() {
-		return fmt.Errorf("actors: activate %q: system is stopped", entry.name)
+		return fmt.Errorf("actors: activate %q: %w", entry.name, ErrSystemStopped)
 	}
 	if err := s.admit(ctx, entry); err != nil {
 		return err
@@ -510,7 +519,7 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 // immediate).
 func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev statecharts.Event) error {
 	if s.stopped.Load() {
-		return fmt.Errorf("actors: %q: system is stopped", name)
+		return fmt.Errorf("actors: %q: %w", name, ErrSystemStopped)
 	}
 	entry, ok := s.resolve(name)
 	if !ok {

@@ -378,7 +378,12 @@ func TestSpawnStopRaceLeavesNoOrphanedInstance(t *testing.T) {
 		if spawnErrs[i] != nil {
 			// Refused outright (system already stopping/stopped) --
 			// exactly what the fix is supposed to make possible, and
-			// there is nothing resident to check.
+			// there is nothing resident to check. Confirm it was actually
+			// refused for that reason, not some other failure the race
+			// happened to produce.
+			if !errors.Is(spawnErrs[i], ErrSystemStopped) {
+				t.Fatalf("Spawn %d failed with %v, want ErrSystemStopped", i, spawnErrs[i])
+			}
 			continue
 		}
 		inst := instances[i]
