@@ -69,7 +69,15 @@ func (g *replayGate) goLive() { g.live.Store(true) }
 // is no special replay code path. Real IOProcessor dispatch and real Logger
 // calls are both suppressed until replay catches up; the returned Instance
 // is then left fully live (further Sends dispatch, and Log calls write, for
-// real).
+// real). Once live, every invocation still active in the restored
+// configuration -- whether it got there by replaying its entry into the
+// invoking state or straight off Snapshot.ActiveInvokes -- is reconciled
+// exactly once: an invocation configured with WithInvokeResume gets a real
+// chance to reattach to whatever real-world process it was talking to, its
+// return translated into done.invoke.<id> or error.communication precisely
+// as a live Start's return would be; one left unconfigured gets
+// error.communication unconditionally, since Rehydrate has no other way to
+// confirm its external process survived the restart.
 func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapshots SnapshotStore, sessionID SessionID, realIO IOProcessor, opts ...Option) (*Instance, error) {
 	// Logger, unlike IOProcessor, has no explicit Rehydrate parameter -- it
 	// only ever arrives via a WithLogger call inside opts, defaulting to
@@ -135,20 +143,32 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 	// running, or had been started and not yet cancelled, at the moment
 	// this session stopped being driven -- by definition, any event such an
 	// invocation had actually delivered by then is already in the log and
-	// was just replayed above. What Rehydrate cannot do is resume the
-	// invocation itself (ADR 0010) or confirm its external process survived
-	// the restart, so each one gets the same error.communication SCXML
-	// would give a communication failure, letting the chart's own
-	// <invoke>/<finalize> handling decide what to do next -- e.g. retry, or
-	// transition out of the invoking state -- rather than silently leaving
-	// it looking alive.
-	for _, id := range sortedInvokeIDs(in.ip.invokesByID) {
-		_ = in.Send(ctx, Event{
-			Name:     ErrEventCommunication,
-			Type:     EventPlatform,
-			InvokeID: id,
-			Data:     fmt.Errorf("statecharts: Rehydrate: invoke %q was active before restart; its continuation cannot be guaranteed", id),
-		})
+	// was just replayed above (or, for a checkpoint-derived restore with
+	// nothing left to replay, was captured directly in
+	// Snapshot.ActiveInvokes). What Rehydrate cannot do on its own is
+	// resume the invocation itself, or confirm its external process
+	// survived the restart -- unless the invocation's own InvokeSpec says
+	// otherwise via WithInvokeResume. An invocation with no Resume gets the
+	// same error.communication SCXML would give a communication failure,
+	// letting the chart's own <invoke>/<finalize> handling decide what to
+	// do next -- e.g. retry, or transition out of the invoking state --
+	// rather than silently leaving it looking alive. An invocation with a
+	// Resume gets a real chance to reattach instead: Resume's own return is
+	// threaded through the same done.invoke/error.communication synthesis
+	// startInvoke uses for Start, via resumeInvoke.
+	//
+	// This reconciliation runs on the Instance's own actor goroutine
+	// (resumeInvokesAfterReplay, instance.go), not here: a resumed
+	// invocation's goroutine can call Deliver the moment Resume returns,
+	// which reaches back into this same Instance, so the runningInvoke
+	// bookkeeping it touches has to be mutated by the one goroutine that
+	// owns it, the same way every other piece of interpreter-core state is.
+	resumeReq := actorRequest{kind: reqResumeInvokes, reply: make(chan error, 1)}
+	if err := in.submit(ctx, resumeReq); err != nil {
+		return nil, fmt.Errorf("statecharts: Rehydrate: resume invokes: %w", err)
+	}
+	if err := in.awaitReply(ctx, resumeReq.reply); err != nil {
+		return nil, fmt.Errorf("statecharts: Rehydrate: resume invokes: %w", err)
 	}
 
 	return in, nil

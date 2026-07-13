@@ -10,9 +10,10 @@ import (
 
 // Snapshot is a point-in-time capture of everything about a running chart's
 // state except the datamodel: the session id, the active configuration,
-// recorded history, both event queues, the running flag, and any
-// outstanding delayed sends. The datamodel is explicitly excluded -- it is
-// the caller's own Go value(s), serialized by the caller if desired.
+// recorded history, both event queues, the running flag, any outstanding
+// delayed sends, and which invocations were active. The datamodel is
+// explicitly excluded -- it is the caller's own Go value(s), serialized by
+// the caller if desired.
 //
 // Snapshot is a derivable checkpoint, not an independent source of truth: it
 // captures exactly what replaying a Log up to some point would produce, and
@@ -27,6 +28,7 @@ type Snapshot struct {
 	ExternalQueue []Event
 	Running       bool
 	PendingSends  []PendingSend
+	ActiveInvokes []ActiveInvoke
 }
 
 // PendingSend describes one delayed <send> that has not yet fired or been
@@ -38,6 +40,14 @@ type PendingSend struct {
 	Type   Identifier
 	Event  Event
 	FireAt time.Time
+}
+
+// ActiveInvoke records one <invoke> that was active in Configuration when a
+// Snapshot was taken.
+type ActiveInvoke struct {
+	State     Identifier // the state that owns this invocation
+	SpecIndex int        // this invocation's position among State's <invoke> elements, in document order
+	ID        Identifier // the invocation's own id, exactly as assigned when it started
 }
 
 // Checkpoint pairs a Snapshot with the Log sequence number it reflects.
@@ -102,6 +112,18 @@ func (in *Instance) buildSnapshot() Snapshot {
 	sort.Slice(snap.PendingSends, func(i, j int) bool {
 		return snap.PendingSends[i].SendID < snap.PendingSends[j].SendID
 	})
+	for _, invokes := range ip.activeInvokes {
+		for _, ri := range invokes {
+			snap.ActiveInvokes = append(snap.ActiveInvokes, ActiveInvoke{
+				State:     ri.state.id,
+				SpecIndex: ri.specIndex,
+				ID:        ri.id,
+			})
+		}
+	}
+	sort.Slice(snap.ActiveInvokes, func(i, j int) bool {
+		return snap.ActiveInvokes[i].ID < snap.ActiveInvokes[j].ID
+	})
 	return snap
 }
 
@@ -112,8 +134,12 @@ func (in *Instance) buildSnapshot() Snapshot {
 // IDGenerator. It validates that every state ID mentioned in snap still
 // exists in chart, returning an error on drift. Pending sends are
 // re-armed as real timers relative to time.Until(FireAt) (firing
-// immediately if already overdue). The Instance is constructed but not
-// started; call Start to spawn its goroutine.
+// immediately if already overdue). ActiveInvokes are reconstructed as
+// bookkeeping only -- routing a <finalize> or a "#_<invokeid>" send still
+// works, but no invocation goroutine is started; Rehydrate is what decides
+// whether each one gets error.communication or a real InvokeResumeFunc
+// call. The Instance is constructed but not started; call Start to spawn
+// its goroutine.
 func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Instance, error) {
 	cfg := defaultInstanceConfig()
 	for _, opt := range opts {
@@ -189,6 +215,40 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 		rec.stop = ip.clock.AfterFunc(delay, func() { ip.handleTimerFire(sendID) })
 	}
 
+	// Reconstructed as bookkeeping, not as a running invocation: cancel and
+	// incoming are left as the same no-op/nil shape startInvoke returns
+	// while suppressed, exactly mirroring how PendingSends are rebuilt as
+	// records rather than replayed as historical events. This is what lets
+	// Rehydrate's post-replay reconciliation loop see this invocation as
+	// active regardless of whether it got here via replay or straight off a
+	// checkpoint.
+	ip.activeInvokes = map[*compiledState][]*runningInvoke{}
+	ip.invokesByID = map[Identifier]*runningInvoke{}
+	for _, ai := range snap.ActiveInvokes {
+		s, ok := chart.byID[ai.State]
+		if !ok {
+			return fmt.Errorf("statecharts: restore: chart has no state %q (from active invoke)", ai.State)
+		}
+		if !configuration[s] {
+			return fmt.Errorf("statecharts: restore: active invoke references state %q not in Configuration", ai.State)
+		}
+		if ai.SpecIndex < 0 || ai.SpecIndex >= len(s.invokes) {
+			return fmt.Errorf("statecharts: restore: state %q has no invoke at index %d", ai.State, ai.SpecIndex)
+		}
+		spec := s.invokes[ai.SpecIndex]
+		ri := &runningInvoke{
+			id:          ai.ID,
+			state:       s,
+			specIndex:   ai.SpecIndex,
+			finalize:    spec.finalize,
+			autoForward: spec.autoForward,
+			cancel:      func() {},
+			incoming:    nil,
+		}
+		ip.activeInvokes[s] = append(ip.activeInvokes[s], ri)
+		ip.invokesByID[ai.ID] = ri
+	}
+
 	ip.restored = true
 	return nil
 }
@@ -207,6 +267,7 @@ type snapshotWire struct {
 	ExternalQueue []EncodedEvent              `json:"external_queue,omitempty"`
 	Running       bool                        `json:"running"`
 	PendingSends  []pendingSendWire           `json:"pending_sends,omitempty"`
+	ActiveInvokes []ActiveInvoke              `json:"active_invokes,omitempty"`
 }
 
 type pendingSendWire struct {
@@ -225,6 +286,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 		Configuration: s.Configuration,
 		HistoryValue:  s.HistoryValue,
 		Running:       s.Running,
+		ActiveInvokes: s.ActiveInvokes,
 	}
 	for _, ev := range s.InternalQueue {
 		enc, err := EncodeEvent(ev)
@@ -263,6 +325,7 @@ func (s *Snapshot) UnmarshalJSON(b []byte) error {
 	s.Configuration = wire.Configuration
 	s.HistoryValue = wire.HistoryValue
 	s.Running = wire.Running
+	s.ActiveInvokes = wire.ActiveInvokes
 
 	s.InternalQueue = nil
 	for _, enc := range wire.InternalQueue {

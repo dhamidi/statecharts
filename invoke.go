@@ -41,6 +41,29 @@ type InvokeIO struct {
 // is generated if ctx was already cancelled by the time InvokeFunc returns.
 type InvokeFunc func(ctx context.Context, params any, io InvokeIO) (data any, err error)
 
+// InvokeResumeFunc reattaches to a possibly-still-running invocation after
+// Rehydrate, instead of starting a fresh one via Start. id is the
+// invocation's own id, preserved exactly as it was before the restart --
+// whatever identity a resumable invocation uses to find the real-world
+// resource it was talking to (a subprocess's PID, a job id in an external
+// queue, a container name) has to be either id itself or something params
+// encodes, since nothing else about the pre-restart invocation survives.
+// params is recomputed fresh, by calling Params again against the
+// fully-restored datamodel; there is no separate "original params"
+// preserved anywhere. Unlike a live invocation's Params call, _event is
+// unbound during this recomputation (SCXML 5.10.1's rule for before the
+// first event is processed): there is no single well-defined triggering
+// event left once replay has caught up. Write a Params callback meant to
+// run again during Resume so its result depends on datamodel state, not on
+// the current event.
+//
+// Resume's return is treated exactly like Start's: a non-nil error becomes
+// error.communication, a nil error with data becomes done.invoke.<id>
+// immediately (the work finished while nothing was watching it), and
+// blocking on ctx or io.Incoming continues the invocation exactly as if it
+// had never stopped.
+type InvokeResumeFunc func(ctx context.Context, id Identifier, params any, io InvokeIO) (data any, err error)
+
 // InvokeSpec is the uncompiled description of one <invoke> attached to a
 // state, built via Invoke and InvokeOptions.
 type InvokeSpec struct {
@@ -49,6 +72,7 @@ type InvokeSpec struct {
 	Params      func(ExecContext) any // evaluated once, synchronously, when the invocation starts; nil => nil params
 	Finalize    []ActionFunc
 	AutoForward bool
+	Resume      InvokeResumeFunc
 }
 
 // InvokeOption configures an InvokeSpec being built by Invoke.
@@ -85,6 +109,14 @@ func WithAutoForward() InvokeOption {
 	return func(s *InvokeSpec) { s.AutoForward = true }
 }
 
+// WithInvokeResume sets the callback Rehydrate calls, once replay catches
+// up, to reattach to this invocation instead of assuming it is gone. Left
+// unset, Rehydrate reports error.communication for this invocation
+// unconditionally, the only honest default for one with no way to check.
+func WithInvokeResume(fn InvokeResumeFunc) InvokeOption {
+	return func(s *InvokeSpec) { s.Resume = fn }
+}
+
 // Invoke attaches an external service instance to a state (SCXML's
 // <invoke>) -- fn is any Go function willing to run in its own goroutine
 // and talk back through InvokeIO. Use InvokeChart to run another *Chart as
@@ -108,6 +140,7 @@ type compiledInvoke struct {
 	params      func(ExecContext) any
 	finalize    []ActionFunc
 	autoForward bool
+	resume      InvokeResumeFunc
 }
 
 // runningInvoke is the interpreter-core bookkeeping for one active
@@ -121,6 +154,7 @@ type compiledInvoke struct {
 type runningInvoke struct {
 	id          Identifier
 	state       *compiledState
+	specIndex   int // this invocation's position among state's <invoke> elements, in document order
 	finalize    []ActionFunc
 	autoForward bool
 	cancel      func()

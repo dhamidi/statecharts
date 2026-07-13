@@ -660,13 +660,13 @@ func (ip *interpretation) processInvokes() {
 	pending := sortAsc(ip.statesToInvoke)
 	ip.statesToInvoke = map[*compiledState]bool{}
 	for _, s := range pending {
-		for _, spec := range s.invokes {
-			ip.beginInvoke(s, spec)
+		for i, spec := range s.invokes {
+			ip.beginInvoke(s, i, spec)
 		}
 	}
 }
 
-func (ip *interpretation) beginInvoke(s *compiledState, spec *compiledInvoke) {
+func (ip *interpretation) beginInvoke(s *compiledState, specIndex int, spec *compiledInvoke) {
 	id := spec.id
 	if id == "" {
 		ip.invokeSeq++
@@ -677,7 +677,7 @@ func (ip *interpretation) beginInvoke(s *compiledState, spec *compiledInvoke) {
 		params = spec.params(ip.execContext())
 	}
 	cancel, incoming := ip.startInvoke(id, spec, params)
-	ri := &runningInvoke{id: id, state: s, finalize: spec.finalize, autoForward: spec.autoForward, cancel: cancel, incoming: incoming}
+	ri := &runningInvoke{id: id, state: s, specIndex: specIndex, finalize: spec.finalize, autoForward: spec.autoForward, cancel: cancel, incoming: incoming}
 	ip.activeInvokes[s] = append(ip.activeInvokes[s], ri)
 	ip.invokesByID[id] = ri
 }

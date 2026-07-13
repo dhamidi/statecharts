@@ -133,6 +133,7 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 			params:      inv.Params,
 			finalize:    inv.Finalize,
 			autoForward: inv.AutoForward,
+			resume:      inv.Resume,
 		})
 	}
 

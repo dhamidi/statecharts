@@ -43,13 +43,14 @@ const (
 	reqTimerFired
 	reqSnapshot
 	reqActiveInvokes
+	reqResumeInvokes
 )
 
 type actorRequest struct {
 	kind       actorReqKind
 	event      Event
 	fn         func()        // reqTimerFired only
-	reply      chan error    // reqSend/reqStop
+	reply      chan error    // reqSend/reqStop/reqResumeInvokes
 	snapOut    chan Snapshot // reqSnapshot only
 	invokesOut chan bool     // reqActiveInvokes only
 }
@@ -203,7 +204,94 @@ func (in *Instance) startInvoke(id Identifier, spec *compiledInvoke, params any)
 	if in.suppressInvoke.Load() {
 		return func() {}, nil
 	}
+	return in.runInvokeGoroutine(id, func(ctx context.Context, io InvokeIO) (any, error) {
+		return spec.start(ctx, params, io)
+	})
+}
 
+// resumeInvoke reattaches to the invocation identified by id after
+// Rehydrate's replay pass has caught up, via spec.resume instead of
+// spec.start -- the InvokeResumeFunc counterpart of startInvoke, sharing its
+// goroutine wiring through runInvokeGoroutine so a resumed invocation
+// behaves exactly like one that had never stopped. Unlike startInvoke, it
+// never checks suppressInvoke: by the time Rehydrate calls this, replay has
+// already caught up and suppressInvoke is already false, so this call is
+// always the real thing.
+func (in *Instance) resumeInvoke(id Identifier, spec *compiledInvoke, params any) (cancel func(), incoming chan<- Event) {
+	return in.runInvokeGoroutine(id, func(ctx context.Context, io InvokeIO) (any, error) {
+		return spec.resume(ctx, id, params, io)
+	})
+}
+
+// resumeInvokesAfterReplay is reqResumeInvokes's handler, run on the actor's
+// own goroutine by Rehydrate once replay has caught up (see replay.go): for
+// every invocation ip.invokesByID still holds, in the same deterministic
+// order applyInvokeSideEffects already uses, it either reports
+// error.communication (no Resume configured) or calls resumeInvoke and
+// records the real cancel/incoming it returns onto the runningInvoke in
+// place.
+//
+// This must run here, not on Rehydrate's own calling goroutine: a
+// runningInvoke's fields are exactly as single-goroutine-owned as the rest
+// of interpretation's state, and resumeInvoke's spawned goroutine can call
+// Deliver -- reaching this Instance's inbox, and from there this same actor
+// goroutine, via a completely ordinary Send -- the moment Resume returns,
+// which for an error or already-finished outcome can be almost immediately.
+// Reconciling from any other goroutine would race that delivery against
+// whichever runningInvoke it still needed to finish updating.
+func (in *Instance) resumeInvokesAfterReplay() {
+	for _, id := range sortedInvokeIDs(in.ip.invokesByID) {
+		ri, ok := in.ip.invokesByID[id]
+		if !ok {
+			// Resolving an earlier id in this same pass already cancelled
+			// this one, e.g. by exiting a parallel region both belonged to.
+			continue
+		}
+		spec := ri.state.invokes[ri.specIndex]
+		if spec.resume == nil {
+			in.ip.enqueueInternal(Event{
+				Name:     ErrEventCommunication,
+				Type:     EventPlatform,
+				InvokeID: id,
+				Data:     fmt.Errorf("statecharts: Rehydrate: invoke %q was active before restart; its continuation cannot be guaranteed", id),
+			})
+			in.ip.runToStable()
+			continue
+		}
+		var params any
+		if spec.params != nil {
+			// _event is unbound here (SCXML 5.10.1), not whatever event
+			// ip.lastEvent happens to hold: that field reflects the tail of
+			// replay, or an earlier iteration of this very loop's own
+			// synthesized error.communication for a different invocation,
+			// neither of which is the event that originally caused entry
+			// into this invoking state. There is no way to recover that
+			// event at this point, so ec is built directly off
+			// ip.execContext() with event/hasEvent overridden on this local
+			// copy -- ip's own lastEvent/hasLastEvent are never touched, so
+			// this has no effect on any other invocation's reconciliation
+			// or on anything processed afterward.
+			ec := in.ip.execContext()
+			ec.event, ec.hasEvent = Event{}, false
+			params = spec.params(ec)
+		}
+		cancel, incoming := in.resumeInvoke(id, spec, params)
+		ri.cancel = cancel
+		ri.incoming = incoming
+	}
+}
+
+// runInvokeGoroutine is the machinery startInvoke and resumeInvoke share:
+// building ctx/InvokeIO, spawning the goroutine that runs run, recovering a
+// panic, and turning run's return into done.invoke.<id> or
+// error.communication via Deliver, exactly as SCXML 6.4.3 requires of an
+// InvokeFunc's own return. It is written once so a resumed invocation is
+// genuinely "the same invocation, still going" rather than a parallel
+// mechanism with its own edge cases to keep in sync by hand. ctx is
+// cancelled by the returned cancel func, which interpretation.cancelInvokes
+// calls as part of exiting the invoking state (SCXML 6.4.2); run observing
+// ctx already done by the time it returns generates neither event.
+func (in *Instance) runInvokeGoroutine(id Identifier, run func(context.Context, InvokeIO) (any, error)) (cancel func(), incoming chan<- Event) {
 	ctx, cancelFn := context.WithCancel(context.Background())
 	inbound := make(chan Event, invokeIncomingBuffer)
 	io := InvokeIO{
@@ -228,7 +316,7 @@ func (in *Instance) startInvoke(id Identifier, spec *compiledInvoke, params any)
 			}
 		}()
 
-		data, err := spec.start(ctx, params, io)
+		data, err := run(ctx, io)
 		if ctx.Err() != nil {
 			return
 		}
@@ -329,6 +417,8 @@ func (in *Instance) run() {
 			snapOut = req.snapOut
 		case reqActiveInvokes:
 			invokesOut = req.invokesOut
+		case reqResumeInvokes:
+			in.resumeInvokesAfterReplay()
 		}
 		for in.ip.running && in.ip.processNextExternal() {
 		}
