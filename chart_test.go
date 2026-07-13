@@ -117,6 +117,38 @@ func TestBuildHistoryChart(t *testing.T) {
 	}
 }
 
+// SCXML 3.11 requires only that a state's 'initial' target be a descendant
+// of that state, not a direct child -- entry fills in every intervening
+// ancestor. A grandchild target (or deeper) must Build successfully and
+// enter correctly.
+func TestBuildCompoundInitialCanTargetDeepDescendant(t *testing.T) {
+	chart, err := Build(
+		Compound("root", "grandchild",
+			Children(
+				Compound("child", "grandchild",
+					Children(
+						Atomic("grandchild"),
+						Atomic("sibling"),
+					),
+				),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	got := ip.activeStates()
+	if !hasState(got, "child") || !hasState(got, "grandchild") {
+		t.Fatalf("initial configuration = %v, want to contain 'child' and 'grandchild'", got)
+	}
+	if hasState(got, "sibling") {
+		t.Fatalf("initial configuration = %v, must not contain 'sibling'", got)
+	}
+}
+
 func TestBuildValidationErrors(t *testing.T) {
 	cases := []struct {
 		name string
@@ -141,6 +173,13 @@ func TestBuildValidationErrors(t *testing.T) {
 			name: "unresolved transition target",
 			spec: Compound("root", "a", Children(
 				Atomic("a", On("go", Target("nowhere"))),
+			)),
+		},
+		{
+			name: "initial targets a state outside its own subtree",
+			spec: Compound("root", "a", Children(
+				Compound("a", "b.child", Children(Atomic("a.child"))),
+				Compound("b", "b.child", Children(Atomic("b.child"))),
 			)),
 		},
 		{

@@ -113,9 +113,14 @@ func (c *Chart) validateReferences() error {
 			if cs.initial == "" {
 				return fmt.Errorf("statecharts: compound state %q has no initial child", cs.id)
 			}
+			// SCXML 3.11 requires only that the target of a state's
+			// 'initial' attribute be a descendant of that state, not a
+			// direct child -- entry fills in every intervening ancestor
+			// (interpreter.go's addAncestorStatesToEnter), so a deeper
+			// target is entered correctly.
 			child, ok := c.byID[cs.initial]
-			if !ok || child.parent != cs {
-				return fmt.Errorf("statecharts: compound state %q initial %q is not a direct child", cs.id, cs.initial)
+			if !ok || !isDescendant(child, cs) {
+				return fmt.Errorf("statecharts: compound state %q initial %q is not a descendant of it", cs.id, cs.initial)
 			}
 		case KindParallel:
 			if len(cs.children) == 0 {
