@@ -65,6 +65,8 @@ needs.
   - [Instances](#instances)
   - [The Datamodel](#the-datamodel)
   - [IOProcessor](#ioprocessor)
+  - [Error events](#error-events)
+  - [Log](#log)
   - [Invoke](#invoke)
   - [Persistence](#persistence)
 - [Extras](#extras)
@@ -276,6 +278,44 @@ goroutine is the one that would have to service the call, so doing so
 deadlocks. Use `ExecContext.Raise` to enqueue a follow-up event within the
 same chart instead.
 
+A raised event is processed within the same macrostep-processing chain as
+the event that triggered it, so its effects are already visible by the
+time the outer `Send` returns — unlike `Send` to a different actor, which
+only enqueues delivery elsewhere:
+
+```go
+settle := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
+	ec.Raise(statecharts.Event{Name: "settle"})
+	return nil
+})
+
+chart, err := statecharts.Build(
+	statecharts.Compound("door", "closed",
+		statecharts.Children(
+			statecharts.Atomic("closed", statecharts.On("open.request", statecharts.Target("opening"))),
+			statecharts.Atomic("opening",
+				statecharts.OnEntry(settle),
+				statecharts.On("settle", statecharts.Target("open")),
+			),
+			statecharts.Atomic("open"),
+		),
+	),
+)
+if err != nil {
+	// ...
+}
+
+in := statecharts.New(chart, nil)
+in.Start(ctx)
+defer in.Stop(ctx)
+
+in.Send(ctx, statecharts.Event{Name: "open.request", Type: statecharts.EventExternal})
+fmt.Println(in.Configuration()) // [open] -- "settle" already fired
+```
+
+`opening` is never visible outside the action that raises past it: by the
+time `Send` returns, `settle` has already moved the chart on to `open`.
+
 </details>
 
 ### The Datamodel
@@ -310,6 +350,26 @@ addItem := statecharts.Action(func(c *Cart, ec statecharts.ExecContext) error {
 hasItems := statecharts.Cond(func(c *Cart, ec statecharts.ExecContext) bool {
 	return len(c.Items) > 0
 })
+```
+
+`Send`'s own `Event.Data` field is where a caller attaches the payload
+`Payload` recovers above:
+
+```go
+chart, err := statecharts.Build(
+	statecharts.Atomic("cart", statecharts.On("add", statecharts.Then(addItem))),
+)
+if err != nil {
+	panic(err)
+}
+
+cart := &Cart{}
+in := statecharts.New(chart, cart)
+in.Start(ctx)
+defer in.Stop(ctx)
+
+in.Send(ctx, statecharts.Event{Name: "add", Type: statecharts.EventExternal, Data: "widget"})
+fmt.Println(cart.Items) // [widget]
 ```
 
 `ExecContext`, passed to every callback, gives access to the event
@@ -347,6 +407,75 @@ default `Instance` uses `NoopIOProcessor`, which suppresses all outbound
 dispatch; `LocalIOProcessor` is a starting point for a single-process
 `IOProcessor` implementation, and any type satisfying the `IOProcessor`
 interface can be supplied with `WithIOProcessor`.
+
+</details>
+
+### Error events
+
+<details>
+<summary>Show Error Event Examples</summary>
+
+An `ActionFunc` that returns a non-nil error doesn't propagate that error
+to the caller of `Send`. Per SCXML's own error model, it's reported as an
+`error.execution` event on the internal queue instead — an ordinary event
+a sibling transition can match against, carrying the error itself as its
+`Data`:
+
+```go
+validate := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
+	return errors.New("payment declined")
+})
+
+recordFailure := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
+	ev, _ := ec.Event()
+	fmt.Println(ev.Data) // payment declined
+	return nil
+})
+
+statecharts.Atomic("paying",
+	statecharts.OnEntry(validate),
+	statecharts.On(string(statecharts.ErrEventExecution), statecharts.Target("failed"), statecharts.Then(recordFailure)),
+)
+```
+
+`error.communication` is `error.execution`'s counterpart for `Send`: a
+dispatch that fails at the `IOProcessor` — no `IOProcessor` configured for
+the target, or the configured one returning an error — produces
+`error.communication` instead of a Go error at the `Send` call site, for
+the same reason `error.execution` exists: SCXML executable content has no
+synchronous error return, only further events.
+
+</details>
+
+### Log
+
+<details>
+<summary>Show Log Examples</summary>
+
+`ExecContext.Log(label, data)` is SCXML's `<log>`: diagnostic output for a
+human or a log aggregator to read, with no relationship to a chart's own
+event traffic — unlike `Send`, it never leaves the interpreter's process,
+and unlike `Raise`, it never produces an event a transition could match
+against.
+
+```go
+greet := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
+	ev, _ := ec.Event()
+	ec.Log("received", ev.Name)
+	return nil
+})
+```
+
+Where a `Log` call ends up is a `Logger`, configured per `Instance` with
+`WithLogger`:
+
+```go
+in := statecharts.New(chart, myDatamodel, statecharts.WithLogger(statecharts.NewWriterLogger(os.Stdout)))
+```
+
+`WriterLogger` writes one line per call to an `io.Writer`. An `Instance`
+built with no `WithLogger` option uses `NoopLogger`, which discards every
+call, so a chart that never calls `Log` behaves identically either way.
 
 </details>
 
@@ -501,7 +630,7 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"time"
 
 	"github.com/dhamidi/statecharts"
@@ -513,7 +642,7 @@ func main() {
 
 	greet := func(ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		fmt.Println("alice received", ev.Name, "from", ev.Origin)
+		ec.Log("received", ev)
 		return nil
 	}
 	greeterChart, err := statecharts.Build(
@@ -536,7 +665,7 @@ func main() {
 		panic(err)
 	}
 
-	sys := actors.NewSystem()
+	sys := actors.NewSystem(actors.WithLogger(statecharts.NewWriterLogger(os.Stdout)))
 	sys.Register(greeterChart)
 	sys.Register(callerChart)
 
