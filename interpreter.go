@@ -30,6 +30,7 @@ type interpretation struct {
 
 	io      IOProcessor
 	clock   Clock
+	logger  Logger
 	pending map[Identifier]*pendingSendRecord
 	sendSeq int
 
@@ -87,6 +88,7 @@ func newInterpretation(chart *Chart, datamodel any) *interpretation {
 		pending:        map[Identifier]*pendingSendRecord{},
 		io:             NoopIOProcessor,
 		clock:          NewRealClock(),
+		logger:         NoopLogger,
 		statesToInvoke: map[*compiledState]bool{},
 		activeInvokes:  map[*compiledState][]*runningInvoke{},
 		invokesByID:    map[Identifier]*runningInvoke{},
@@ -309,6 +311,16 @@ func (ip *interpretation) doCancel(sendID Identifier) {
 
 // --- ExecContext plumbing ----------------------------------------------
 
+// doLog is <log>'s implementation: it calls straight through to whichever
+// Logger this interpretation was configured with, with no queue and no
+// dispatch-failure path -- unlike doSend, a Logger call cannot produce a
+// platform error event, since it never reaches an IOProcessor.
+func (ip *interpretation) doLog(label string, data any) {
+	if ip.logger != nil {
+		ip.logger.Log(label, data)
+	}
+}
+
 func (ip *interpretation) execContext() ExecContext {
 	return ExecContext{
 		event:     ip.lastEvent,
@@ -321,6 +333,7 @@ func (ip *interpretation) execContext() ExecContext {
 		raise:  ip.enqueueInternal,
 		send:   ip.doSend,
 		cancel: ip.doCancel,
+		log:    ip.doLog,
 	}
 }
 

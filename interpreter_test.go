@@ -1,6 +1,9 @@
 package statecharts
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func hasState(ids []Identifier, want Identifier) bool {
 	for _, id := range ids {
@@ -459,5 +462,48 @@ func TestInterpreterExitInterpreterRunsRemainingOnExit(t *testing.T) {
 		if exitOrder[i] != id {
 			t.Fatalf("exitOrder = %v, want %v", exitOrder, want)
 		}
+	}
+}
+
+// A non-nil error returned by an ActionFunc is reported as an
+// error.execution platform event (SCXML 5.10.2/C.1), not returned to any
+// caller as a Go error -- a sibling transition armed against it must be
+// able to match and fire on it, mirroring how error.communication already
+// works for a failing <invoke> (see TestInvokeErrorBecomesCommunicationError).
+func TestInterpreterActionErrorBecomesExecutionErrorEvent(t *testing.T) {
+	boom := errors.New("boom")
+	failing := Action(func(d *Door, ec ExecContext) error { return boom })
+
+	var gotErr error
+	recordErr := Action(func(d *Door, ec ExecContext) error {
+		ev, _ := ec.Event()
+		gotErr, _ = ev.Data.(error)
+		return nil
+	})
+
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a",
+					OnEntry(failing),
+					On(string(ErrEventExecution), Target("b"), Then(recordErr)),
+				),
+				Atomic("b"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	d := &Door{}
+	ip := newInterpretation(chart, d)
+	ip.start()
+
+	if got := ip.activeStates(); !hasState(got, "b") {
+		t.Fatalf("configuration = %v, want to contain 'b' after error.execution transition", got)
+	}
+	if gotErr != boom {
+		t.Fatalf("error.execution Data = %v, want %v", gotErr, boom)
 	}
 }

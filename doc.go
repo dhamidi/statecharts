@@ -21,14 +21,18 @@
 // written against the chart's own datamodel type into the untyped
 // ActionFunc and CondFunc that a chart's tree stores; ExecContext gives
 // that callback access to the event being processed, the In() predicate,
-// and the ability to raise, send, or cancel further events.
+// and the ability to raise, send, cancel, or log against the owning
+// Instance.
 //
 // All communication with the world outside a running Instance goes through
 // an IOProcessor, isolating every real side effect behind one interface.
 // Invoke attaches a longer-lived external service to a state instead: an
 // InvokeFunc runs in its own goroutine for as long as the state is active,
 // delivering events back through InvokeIO and cancelled automatically if
-// the state is exited first.
+// the state is exited first. Diagnostic output -- what a chart is doing,
+// for a human or a log aggregator to read -- goes through a separate,
+// simpler seam, Logger, since it never crosses a session boundary and
+// never produces an event a transition could match against.
 //
 // A running chart's state -- its active configuration, recorded history,
 // queued events, and outstanding delayed sends -- can be captured with

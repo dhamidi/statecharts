@@ -357,6 +357,51 @@ func TestRehydrateSuppressesRealDispatchDuringReplayThenGoesLive(t *testing.T) {
 	}
 }
 
+// TestRehydrateWithNilLoggerDoesNotPanicOnceLive reproduces a nil-pointer
+// panic in replayGate.Log: Rehydrate always wraps whatever Logger it finds
+// in a non-nil *replayGate, so doLog's own "logger != nil" guard always
+// passes even when the caller configured WithLogger(nil), and the gate must
+// therefore refuse to dereference a nil wrapped Logger itself once live.
+func TestRehydrateWithNilLoggerDoesNotPanicOnceLive(t *testing.T) {
+	ctx := context.Background()
+	log := newMemLog()
+	store := newMemSnapshotStore()
+	sessionID := "sess-nil-logger"
+
+	logAction := func(ec ExecContext) error {
+		ec.Log("transition", nil)
+		return nil
+	}
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a", On("go", Target("b"), Then(logAction))),
+				Atomic("b", On("back", Target("a"), Then(logAction))),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in2, err := Rehydrate(ctx, chart, nil, log, store, sessionID, NoopIOProcessor, WithLogger(nil))
+	if err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+
+	// A live Send that triggers Log must not panic even though no Logger
+	// was configured.
+	if err := in2.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
+		t.Fatalf("Send after Rehydrate: %v", err)
+	}
+	if !hasState(in2.Configuration(), "b") {
+		t.Fatalf("configuration = %v, want 'b'", in2.Configuration())
+	}
+	if err := in2.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 type spyIOProcessor struct {
 	sendCount int
 }

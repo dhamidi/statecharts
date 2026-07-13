@@ -21,6 +21,7 @@ type systemConfig struct {
 	idleTimeout    time.Duration
 	residencyLimit func(resident int) bool
 	clock          statecharts.Clock
+	logger         statecharts.Logger
 	onSweepError   func(name statecharts.Identifier, err error)
 	fallback       statecharts.IOProcessor
 }
@@ -83,6 +84,12 @@ func WithClock(clk statecharts.Clock) Option {
 	return func(c *systemConfig) { c.clock = clk }
 }
 
+// WithLogger sets the Logger every Instance a System spawns is configured
+// with (see statecharts.WithLogger). Defaults to statecharts.NoopLogger.
+func WithLogger(l statecharts.Logger) Option {
+	return func(c *systemConfig) { c.logger = l }
+}
+
 // WithOnSweepError registers a callback invoked whenever an idle-timeout
 // sweep fails to evict a candidate actor -- e.g. Snapshot, LastSeq, or
 // SnapshotStore.Save returning an error. A sweep runs on its own timer
@@ -116,6 +123,7 @@ func defaultSystemConfig() systemConfig {
 	return systemConfig{
 		idleTimeout: 5 * time.Minute,
 		clock:       statecharts.NewRealClock(),
+		logger:      statecharts.NoopLogger,
 	}
 }
 
@@ -356,10 +364,11 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 		// durable actor's self-scheduled sends would never be durable.
 		inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, string(entry.name), proc,
 			statecharts.WithClock(s.cfg.clock),
+			statecharts.WithLogger(s.cfg.logger),
 			statecharts.WithTimerFiredHook(statecharts.LoggingTimerFiredHook(s.cfg.log, string(entry.name))),
 		)
 	} else {
-		inst = statecharts.New(chart, dm, statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock))
+		inst = statecharts.New(chart, dm, statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock), statecharts.WithLogger(s.cfg.logger))
 		err = inst.Start(ctx)
 	}
 	if err != nil {

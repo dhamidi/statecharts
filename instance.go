@@ -49,6 +49,7 @@ type Option func(*instanceConfig)
 type instanceConfig struct {
 	io             IOProcessor
 	clock          Clock
+	logger         Logger
 	inboxSize      int
 	timerFiredHook func(Identifier, Event) error
 }
@@ -63,6 +64,12 @@ func WithIOProcessor(p IOProcessor) Option {
 // real wall clock.
 func WithClock(clk Clock) Option {
 	return func(c *instanceConfig) { c.clock = clk }
+}
+
+// WithLogger sets the Logger that ExecContext.Log calls are routed to.
+// Defaults to NoopLogger.
+func WithLogger(l Logger) Option {
+	return func(c *instanceConfig) { c.logger = l }
 }
 
 // WithInboxSize sets the buffer size of the actor's ingress channel, i.e.
@@ -86,7 +93,7 @@ func WithTimerFiredHook(fn func(sendID Identifier, ev Event) error) Option {
 }
 
 func defaultInstanceConfig() instanceConfig {
-	return instanceConfig{io: NoopIOProcessor, clock: NewRealClock(), inboxSize: 1}
+	return instanceConfig{io: NoopIOProcessor, clock: NewRealClock(), logger: NoopLogger, inboxSize: 1}
 }
 
 // New constructs an Instance for chart, bound to the given datamodel value
@@ -110,6 +117,7 @@ func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig) *Instance
 
 	ip.io = cfg.io
 	ip.clock = &actorClock{real: cfg.clock, inbox: in.inbox, done: in.doneCh}
+	ip.logger = cfg.logger
 	ip.timerFiredHook = cfg.timerFiredHook
 	ip.startInvoke = in.startInvoke
 	in.ip = ip

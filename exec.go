@@ -15,6 +15,7 @@ type ExecContext struct {
 	raise     func(Event)
 	send      func(name Identifier, opts SendOptions)
 	cancel    func(sendID Identifier)
+	log       func(label string, data any)
 }
 
 // Event returns the event currently being processed, if any. Per SCXML
@@ -64,6 +65,19 @@ func (ec ExecContext) Send(name Identifier, opts SendOptions) {
 func (ec ExecContext) Cancel(sendID Identifier) {
 	if ec.cancel != nil {
 		ec.cancel(sendID)
+	}
+}
+
+// Log records one diagnostic entry, mirroring <log>: label names it, data
+// carries whatever value the call site wants recorded. It is routed to
+// whichever Logger the owning Instance was configured with (see
+// WithLogger), and is a silent no-op if none was. Unlike Send, Log never
+// produces an event another transition can match against, and unlike
+// Raise, it never touches either event queue -- it exists purely for a
+// human or a log aggregator to read.
+func (ec ExecContext) Log(label string, data any) {
+	if ec.log != nil {
+		ec.log(label, data)
 	}
 }
 
