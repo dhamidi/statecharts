@@ -70,6 +70,14 @@ needs.
 - [Extras](#extras)
   - [Testing with a manual clock](#testing-with-a-manual-clock)
   - [The sqllog subpackage](#the-sqllog-subpackage)
+- [Running actor systems](#running-actor-systems)
+  - [Quickstart](#quickstart-1)
+  - [Building a system](#building-a-system)
+  - [Registering and spawning actors](#registering-and-spawning-actors)
+  - [Addressing actors by name](#addressing-actors-by-name)
+  - [Automatic paging](#automatic-paging)
+  - [A full example](#a-full-example)
+  - [Connecting two systems](#connecting-two-systems)
 
 ## Installation
 
@@ -462,3 +470,606 @@ log, err := sqllog.New(db, sqllog.SQLite)
 
 The returned `*sqllog.Log` satisfies both interfaces, so it can be passed
 as both the `log` and `snapshots` arguments to `Rehydrate`.
+
+## Running actor systems
+
+A `*statecharts.Instance` is a Go value: talking to one means holding a
+reference to it. That works as long as everything that needs a session
+lives in the same process and keeps every session it will ever run
+resident in memory. The `actors` subpackage removes that constraint. It
+lets a group of charts run as named actors that address each other by
+name instead of by Go reference, that can be spawned durable so a process
+restart resumes them exactly where they left off, and that are paged into
+and out of memory automatically as they go idle or as the system comes
+under resident-actor pressure -- the virtual actor pattern.
+
+`actors` reuses the root package directly; there is no wrapper type
+standing in for "actor definition":
+
+| Actor-model term | Type |
+| --- | --- |
+| actor definition | `*statecharts.Chart`, given identity by `Chart.ID` and a datamodel factory by `WithNewDatamodel` |
+| actor | `*statecharts.Instance`, spawned under a name |
+| actor system | `*actors.System` |
+
+### Quickstart
+
+Two actors, addressed by name instead of by Go reference:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/dhamidi/statecharts"
+	"github.com/dhamidi/statecharts/actors"
+)
+
+func main() {
+	ctx := context.Background()
+
+	greet := func(ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		fmt.Println("alice received", ev.Name, "from", ev.Origin)
+		return nil
+	}
+	greeterChart, err := statecharts.Build(
+		statecharts.Atomic("greeter", statecharts.On("hello", statecharts.Then(greet))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	sendHello := func(ec statecharts.ExecContext) error {
+		ec.Send("hello", statecharts.SendOptions{Target: "alice"})
+		return nil
+	}
+	callerChart, err := statecharts.Build(
+		statecharts.Atomic("caller", statecharts.On("start", statecharts.Then(sendHello))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	sys := actors.NewSystem()
+	sys.Register(greeterChart)
+	sys.Register(callerChart)
+
+	sys.Spawn(ctx, "alice", greeterChart.ID())
+	sys.Spawn(ctx, "bob", callerChart.ID())
+
+	sys.Tell(ctx, "bob", statecharts.Event{Name: "start", Type: statecharts.EventExternal})
+	time.Sleep(50 * time.Millisecond) // peer delivery hops through a goroutine
+	sys.Stop(ctx)
+}
+```
+
+`bob` addresses `alice` by name from inside its own chart, the same way
+it would address any other executable content target. Neither actor holds
+a Go reference to the other.
+
+### Building a system
+
+`NewSystem` takes functional options, so there are no positional
+constructor arguments to get the order of wrong:
+
+```go
+sys := actors.NewSystem(
+	actors.WithNodeName("main"),
+	actors.WithLog(log),
+	actors.WithSnapshotStore(log),
+	actors.WithIdleTimeout(5*time.Minute),
+)
+```
+
+`WithNodeName` labels the system for diagnostics only -- an actor's name
+means the same thing regardless of which node's `System` happens to have
+it loaded right now. `WithLog` and `WithSnapshotStore` supply the
+durability backing every `Durable` actor; `*sqllog.Log` satisfies both, so
+the same value is commonly passed to each. A `System` with neither
+configured still works -- `Spawn` without `Durable()` never touches them
+-- but `Spawn(..., Durable())` fails if either is missing. `WithIdleTimeout`
+and `WithResidencyLimit` (below) control automatic paging.
+
+### Registering and spawning actors
+
+Register every chart the system will ever spawn before spawning any of
+it -- paging an actor back in reconstructs its `Instance` from the
+registered `Chart`, since the chart's Go value itself is never persisted:
+
+```go
+sys.Register(warehouseChart)
+sys.Register(orderChart)
+```
+
+`Spawn` gives an actor a name -- its address within the system -- and
+starts it running under the chart registered for `kind` (`chart.ID()`):
+
+```go
+sys.Spawn(ctx, "warehouse", "warehouse")               // not durable
+sys.Spawn(ctx, "order-482", "order", actors.Durable()) // durable
+```
+
+Without `Durable()`, `Spawn` behaves like `statecharts.New` plus `Start`:
+the actor begins in its chart's initial configuration and keeps no record
+of what it does. If the process restarts, it's gone.
+
+`Durable()` changes that. A durable actor's messages are appended to the
+system's `Log` before they're applied, and its name doubles as its
+session ID. One call handles both "start fresh" and "resume": if
+`"order-482"` has no prior log entries, `Spawn` starts it fresh; if it
+already has history -- because the process restarted, or because it was
+previously paged out -- `Spawn` loads its latest checkpoint and replays
+everything since, landing the actor back in the exact state it was in
+before, ahead of the first new message being let through. This is what
+"the durable attribute automatically hydrates the actor" means in
+practice: creating an actor and resuming one are the same call. A name's
+durability is fixed at its first `Spawn` -- a name spawned without
+`Durable()` cannot later be spawned durable, and vice versa.
+
+### Addressing actors by name
+
+Every actor a `System` spawns is wired to the same routing `IOProcessor`.
+Addressing another actor from inside a chart is ordinary executable
+content -- `Target` is just the other actor's name:
+
+```go
+placeOrder := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
+	ec.Send("reserve.request", statecharts.SendOptions{
+		Target: "warehouse",
+		Data:   o.SKU,
+	})
+	return nil
+})
+```
+
+The receiving actor doesn't need to be told who sent the message: every
+event a `System` delivers carries `Origin` set to the sender's own name,
+so a reply is just another `Send` targeting `ev.Origin`:
+
+```go
+reserve := statecharts.Action(func(w *Warehouse, ec statecharts.ExecContext) error {
+	ev, _ := ec.Event()
+	sku, _ := statecharts.Payload[string](ev)
+	reply := statecharts.Identifier("reserve.denied")
+	if w.Stock[sku] > 0 {
+		w.Stock[sku]--
+		reply = "reserve.ok"
+	}
+	ec.Send(reply, statecharts.SendOptions{Target: ev.Origin})
+	return nil
+})
+```
+
+Application code outside any chart addresses an actor the same way, with
+`System.Tell`:
+
+```go
+sys.Tell(ctx, "order-482", statecharts.Event{
+	Name: "order.place",
+	Type: statecharts.EventExternal,
+	Data: &skuPayload{TypeName: "sku", Value: "WIDGET-1"},
+})
+```
+
+`Tell` and a chart's own `ec.Send` resolve names identically -- an actor
+cannot tell whether a message came from `Tell` or from another actor in
+the system.
+
+This routing is scoped to one `System`: a name it never spawned is unknown
+to it, full stop, unless it was built with `WithFallback` -- see
+[Connecting two systems](#connecting-two-systems) for addressing an actor
+that lives in a different `System` entirely.
+
+### Automatic paging
+
+A `System` never requires every spawned actor to be resident in memory at
+once. A durable actor idle past `WithIdleTimeout` is checkpointed and
+stopped, freeing its goroutine and its datamodel; the system keeps only
+the fact that the name exists and which kind it is. The next message
+addressed to that name -- from `Tell` or from another actor's `Send` --
+transparently pages it back in, through the same `Durable()`-hydration
+path `Spawn` uses, with the message held until the actor is caught up and
+ready to receive it. Nothing about sending to a durable actor reveals
+whether it happened to already be resident.
+
+Idle timeouts alone don't protect a node from holding more resident
+actors than it has room for -- a system under heavy, broad traffic may
+never see any one actor go idle. `WithResidencyLimit` gives the system a
+predicate to consult before admitting a new activation, called with the
+current resident count:
+
+```go
+sys := actors.NewSystem(
+	actors.WithLog(log),
+	actors.WithSnapshotStore(log),
+	actors.WithResidencyLimit(func(resident int) bool {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.Alloc > 2<<30 // evict once this node has 2 GiB resident
+	}),
+)
+```
+
+`WithMaxResident(n)` is sugar for the common case, a plain count cap.
+When the predicate returns true, the system evicts durable resident
+actors, least-recently-active first, until either the predicate is
+satisfied or no durable resident actor is left to evict. If every
+resident actor is pinned and the predicate still says to evict, admitting
+the new activation fails rather than silently exceeding budget.
+
+Paging applies to durable actors only. A non-durable actor has no `Log`
+to rebuild itself from, so evicting one from memory would destroy it
+rather than hibernate it; `actors` keeps non-durable actors resident for
+as long as the system itself runs, which is the right behavior for
+something meant to always be around, like a `"warehouse"` singleton.
+
+### A full example
+
+A warehouse actor holds stock. An order actor reserves against it and
+records whether the reservation succeeded. The order is durable, so it
+survives a restart in whatever state it last reached:
+
+```go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/dhamidi/statecharts"
+	"github.com/dhamidi/statecharts/actors"
+	"github.com/dhamidi/statecharts/sqllog"
+)
+
+type Warehouse struct {
+	Stock map[string]int
+}
+
+type OrderData struct {
+	SKU    string
+	Status string
+}
+
+// skuPayload is the DataMarshaler wrapper "order.place" carries its SKU
+// in. A durable actor's incoming events are appended to the Log before
+// they're applied, so any Event.Data reaching one must implement
+// statecharts.DataMarshaler; JSONData is a ready-made implementation.
+// "reserve.request" and the replies below target actors that are either
+// non-durable (warehouse) or carry no Data at all, so they need no such
+// wrapper.
+type skuPayload = statecharts.JSONData[string]
+
+func init() {
+	statecharts.RegisterDataType("sku", func() statecharts.DataUnmarshaler {
+		return &skuPayload{TypeName: "sku"}
+	})
+}
+
+func buildWarehouseChart() *statecharts.Chart {
+	reserve := statecharts.Action(func(w *Warehouse, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		sku, _ := statecharts.Payload[string](ev)
+		reply := statecharts.Identifier("reserve.denied")
+		if w.Stock[sku] > 0 {
+			w.Stock[sku]--
+			reply = "reserve.ok"
+		}
+		ec.Send(reply, statecharts.SendOptions{Target: ev.Origin})
+		return nil
+	})
+	chart, err := statecharts.Build(
+		statecharts.Atomic("warehouse", statecharts.On("reserve.request", statecharts.Then(reserve))),
+		statecharts.WithNewDatamodel(func() any {
+			return &Warehouse{Stock: map[string]int{"WIDGET-1": 100}}
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
+func buildOrderChart() *statecharts.Chart {
+	placeOrder := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		if payload, ok := statecharts.Payload[*skuPayload](ev); ok {
+			o.SKU = payload.Value
+		}
+		ec.Send("reserve.request", statecharts.SendOptions{Target: "warehouse", Data: o.SKU})
+		return nil
+	})
+	recordConfirmed := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
+		o.Status = "confirmed"
+		return nil
+	})
+	recordFailed := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
+		o.Status = "failed"
+		return nil
+	})
+	chart, err := statecharts.Build(
+		statecharts.Compound("order", "new",
+			statecharts.Children(
+				statecharts.Atomic("new",
+					statecharts.On("order.place", statecharts.Target("reserving"), statecharts.Then(placeOrder)),
+				),
+				statecharts.Atomic("reserving",
+					statecharts.On("reserve.ok", statecharts.Target("confirmed"), statecharts.Then(recordConfirmed)),
+					statecharts.On("reserve.denied", statecharts.Target("failed"), statecharts.Then(recordFailed)),
+				),
+				statecharts.Atomic("confirmed"),
+				statecharts.Atomic("failed"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &OrderData{} }),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
+func buildSystem(log *sqllog.Log) *actors.System {
+	sys := actors.NewSystem(
+		actors.WithNodeName("main"),
+		actors.WithLog(log),
+		actors.WithSnapshotStore(log),
+		actors.WithIdleTimeout(5*time.Minute),
+		actors.WithMaxResident(10_000),
+	)
+	if err := sys.Register(buildWarehouseChart()); err != nil {
+		panic(err)
+	}
+	if err := sys.Register(buildOrderChart()); err != nil {
+		panic(err)
+	}
+	return sys
+}
+
+func main() {
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite", "actors.db")
+	if err != nil {
+		panic(err)
+	}
+	log, err := sqllog.New(db, sqllog.SQLite)
+	if err != nil {
+		panic(err)
+	}
+
+	sys := buildSystem(log)
+
+	if err := sys.Spawn(ctx, "warehouse", "warehouse"); err != nil {
+		panic(err)
+	}
+	if err := sys.Spawn(ctx, "order-482", "order", actors.Durable()); err != nil {
+		panic(err)
+	}
+
+	if err := sys.Tell(ctx, "order-482", statecharts.Event{
+		Name: "order.place",
+		Type: statecharts.EventExternal,
+		Data: &skuPayload{TypeName: "sku", Value: "WIDGET-1"},
+	}); err != nil {
+		panic(err)
+	}
+
+	time.Sleep(50 * time.Millisecond) // peer delivery hops through a goroutine
+
+	if err := sys.Stop(ctx); err != nil {
+		panic(err)
+	}
+
+	// Later, possibly in a different process entirely, against the same Log:
+	sys2 := buildSystem(log)
+	if err := sys2.Spawn(ctx, "order-482", "order", actors.Durable()); err != nil {
+		panic(err)
+	}
+	// order-482 resumes in "confirmed" without replaying "order.place" or
+	// "reserve.ok" as new messages against the warehouse -- they're already
+	// baked into its checkpointed state.
+	if err := sys2.Stop(ctx); err != nil {
+		panic(err)
+	}
+
+	fmt.Println("order-482 resumed")
+}
+```
+
+### Connecting two systems
+
+Every actor a `System` addresses by name lives inside that one `System`. A
+name it never spawned is unknown to it, full stop -- there is no way for an
+actor in one `System` to reach a name that belongs to a different `System`,
+unless that `System` is built with `WithFallback`.
+
+`WithFallback` gives a `System` an `IOProcessor` to try once its own
+routing table comes up empty for a `Send`'s target. A name the `System`
+already knows -- spawned there, resident or not -- is always resolved
+locally first; the fallback only ever sees a `Send` for a name outside that
+table. It's the same seam every actor already sends through,
+`IOProcessor`, doing the same job one level up: routing between Systems
+instead of between actors inside one.
+
+`Bridge` is a ready-made fallback `IOProcessor` for connecting two
+`System`s. It's configured with a namespace and a target `System`: `Send`
+accepts only targets whose first segment is that namespace, strips it, and
+delivers what's left to the target via `Tell`. An actor in `sysA` reaches
+an actor named `"billing"` in `sysB` by addressing
+`"warehouse-b.billing"`, once `sysA` is built with a `Bridge` for the
+`"warehouse-b"` namespace pointed at `sysB`.
+
+Replies work the same way, in reverse. `Bridge` stamps `Origin` with its
+own namespace, so a reply -- an ordinary `Send` targeting `ev.Origin`,
+exactly like a same-`System` reply -- lands on a namespaced address a
+`Bridge` on the other side recognizes and strips in turn. Connecting two
+`System`s both ways takes one `Bridge` each, one per direction.
+
+Wiring them together is circular: each `Bridge`'s target is the other
+`System`, but neither `System` can finish being built -- `WithFallback`
+wants a complete `IOProcessor` -- before the other one exists.
+`NewBridge` accepts a `nil` target to break the cycle; `Bridge.SetTarget`
+fills it in once both `System`s exist, before either receives any traffic:
+
+```go
+toOrders := actors.NewBridge("orders-system", nil, "warehouse-system")
+warehouseSystem := actors.NewSystem(actors.WithFallback(toOrders))
+// ... register charts and spawn actors on warehouseSystem ...
+
+ordersSystem := actors.NewSystem(actors.WithFallback(
+	actors.NewBridge("warehouse-system", warehouseSystem, "orders-system"),
+))
+// ... register charts and spawn actors on ordersSystem ...
+
+toOrders.SetTarget(ordersSystem)
+```
+
+`Bridge.Send` never blocks on delivery, the same way a `System`'s own
+routing `IOProcessor` never does: it checks the namespace and looks up the
+target name in the target `System`'s table -- both cheap, synchronous
+lookups -- and hands the actual delivery off to a goroutine before
+returning. A slow or wedged actor on the far side of a bridge holds up only
+that goroutine, never the sender's own.
+
+A complete example: `warehouse-system` holds a warehouse actor,
+`orders-system` holds an order actor, and an order in one reserves stock in
+the other by addressing it across the bridge:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/dhamidi/statecharts"
+	"github.com/dhamidi/statecharts/actors"
+)
+
+type Warehouse struct {
+	Stock map[string]int
+}
+
+type OrderData struct {
+	Status string
+}
+
+func buildWarehouseChart() *statecharts.Chart {
+	reserve := statecharts.Action(func(w *Warehouse, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		sku, _ := statecharts.Payload[string](ev)
+		reply := statecharts.Identifier("reserve.denied")
+		if w.Stock[sku] > 0 {
+			w.Stock[sku]--
+			reply = "reserve.ok"
+		}
+		ec.Send(reply, statecharts.SendOptions{Target: ev.Origin})
+		return nil
+	})
+	chart, err := statecharts.Build(
+		statecharts.Atomic("warehouse", statecharts.On("reserve.request", statecharts.Then(reserve))),
+		statecharts.WithNewDatamodel(func() any {
+			return &Warehouse{Stock: map[string]int{"WIDGET-1": 100}}
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
+func buildOrderChart() *statecharts.Chart {
+	placeOrder := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
+		ec.Send("reserve.request", statecharts.SendOptions{
+			Target: "warehouse-system.warehouse",
+			Data:   "WIDGET-1",
+		})
+		return nil
+	})
+	recordConfirmed := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
+		o.Status = "confirmed"
+		return nil
+	})
+	recordFailed := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
+		o.Status = "failed"
+		return nil
+	})
+	chart, err := statecharts.Build(
+		statecharts.Compound("order", "new",
+			statecharts.Children(
+				statecharts.Atomic("new",
+					statecharts.On("order.place", statecharts.Target("reserving"), statecharts.Then(placeOrder)),
+				),
+				statecharts.Atomic("reserving",
+					statecharts.On("reserve.ok", statecharts.Target("confirmed"), statecharts.Then(recordConfirmed)),
+					statecharts.On("reserve.denied", statecharts.Target("failed"), statecharts.Then(recordFailed)),
+				),
+				statecharts.Atomic("confirmed"),
+				statecharts.Atomic("failed"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &OrderData{} }),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
+func main() {
+	ctx := context.Background()
+
+	// warehouseSystem's Bridge needs ordersSystem as its target, but
+	// ordersSystem's own Bridge needs warehouseSystem -- built first here
+	// -- as its target. NewBridge accepts a nil target to break the cycle;
+	// toOrders is wired up with SetTarget once ordersSystem exists.
+	toOrders := actors.NewBridge("orders-system", nil, "warehouse-system")
+	warehouseSystem := actors.NewSystem(actors.WithFallback(toOrders))
+	if err := warehouseSystem.Register(buildWarehouseChart()); err != nil {
+		panic(err)
+	}
+	if err := warehouseSystem.Spawn(ctx, "warehouse", "warehouse"); err != nil {
+		panic(err)
+	}
+
+	ordersSystem := actors.NewSystem(actors.WithFallback(
+		actors.NewBridge("warehouse-system", warehouseSystem, "orders-system"),
+	))
+	if err := ordersSystem.Register(buildOrderChart()); err != nil {
+		panic(err)
+	}
+	if err := ordersSystem.Spawn(ctx, "order-482", "order"); err != nil {
+		panic(err)
+	}
+	toOrders.SetTarget(ordersSystem)
+
+	if err := ordersSystem.Tell(ctx, "order-482", statecharts.Event{
+		Name: "order.place",
+		Type: statecharts.EventExternal,
+	}); err != nil {
+		panic(err)
+	}
+
+	time.Sleep(50 * time.Millisecond) // the reservation round-trips through both bridges
+
+	if err := warehouseSystem.Stop(ctx); err != nil {
+		panic(err)
+	}
+	if err := ordersSystem.Stop(ctx); err != nil {
+		panic(err)
+	}
+
+	fmt.Println("order-482 reserved WIDGET-1 in a different System entirely")
+}
+```
