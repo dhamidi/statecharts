@@ -108,6 +108,83 @@ func TestPeerMessagingSetsOriginAndAllowsReply(t *testing.T) {
 	}
 }
 
+func TestSpawnNonDurableInstanceIDMatchesName(t *testing.T) {
+	ctx := context.Background()
+	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	sys := NewSystem()
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "solo-name", chart.ID()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	inst := testInstanceFor(sys, "solo-name")
+	if inst == nil {
+		t.Fatalf("solo-name not resident after Spawn")
+	}
+	if inst.ID() != "solo-name" {
+		t.Fatalf("Instance.ID() = %q, want %q (the spawned name)", inst.ID(), "solo-name")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestSpawnDurableInstanceIDMatchesName(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+
+	var dms []*counterModel
+	chart := buildLadderChart(&dms)
+
+	sys := NewSystem(WithLog(log), WithSnapshotStore(log))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "durable-name", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	inst := testInstanceFor(sys, "durable-name")
+	if inst == nil {
+		t.Fatalf("durable-name not resident after Spawn")
+	}
+	if inst.ID() != "durable-name" {
+		t.Fatalf("Instance.ID() = %q, want %q (the spawned name)", inst.ID(), "durable-name")
+	}
+
+	// Paging out and back in (via idle eviction, simulated directly through
+	// Stop+re-Spawn against the same Log) must still land on the same ID,
+	// since Rehydrate's sessionID parameter is entry.name either way.
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	sys2 := NewSystem(WithLog(log), WithSnapshotStore(log))
+	if err := sys2.Register(buildLadderChart(&dms)); err != nil {
+		t.Fatalf("Register (sys2): %v", err)
+	}
+	if err := sys2.Spawn(ctx, "durable-name", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn (sys2): %v", err)
+	}
+	inst2 := testInstanceFor(sys2, "durable-name")
+	if inst2 == nil {
+		t.Fatalf("durable-name not resident in sys2 after Spawn")
+	}
+	if inst2.ID() != "durable-name" {
+		t.Fatalf("resumed Instance.ID() = %q, want %q", inst2.ID(), "durable-name")
+	}
+	if err := sys2.Stop(ctx); err != nil {
+		t.Fatalf("Stop (sys2): %v", err)
+	}
+}
+
 func TestSendToUnknownActorSurfacesAsCommunicationError(t *testing.T) {
 	ctx := context.Background()
 	chart := buildCommTestChart("nobody-home")

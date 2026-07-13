@@ -9,10 +9,10 @@ import (
 )
 
 // Snapshot is a point-in-time capture of everything about a running chart's
-// state except the datamodel: the active configuration, recorded history,
-// both event queues, the running flag, and any outstanding delayed sends.
-// The datamodel is explicitly excluded -- it is the caller's own Go
-// value(s), serialized by the caller if desired.
+// state except the datamodel: the session id, the active configuration,
+// recorded history, both event queues, the running flag, and any
+// outstanding delayed sends. The datamodel is explicitly excluded -- it is
+// the caller's own Go value(s), serialized by the caller if desired.
 //
 // Snapshot is a derivable checkpoint, not an independent source of truth: it
 // captures exactly what replaying a Log up to some point would produce, and
@@ -20,6 +20,7 @@ import (
 // every time (see Checkpoint, Rehydrate in replay.go).
 type Snapshot struct {
 	Version       int
+	ID            string // SCXML 5.10's _sessionid for this session; Restore preserves it unless WithSessionID overrides it
 	Configuration []Identifier
 	HistoryValue  map[Identifier][]Identifier
 	InternalQueue []Event
@@ -75,6 +76,7 @@ func (in *Instance) buildSnapshot() Snapshot {
 	ip := in.ip
 	snap := Snapshot{
 		Version:       snapshotVersion,
+		ID:            ip.sessionID,
 		Configuration: ip.activeStates(),
 		HistoryValue:  map[Identifier][]Identifier{},
 		InternalQueue: append([]Event(nil), ip.internalQueue...),
@@ -105,8 +107,10 @@ func (in *Instance) buildSnapshot() Snapshot {
 
 // Restore reconstructs a paused Instance directly from a Snapshot, without
 // re-running any onentry/initial-transition executable content (those
-// already ran historically). It validates that every state ID mentioned in
-// snap still exists in chart, returning an error on drift. Pending sends are
+// already ran historically). Its session id follows the same precedence as
+// Instance.ID: an explicit WithSessionID, then snap.ID, then the configured
+// IDGenerator. It validates that every state ID mentioned in snap still
+// exists in chart, returning an error on drift. Pending sends are
 // re-armed as real timers relative to time.Until(FireAt) (firing
 // immediately if already overdue). The Instance is constructed but not
 // started; call Start to spawn its goroutine.
@@ -115,8 +119,19 @@ func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Insta
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	// Precedence, highest to lowest: an explicit WithSessionID, an id
+	// already recorded in snap, then the configured IDGenerator -- resolved
+	// here, before constructing anything, so the generator is never invoked
+	// speculatively only to be discarded.
+	id := cfg.sessionID
+	if id == "" {
+		id = snap.ID
+	}
+	if id == "" {
+		id = cfg.idGen.NewID()
+	}
 	ip := newInterpretation(chart, datamodel)
-	in := newInstance(chart, ip, cfg)
+	in := newInstance(chart, ip, cfg, id)
 	if err := ip.restoreFrom(chart, snap); err != nil {
 		return nil, err
 	}
@@ -185,6 +200,7 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 
 type snapshotWire struct {
 	Version       int                         `json:"version"`
+	ID            string                      `json:"id,omitempty"`
 	Configuration []Identifier                `json:"configuration"`
 	HistoryValue  map[Identifier][]Identifier `json:"history_value,omitempty"`
 	InternalQueue []EncodedEvent              `json:"internal_queue,omitempty"`
@@ -205,6 +221,7 @@ type pendingSendWire struct {
 func (s Snapshot) MarshalJSON() ([]byte, error) {
 	wire := snapshotWire{
 		Version:       s.Version,
+		ID:            s.ID,
 		Configuration: s.Configuration,
 		HistoryValue:  s.HistoryValue,
 		Running:       s.Running,
@@ -242,6 +259,7 @@ func (s *Snapshot) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	s.Version = wire.Version
+	s.ID = wire.ID
 	s.Configuration = wire.Configuration
 	s.HistoryValue = wire.HistoryValue
 	s.Running = wire.Running

@@ -368,7 +368,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 			statecharts.WithTimerFiredHook(statecharts.LoggingTimerFiredHook(s.cfg.log, string(entry.name))),
 		)
 	} else {
-		inst = statecharts.New(chart, dm, statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock), statecharts.WithLogger(s.cfg.logger))
+		inst = statecharts.New(chart, dm, statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock), statecharts.WithLogger(s.cfg.logger), statecharts.WithSessionID(string(entry.name)))
 		err = inst.Start(ctx)
 	}
 	if err != nil {

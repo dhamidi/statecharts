@@ -254,6 +254,106 @@ func TestInstanceDelayedSendFiresAndCanBeCancelled(t *testing.T) {
 	}
 }
 
+func TestInstanceDefaultSessionIDIsNonEmptyAndVaries(t *testing.T) {
+	chart := doorChart(t)
+
+	in1 := New(chart, &Door{})
+	in2 := New(chart, &Door{})
+
+	if in1.ID() == "" {
+		t.Fatalf("Instance.ID() = %q, want non-empty", in1.ID())
+	}
+	if in2.ID() == "" {
+		t.Fatalf("Instance.ID() = %q, want non-empty", in2.ID())
+	}
+	if in1.ID() == in2.ID() {
+		t.Fatalf("two Instances minted the same default session id %q, want distinct ids", in1.ID())
+	}
+}
+
+func TestInstanceWithIDGeneratorOverridesDefault(t *testing.T) {
+	chart := doorChart(t)
+	gen := &ManualIDGenerator{}
+
+	in1 := New(chart, &Door{}, WithIDGenerator(gen))
+	in2 := New(chart, &Door{}, WithIDGenerator(gen))
+
+	if in1.ID() != "id-1" {
+		t.Fatalf("in1.ID() = %q, want %q", in1.ID(), "id-1")
+	}
+	if in2.ID() != "id-2" {
+		t.Fatalf("in2.ID() = %q, want %q", in2.ID(), "id-2")
+	}
+}
+
+func TestInstanceWithSessionIDTakesPriorityOverGenerator(t *testing.T) {
+	chart := doorChart(t)
+	gen := &ManualIDGenerator{}
+
+	in := New(chart, &Door{}, WithIDGenerator(gen), WithSessionID("explicit-id"))
+	if in.ID() != "explicit-id" {
+		t.Fatalf("in.ID() = %q, want %q (WithSessionID must win over WithIDGenerator)", in.ID(), "explicit-id")
+	}
+}
+
+func TestExecContextSessionIDAndNameInsideActionAndGuard(t *testing.T) {
+	var gotSessionID string
+	var gotName string
+	var guardSessionID string
+	var guardName string
+
+	recordAndOpen := Action(func(d *Door, ec ExecContext) error {
+		gotSessionID = ec.SessionID()
+		gotName = ec.Name()
+		d.OpenCount++
+		return nil
+	})
+	guardSeesIdentity := Cond(func(d *Door, ec ExecContext) bool {
+		guardSessionID = ec.SessionID()
+		guardName = ec.Name()
+		return true
+	})
+
+	chart, err := Build(
+		Compound("door", "closed",
+			Children(
+				Atomic("closed", On("open.request", Target("open"), If(guardSeesIdentity), Then(recordAndOpen))),
+				Atomic("open"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	d := &Door{}
+	in := New(chart, d, WithSessionID("sess-xyz"))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := in.Send(ctx, Event{Name: "open.request", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if gotSessionID != "sess-xyz" {
+		t.Fatalf("ExecContext.SessionID() inside action = %q, want %q", gotSessionID, "sess-xyz")
+	}
+	if gotName != string(chart.ID()) {
+		t.Fatalf("ExecContext.Name() inside action = %q, want %q", gotName, chart.ID())
+	}
+	if guardSessionID != "sess-xyz" {
+		t.Fatalf("ExecContext.SessionID() inside guard = %q, want %q", guardSessionID, "sess-xyz")
+	}
+	if guardName != string(chart.ID()) {
+		t.Fatalf("ExecContext.Name() inside guard = %q, want %q", guardName, chart.ID())
+	}
+
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestInstanceCancelledSendNeverFires(t *testing.T) {
 	scheduleAndCancel := Action(func(d *struct{}, ec ExecContext) error {
 		ec.Send("timeout", SendOptions{SendID: "t1", Delay: 5 * time.Second})

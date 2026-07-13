@@ -131,6 +131,92 @@ func TestSnapshotRoundTripJSON(t *testing.T) {
 	}
 }
 
+func TestSnapshotJSONRoundTripsID(t *testing.T) {
+	chart := doorChart(t)
+	d := &Door{}
+	in := New(chart, d, WithSessionID("sess-json-id"))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	snap, err := in.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap.ID != "sess-json-id" {
+		t.Fatalf("snap.ID = %q, want %q", snap.ID, "sess-json-id")
+	}
+
+	b, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Snapshot
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ID != "sess-json-id" {
+		t.Fatalf("round-tripped ID = %q, want %q", got.ID, "sess-json-id")
+	}
+
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestRestorePreservesSessionIDFromSnapshot(t *testing.T) {
+	chart := doorChart(t)
+	d1 := &Door{}
+	in1 := New(chart, d1, WithSessionID("original-session"))
+	ctx := context.Background()
+	if err := in1.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	snap, err := in1.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if err := in1.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	d2 := &Door{}
+	in2, err := Restore(chart, d2, snap)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if in2.ID() != "original-session" {
+		t.Fatalf("restored Instance.ID() = %q, want %q (preserved from Snapshot)", in2.ID(), "original-session")
+	}
+}
+
+func TestRestoreWithSessionIDOverridesSnapshot(t *testing.T) {
+	chart := doorChart(t)
+	d1 := &Door{}
+	in1 := New(chart, d1, WithSessionID("original-session"))
+	ctx := context.Background()
+	if err := in1.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	snap, err := in1.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if err := in1.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	d2 := &Door{}
+	in2, err := Restore(chart, d2, snap, WithSessionID("override-session"))
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if in2.ID() != "override-session" {
+		t.Fatalf("restored Instance.ID() = %q, want %q (explicit WithSessionID must override the Snapshot's)", in2.ID(), "override-session")
+	}
+}
+
 func TestRestoreFromSnapshot(t *testing.T) {
 	chart := doorChart(t)
 	d1 := &Door{}

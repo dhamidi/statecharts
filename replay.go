@@ -71,8 +71,11 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 	gate := &replayGate{io: realIO, logger: probe.logger}
 	// The gate is appended last so it always wins over any conflicting
 	// WithIOProcessor/WithLogger a caller might mistakenly also pass in
-	// opts.
-	allOpts := append(append([]Option{}, opts...), WithIOProcessor(gate), WithLogger(gate))
+	// opts. WithSessionID(sessionID) is appended last for a different
+	// reason: this call's own sessionID parameter, not whatever a caller
+	// might have passed in opts, is the authoritative identity for the
+	// resulting Instance.
+	allOpts := append(append([]Option{}, opts...), WithIOProcessor(gate), WithLogger(gate), WithSessionID(sessionID))
 
 	from := uint64(1)
 	var in *Instance

@@ -2,6 +2,7 @@ package statecharts
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -52,6 +53,8 @@ type instanceConfig struct {
 	logger         Logger
 	inboxSize      int
 	timerFiredHook func(Identifier, Event) error
+	idGen          IDGenerator
+	sessionID      string
 }
 
 // WithIOProcessor sets the IOProcessor used for genuinely external dispatch.
@@ -92,22 +95,50 @@ func WithTimerFiredHook(fn func(sendID Identifier, ev Event) error) Option {
 	return func(c *instanceConfig) { c.timerFiredHook = fn }
 }
 
+// WithIDGenerator sets the IDGenerator used to mint this Instance's session
+// id (SCXML 5.10's _sessionid) when no explicit WithSessionID is given.
+// Defaults to IDGeneratorFunc(rand.Text) (crypto/rand.Text). Tests that need
+// a reproducible id instead of random text can pass a ManualIDGenerator.
+func WithIDGenerator(g IDGenerator) Option {
+	return func(c *instanceConfig) { c.idGen = g }
+}
+
+// WithSessionID pins this Instance's session id (SCXML 5.10's _sessionid) to
+// an id the caller already has -- e.g. from a Log -- instead of minting a
+// fresh one. It takes priority over both the configured IDGenerator and,
+// for Restore, any id recorded in the Snapshot being restored from.
+func WithSessionID(id string) Option {
+	return func(c *instanceConfig) { c.sessionID = id }
+}
+
 func defaultInstanceConfig() instanceConfig {
-	return instanceConfig{io: NoopIOProcessor, clock: NewRealClock(), logger: NoopLogger, inboxSize: 1}
+	return instanceConfig{
+		io:        NoopIOProcessor,
+		clock:     NewRealClock(),
+		logger:    NoopLogger,
+		inboxSize: 1,
+		idGen:     IDGeneratorFunc(rand.Text),
+	}
 }
 
 // New constructs an Instance for chart, bound to the given datamodel value
-// (typically a pointer to the caller's own struct). The interpreter
+// (typically a pointer to the caller's own struct). It assigns the
+// Instance's session id: an explicit WithSessionID if given, otherwise one
+// minted by the configured IDGenerator (see Instance.ID). The interpreter
 // goroutine is not started until Start is called.
 func New(chart *Chart, datamodel any, opts ...Option) *Instance {
 	cfg := defaultInstanceConfig()
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return newInstance(chart, newInterpretation(chart, datamodel), cfg)
+	id := cfg.sessionID
+	if id == "" {
+		id = cfg.idGen.NewID()
+	}
+	return newInstance(chart, newInterpretation(chart, datamodel), cfg, id)
 }
 
-func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig) *Instance {
+func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id string) *Instance {
 	in := &Instance{
 		chart:   chart,
 		inbox:   make(chan actorRequest, cfg.inboxSize),
@@ -120,10 +151,20 @@ func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig) *Instance
 	ip.logger = cfg.logger
 	ip.timerFiredHook = cfg.timerFiredHook
 	ip.startInvoke = in.startInvoke
+	ip.sessionID = id
+	ip.name = chart.ID()
 	in.ip = ip
 
 	cfg.io.Attach(in)
 	return in
+}
+
+// ID returns this Instance's session id (SCXML 5.10's _sessionid). In order
+// of precedence, it is an explicit WithSessionID, an id recorded in the
+// Snapshot Restore was called with, or one minted by the configured
+// IDGenerator. It is stable for the lifetime of the Instance.
+func (in *Instance) ID() string {
+	return in.ip.sessionID
 }
 
 // invokeIncomingBuffer bounds how many "#_<invokeid>"-addressed events an

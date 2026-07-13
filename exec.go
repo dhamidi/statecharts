@@ -11,6 +11,8 @@ type ExecContext struct {
 	event     Event
 	hasEvent  bool
 	datamodel any
+	sessionID string
+	name      Identifier
 	active    func(Identifier) bool
 	raise     func(Event)
 	send      func(name Identifier, opts SendOptions)
@@ -47,6 +49,19 @@ func (ec ExecContext) Raise(ev Event) {
 // the Action[D]/Cond[D] adapters for callers that need untyped access.
 func (ec ExecContext) Datamodel() any {
 	return ec.datamodel
+}
+
+// SessionID returns this session's id, bound for its entire lifetime, per
+// SCXML 5.10's _sessionid. See WithSessionID and WithIDGenerator
+// (instance.go) for how it is minted or supplied.
+func (ec ExecContext) SessionID() string {
+	return ec.sessionID
+}
+
+// Name returns the chart's own name (Chart.ID()), bound for this session's
+// entire lifetime, per SCXML 5.10's _name.
+func (ec ExecContext) Name() string {
+	return string(ec.name)
 }
 
 // Send schedules delivery of an event, mirroring <send>: immediately (if
