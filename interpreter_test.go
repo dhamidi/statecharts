@@ -358,6 +358,39 @@ func TestInterpreterTopLevelFinalStops(t *testing.T) {
 	}
 }
 
+// SCXML 5.10.1: every event carries the sendid of whichever <send>
+// produced it, so a handler can correlate a reply (or a self-raised
+// follow-up) back to the specific send that generated it. Self-delivered
+// sends -- the default target and "#_internal" -- went through a
+// different path than genuinely external ones (which only ever attach
+// SendID to the IOProcessor's SendRequest) and silently dropped it.
+func TestInterpreterSendIDPropagatesToSelfDeliveredEvents(t *testing.T) {
+	var gotSendID Identifier
+	chart, err := Build(
+		Atomic("only",
+			OnEntry(Action(func(d *struct{}, ec ExecContext) error {
+				ec.Send("ping", SendOptions{SendID: "my-id", Target: "#_internal"})
+				return nil
+			})),
+			On("ping", Then(Action(func(d *struct{}, ec ExecContext) error {
+				ev, _ := ec.Event()
+				gotSendID = ev.SendID
+				return nil
+			}))),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, &struct{}{})
+	ip.start()
+
+	if gotSendID != "my-id" {
+		t.Fatalf("_event.sendid = %q, want %q", gotSendID, "my-id")
+	}
+}
+
 // SCXML Appendix D's exitInterpreter() procedure requires every state still
 // in the configuration -- not just the one whose entry flipped running to
 // false -- to run its onexit handlers, in exit order, once the machine

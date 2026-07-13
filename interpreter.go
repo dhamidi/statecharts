@@ -182,7 +182,7 @@ func (ip *interpretation) doSend(name Identifier, opts SendOptions) {
 		ip.sendSeq++
 		sendID = Identifier(fmt.Sprintf("send.%d", ip.sendSeq))
 	}
-	ev := Event{Name: name, Data: opts.Data}
+	ev := Event{Name: name, Data: opts.Data, SendID: sendID}
 
 	if opts.Delay <= 0 {
 		ip.dispatchNow(sendID, opts.Target, opts.Type, ev)
