@@ -20,6 +20,7 @@ type compiledState struct {
 	onEntry     []ActionFunc
 	onExit      []ActionFunc
 	transitions []*compiledTransition
+	invokes     []*compiledInvoke
 	done        DoneDataFunc
 	docOrder    int
 }
@@ -90,6 +91,15 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 			actions:  t.Actions,
 			internal: t.Internal,
 			source:   cs,
+		})
+	}
+
+	for _, inv := range spec.Invokes {
+		cs.invokes = append(cs.invokes, &compiledInvoke{
+			id:       inv.ID,
+			start:    inv.Start,
+			params:   inv.Params,
+			finalize: inv.Finalize,
 		})
 	}
 

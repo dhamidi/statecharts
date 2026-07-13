@@ -111,10 +111,67 @@ func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig) *Instance
 	ip.io = cfg.io
 	ip.clock = &actorClock{real: cfg.clock, inbox: in.inbox, done: in.doneCh}
 	ip.timerFiredHook = cfg.timerFiredHook
+	ip.startInvoke = in.startInvoke
 	in.ip = ip
 
 	cfg.io.Attach(in)
 	return in
+}
+
+// invokeIncomingBuffer bounds how many "#_<invokeid>"-addressed events an
+// invocation can have queued before dispatchNow starts dropping them
+// (never blocking the interpreter goroutine on a slow or absent reader).
+const invokeIncomingBuffer = 16
+
+// startInvoke is interpretation's invokeRunnerFunc: it launches spec.start
+// in its own goroutine -- not the actor's -- and wires its completion (or
+// failure, or panic) back through Deliver, exactly like any other external
+// arrival. ctx is cancelled by the returned cancel func, which
+// interpretation.cancelInvokes calls as part of exiting the invoking state
+// (SCXML 6.4.2); a goroutine that observes ctx already done by the time it
+// returns generates neither done.invoke nor error.communication, per SCXML
+// 6.4.3.
+func (in *Instance) startInvoke(id Identifier, spec *compiledInvoke, params any) (cancel func(), incoming chan<- Event) {
+	ctx, cancelFn := context.WithCancel(context.Background())
+	inbound := make(chan Event, invokeIncomingBuffer)
+	io := InvokeIO{
+		Deliver: func(ev Event) {
+			if ctx.Err() != nil {
+				return
+			}
+			ev.InvokeID = id
+			ev.Type = EventExternal
+			_ = in.Deliver(ctx, ev)
+		},
+		Incoming: inbound,
+	}
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil && ctx.Err() == nil {
+				_ = in.Deliver(context.Background(), Event{
+					Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id,
+					Data: fmt.Errorf("statecharts: invoke %q panicked: %v", id, r),
+				})
+			}
+		}()
+
+		data, err := spec.start(ctx, params, io)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			_ = in.Deliver(context.Background(), Event{
+				Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id, Data: err,
+			})
+			return
+		}
+		_ = in.Deliver(context.Background(), Event{
+			Name: Identifier("done.invoke." + string(id)), Type: EventExternal, InvokeID: id, Data: data,
+		})
+	}()
+
+	return cancelFn, inbound
 }
 
 // actorClock wraps a real Clock so that AfterFunc callbacks -- which fire on

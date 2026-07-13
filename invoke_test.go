@@ -1,0 +1,437 @@
+package statecharts
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestInvokeStartsOnStateEntryAndDeliversEvents(t *testing.T) {
+	started := make(chan struct{})
+	chart, err := Build(
+		Compound("m", "waiting",
+			Children(
+				Atomic("waiting",
+					Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+						close(started)
+						io.Deliver(Event{Name: "ping"})
+						<-ctx.Done()
+						return nil, nil
+					}),
+					On("ping", Target("done")),
+				),
+				Atomic("done"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("invoke never started")
+	}
+
+	// Synchronize with the actor goroutine: the invoke's "ping" arrives on
+	// the external queue asynchronously, so send a no-op and rely on FIFO
+	// ordering through the same inbox to know it was already processed --
+	// same pattern as the delayed-send tests.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		if hasState(in.Configuration(), "done") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("configuration = %v, want 'done' after invoke delivered 'ping'", in.Configuration())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestInvokeNotStartedIfStateExitedWithinSameMacrostep(t *testing.T) {
+	var started bool
+	chart, err := Build(
+		Compound("m", "transient",
+			Children(
+				// An eventless transition fires immediately, before the
+				// macrostep this state was entered in ever settles -- per
+				// SCXML mainEventLoop, the invoke must never actually
+				// start.
+				Atomic("transient",
+					Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+						started = true
+						return nil, nil
+					}),
+					Eventless(Target("settled")),
+				),
+				Atomic("settled"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+
+	if !hasState(in.Configuration(), "settled") {
+		t.Fatalf("configuration = %v, want 'settled'", in.Configuration())
+	}
+	if started {
+		t.Fatalf("invoke started for a state that was exited within its own entering macrostep")
+	}
+}
+
+func TestInvokeCancelledOnStateExitAndSuppressesDoneInvoke(t *testing.T) {
+	cancelled := make(chan struct{})
+	returned := make(chan struct{})
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a",
+					Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+						<-ctx.Done()
+						close(cancelled)
+						close(returned)
+						return nil, nil
+					}),
+					On("go", Target("b")),
+				),
+				Atomic("b"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+
+	if err := in.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("invoke was never cancelled when its containing state was exited")
+	}
+	<-returned
+
+	// SCXML 6.4.3: a cancelled invocation MUST NOT generate done.invoke.
+	// Give the (already-returned) goroutine's Deliver call, if it wrongly
+	// fired, a moment to land, then confirm "b" never saw a transition.
+	time.Sleep(20 * time.Millisecond)
+	if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !hasState(in.Configuration(), "b") {
+		t.Fatalf("configuration = %v, want still 'b'", in.Configuration())
+	}
+}
+
+func TestInvokeErrorBecomesCommunicationError(t *testing.T) {
+	boom := errors.New("boom")
+	gotErr := make(chan Event, 1)
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a",
+					Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+						return nil, boom
+					}),
+					On(string(ErrEventCommunication), Then(Action(func(d *struct{}, ec ExecContext) error {
+						ev, _ := ec.Event()
+						gotErr <- ev
+						return nil
+					}))),
+				),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, &struct{}{})
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+
+	select {
+	case ev := <-gotErr:
+		if ev.Data != boom {
+			t.Fatalf("error.communication Data = %v, want %v", ev.Data, boom)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("never observed error.communication for a failing invoke")
+	}
+}
+
+func TestInvokeAutoGeneratedIDFormat(t *testing.T) {
+	gotID := make(chan Identifier, 1)
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a",
+					Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+						io.Deliver(Event{Name: "ping"})
+						<-ctx.Done()
+						return nil, nil
+					}),
+					On("ping", Then(Action(func(d *struct{}, ec ExecContext) error {
+						ev, _ := ec.Event()
+						gotID <- ev.InvokeID
+						return nil
+					}))),
+				),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, &struct{}{})
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+
+	select {
+	case id := <-gotID:
+		if want := Identifier("a.invoke1"); id != want {
+			t.Fatalf("auto-generated InvokeID = %q, want %q", id, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("never observed the invoke's InvokeID on a delivered event")
+	}
+}
+
+func TestInvokeSendTargetRoutesToIncoming(t *testing.T) {
+	received := make(chan Event, 1)
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a",
+					Invoke(func(ctx context.Context, params any, io InvokeIO) (any, error) {
+						select {
+						case ev := <-io.Incoming:
+							received <- ev
+						case <-ctx.Done():
+						}
+						return nil, nil
+					}, WithInvokeID("svc")),
+					On("poke", Then(Action(func(d *struct{}, ec ExecContext) error {
+						ec.Send("hello", SendOptions{Target: "#_svc", Data: 42})
+						return nil
+					}))),
+				),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, &struct{}{})
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+
+	if err := in.Send(ctx, Event{Name: "poke", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case ev := <-received:
+		if ev.Name != "hello" || ev.Data != 42 {
+			t.Fatalf("invoke received %+v, want Name=hello Data=42", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("invoke never received the #_svc-targeted send")
+	}
+}
+
+// --- A "clock.pl"-style invoke: scxml.html's Appendix on <finalize>
+// (6.5) walks through a state machine that invokes an external clock
+// service (src="clock.pl"), receives periodic "ping" events carrying a
+// 12-hour clock reading, and uses <finalize> to normalize that reading
+// into a 24-hour value before a transition's guard inspects it -- so
+// <finalize> runs strictly before transition selection, not after. This
+// reproduces that scenario end to end, with a deterministic, in-process
+// stand-in for clock.pl driven by a test-controlled feed instead of a
+// real timer. ---------------------------------------------------------
+
+// clockTick is what the invoked clock service reports each time it
+// "ticks" -- the same fields scxml.html's example describes: an hour in
+// 12-hour form, a flag for AM/PM, and the fact of a new second.
+type clockTick struct {
+	Hour int // 1-12
+	IsAM bool
+}
+
+// clockService is a real, running goroutine: it forwards whatever ticks
+// arrive on feed as "ping" events until either feed is closed (natural
+// completion) or it's cancelled (the invoking state was exited).
+func clockService(feed <-chan clockTick) InvokeFunc {
+	return func(ctx context.Context, params any, io InvokeIO) (any, error) {
+		for {
+			select {
+			case <-ctx.Done():
+				return nil, nil
+			case tick, ok := <-feed:
+				if !ok {
+					return nil, nil
+				}
+				io.Deliver(Event{Name: "ping", Data: tick})
+			}
+		}
+	}
+}
+
+type store struct {
+	Hour24 int
+}
+
+// normalizeTime is <finalize>'s content in scxml.html's example, verbatim:
+// "time.setHours(_event.data.currentHour + (_event.isAm ? 0 : 12) - 1)".
+// <finalize> runs for every event carrying its invocation's InvokeID
+// (SCXML 6.5 matches by invokeid alone, not by event name), including the
+// eventual done.invoke.timer -- whose Data is whatever clockService
+// returned (nil here), not a clockTick -- so, like any real finalize
+// handler massaging a specific payload shape, it must check first.
+var normalizeTime = Action(func(s *store, ec ExecContext) error {
+	ev, _ := ec.Event()
+	tick, ok := ev.Data.(clockTick)
+	if !ok {
+		return nil
+	}
+	offset := 12
+	if tick.IsAM {
+		offset = 0
+	}
+	s.Hour24 = tick.Hour + offset - 1
+	return nil
+})
+
+func buildClockChart(t *testing.T, feed <-chan clockTick) *Instance {
+	t.Helper()
+	afterHours := Cond(func(s *store, ec ExecContext) bool {
+		return s.Hour24 > 17 || s.Hour24 < 9
+	})
+
+	chart, err := Build(
+		Compound("root", "getTime",
+			Children(
+				Atomic("getTime",
+					Invoke(clockService(feed), WithInvokeID("timer"), WithFinalize(normalizeTime)),
+					On("ping", If(afterHours), Target("storeClosed")),
+					On("ping", Target("takeOrder")),
+					On("done.invoke.timer", Target("clockDone")),
+				),
+				Atomic("storeClosed"),
+				Atomic("takeOrder"),
+				Atomic("clockDone"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, &store{})
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return in
+}
+
+func TestInvokeClockFinalizeNormalizesBeforeGuardEvaluates(t *testing.T) {
+	cases := []struct {
+		name string
+		tick clockTick
+		want Identifier
+	}{
+		// 8 PM -> 19:00 -> after hours.
+		{"evening", clockTick{Hour: 8, IsAM: false}, "storeClosed"},
+		// 2 PM -> 13:00 -> open.
+		{"afternoon", clockTick{Hour: 2, IsAM: false}, "takeOrder"},
+		// 10 PM -> 21:00 -> after hours.
+		{"night", clockTick{Hour: 10, IsAM: false}, "storeClosed"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			feed := make(chan clockTick, 1)
+			in := buildClockChart(t, feed)
+			ctx := context.Background()
+			defer in.Stop(ctx)
+
+			feed <- c.tick
+
+			deadline := time.Now().Add(2 * time.Second)
+			for !hasState(in.Configuration(), c.want) {
+				if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
+					t.Fatalf("Send: %v", err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("configuration = %v, want %q", in.Configuration(), c.want)
+				}
+				time.Sleep(time.Millisecond)
+			}
+		})
+	}
+}
+
+func TestInvokeClockDoneEventOnFeedClose(t *testing.T) {
+	feed := make(chan clockTick)
+	in := buildClockChart(t, feed)
+	ctx := context.Background()
+	defer in.Stop(ctx)
+
+	close(feed) // the clock service returns (nil, nil): natural completion
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !hasState(in.Configuration(), "clockDone") {
+		if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("configuration = %v, want 'clockDone' after the clock's natural completion", in.Configuration())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := in.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+}

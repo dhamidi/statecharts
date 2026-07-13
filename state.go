@@ -60,6 +60,7 @@ type StateSpec struct {
 	OnExit      []ActionFunc
 	Transitions []TransitionSpec
 	Children    []StateSpec // preserved in call order == SCXML document order
+	Invokes     []InvokeSpec
 	Done        DoneDataFunc
 }
 

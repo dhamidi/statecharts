@@ -65,6 +65,7 @@ needs.
   - [Instances](#instances)
   - [The Datamodel](#the-datamodel)
   - [IOProcessor](#ioprocessor)
+  - [Invoke](#invoke)
   - [Persistence](#persistence)
 - [Extras](#extras)
   - [Testing with a manual clock](#testing-with-a-manual-clock)
@@ -338,6 +339,47 @@ default `Instance` uses `NoopIOProcessor`, which suppresses all outbound
 dispatch; `LocalIOProcessor` is a starting point for a single-process
 `IOProcessor` implementation, and any type satisfying the `IOProcessor`
 interface can be supplied with `WithIOProcessor`.
+
+</details>
+
+### Invoke
+
+<details>
+<summary>Show Invoke Examples</summary>
+
+`Invoke` attaches an external service to a state — SCXML's `<invoke>`,
+minus XML: any Go function willing to run in its own goroutine for as
+long as the state is active. It starts once the state's containing
+macrostep settles, and is cancelled automatically if the state is exited
+before the service finishes on its own:
+
+```go
+clock := statecharts.Invoke(
+	func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil, nil
+			case now := <-t.C:
+				io.Deliver(statecharts.Event{Name: "tick", Data: now})
+			}
+		}
+	},
+	statecharts.WithInvokeID("clock"),
+)
+
+statecharts.Atomic("running", clock, statecharts.On("tick", ...))
+```
+
+A finished invocation's own (non-cancelled) return generates
+`done.invoke.<id>` on the chart, carrying whatever data it returned.
+`WithFinalize` attaches executable content that runs on every event
+carrying that invocation's ID, before any transition's guard sees it —
+useful for normalizing a returned payload first. `SendOptions{Target:
+"#_" + id}` addresses a specific running invocation, delivered to it via
+`InvokeIO.Incoming`.
 
 </details>
 

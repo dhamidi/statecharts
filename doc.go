@@ -25,6 +25,10 @@
 //
 // All communication with the world outside a running Instance goes through
 // an IOProcessor, isolating every real side effect behind one interface.
+// Invoke attaches a longer-lived external service to a state instead: an
+// InvokeFunc runs in its own goroutine for as long as the state is active,
+// delivering events back through InvokeIO and cancelled automatically if
+// the state is exited first.
 //
 // A running chart's state -- its active configuration, recorded history,
 // queued events, and outstanding delayed sends -- can be captured with

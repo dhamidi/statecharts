@@ -4,16 +4,19 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
 // interpretation is the mutable, single-goroutine-owned state of one running
 // chart: the active configuration, recorded history, both event queues, and
 // the running flag -- exactly the SCXML "global" algorithm state (Appendix
-// D), minus the datamodel (owned opaquely by the caller) and invoke, which
-// this package does not implement. interpretation has no goroutines or
-// channels of its own; Instance is the actor wrapper that drives it from a
-// single goroutine.
+// D), minus the datamodel (owned opaquely by the caller). interpretation
+// has no goroutines or channels of its own; Instance is the actor wrapper
+// that drives it from a single goroutine, and is also what actually starts
+// <invoke>'s external services (see invoke.go's invokeRunnerFunc) for the
+// same reason it owns delayed-send timers: spawning goroutines is an actor
+// concern, not a core-interpreter one.
 type interpretation struct {
 	chart         *Chart
 	datamodel     any
@@ -29,6 +32,21 @@ type interpretation struct {
 	clock   Clock
 	pending map[Identifier]*pendingSendRecord
 	sendSeq int
+
+	// statesToInvoke, activeInvokes, invokesByID, and invokeSeq are the
+	// <invoke> bookkeeping (SCXML 6.4): statesToInvoke accumulates states
+	// entered during the current macrostep whose invokes haven't started
+	// yet (processInvokes starts them once the macrostep is stable, and
+	// exitState removes a state again if it's exited first -- so a state
+	// entered and exited within one macrostep is never invoked at all);
+	// activeInvokes and invokesByID index the ones actually running, by
+	// owning state (for cancellation on exit) and by ID (for routing
+	// <finalize> and "#_<invokeid>" sends).
+	statesToInvoke map[*compiledState]bool
+	activeInvokes  map[*compiledState][]*runningInvoke
+	invokesByID    map[Identifier]*runningInvoke
+	invokeSeq      int
+	startInvoke    invokeRunnerFunc
 
 	// restored is set by restoreFrom (snapshot.go) to tell Instance.run to
 	// skip the normal start() bootstrap -- the configuration/queues/history
@@ -62,13 +80,17 @@ type pendingSendRecord struct {
 
 func newInterpretation(chart *Chart, datamodel any) *interpretation {
 	return &interpretation{
-		chart:         chart,
-		datamodel:     datamodel,
-		configuration: map[*compiledState]bool{},
-		historyValue:  map[*compiledState][]*compiledState{},
-		pending:       map[Identifier]*pendingSendRecord{},
-		io:            NoopIOProcessor,
-		clock:         NewRealClock(),
+		chart:          chart,
+		datamodel:      datamodel,
+		configuration:  map[*compiledState]bool{},
+		historyValue:   map[*compiledState][]*compiledState{},
+		pending:        map[Identifier]*pendingSendRecord{},
+		io:             NoopIOProcessor,
+		clock:          NewRealClock(),
+		statesToInvoke: map[*compiledState]bool{},
+		activeInvokes:  map[*compiledState][]*runningInvoke{},
+		invokesByID:    map[Identifier]*runningInvoke{},
+		startInvoke:    noopInvokeRunner,
 	}
 }
 
@@ -201,13 +223,29 @@ func (ip *interpretation) doSend(name Identifier, opts SendOptions) {
 }
 
 func (ip *interpretation) dispatchNow(sendID, target, typ Identifier, ev Event) {
-	switch target {
-	case "#_internal":
+	switch {
+	case target == "#_internal":
 		ev.Type = EventInternal
 		ip.enqueueInternal(ev)
-	case "":
+	case target == "":
 		ev.Type = EventExternal
 		ip.enqueueExternal(ev)
+	case strings.HasPrefix(string(target), "#_"):
+		// SCXML 6.4.4: "#_<invokeid>" addresses a specific running
+		// invocation. An unrecognized invoke ID (already finished, never
+		// existed, or belongs to a different session entirely -- there is
+		// no "#_parent" here, since this package doesn't model child
+		// sessions, see ADR 0005) falls through to the IOProcessor like
+		// any other unhandled target, which reports it as a communication
+		// error rather than silently dropping it.
+		if ri, ok := ip.invokesByID[Identifier(strings.TrimPrefix(string(target), "#_"))]; ok && ri.incoming != nil {
+			select {
+			case ri.incoming <- ev:
+			default: // never block the interpreter on a slow/absent reader
+			}
+			return
+		}
+		fallthrough
 	default:
 		if ip.io == nil {
 			ip.reportCommError(fmt.Errorf("statecharts: no IOProcessor configured for send target %q", target))
@@ -509,6 +547,13 @@ func (ip *interpretation) enterState(s *compiledState, _ bool) {
 	ip.configuration[s] = true
 	ip.runActions(s.onEntry)
 
+	if len(s.invokes) > 0 {
+		// Deferred to the end of the macrostep by processInvokes, per
+		// SCXML mainEventLoop -- not started here, so a state entered and
+		// exited again within the same macrostep is never invoked.
+		ip.statesToInvoke[s] = true
+	}
+
 	if s.kind != KindFinal {
 		return
 	}
@@ -549,7 +594,80 @@ func (ip *interpretation) enterState(s *compiledState, _ bool) {
 
 func (ip *interpretation) exitState(s *compiledState) {
 	ip.runActions(s.onExit)
+	ip.cancelInvokes(s)
+	delete(ip.statesToInvoke, s)
 	delete(ip.configuration, s)
+}
+
+// cancelInvokes stops every invocation currently running on behalf of s --
+// SCXML 6.4.2/6.4.3: cancellation "MUST act as if it were the final onexit
+// handler in the invoking state", so this runs immediately after s.onExit,
+// still as part of exiting s, whether s is being exited by an ordinary
+// transition or as part of exitInterpreter's final cleanup.
+func (ip *interpretation) cancelInvokes(s *compiledState) {
+	if len(ip.activeInvokes[s]) == 0 {
+		return
+	}
+	for _, ri := range ip.activeInvokes[s] {
+		delete(ip.invokesByID, ri.id)
+		if ri.cancel != nil {
+			ri.cancel()
+		}
+	}
+	delete(ip.activeInvokes, s)
+}
+
+// processInvokes starts every <invoke> belonging to a state entered since
+// the last call, in entry order, then in document order per state --
+// SCXML mainEventLoop's "for state in statesToInvoke.sort(entryOrder): for
+// inv in state.invoke.sort(documentOrder): invoke(inv)", run once the
+// current macrostep has settled (no eventless transitions or internal
+// events left to process).
+func (ip *interpretation) processInvokes() {
+	if len(ip.statesToInvoke) == 0 {
+		return
+	}
+	pending := sortAsc(ip.statesToInvoke)
+	ip.statesToInvoke = map[*compiledState]bool{}
+	for _, s := range pending {
+		for _, spec := range s.invokes {
+			ip.beginInvoke(s, spec)
+		}
+	}
+}
+
+func (ip *interpretation) beginInvoke(s *compiledState, spec *compiledInvoke) {
+	id := spec.id
+	if id == "" {
+		ip.invokeSeq++
+		id = Identifier(fmt.Sprintf("%s.invoke%d", s.id, ip.invokeSeq))
+	}
+	var params any
+	if spec.params != nil {
+		params = spec.params(ip.execContext())
+	}
+	cancel, incoming := ip.startInvoke(id, spec, params)
+	ri := &runningInvoke{id: id, state: s, finalize: spec.finalize, cancel: cancel, incoming: incoming}
+	ip.activeInvokes[s] = append(ip.activeInvokes[s], ri)
+	ip.invokesByID[id] = ri
+}
+
+// applyFinalize runs the <finalize> handler of whichever active invocation
+// produced ev (matched by ev.InvokeID), if any, immediately before
+// transitions are selected for it -- SCXML 6.5: finalize content "MUST"
+// execute "right before it removes the event from the external event
+// queue for processing", so it can normalize returned data before any
+// transition's cond inspects it. An event with no InvokeID, or one that
+// doesn't match any currently active invocation, is unaffected.
+func (ip *interpretation) applyFinalize(ev Event) {
+	if ev.InvokeID == "" {
+		return
+	}
+	ri, ok := ip.invokesByID[ev.InvokeID]
+	if !ok {
+		return
+	}
+	ip.runActions(ri.finalize)
 }
 
 // exitInterpreter runs whenever running has just become false -- because a
@@ -742,7 +860,17 @@ func (ip *interpretation) runToStable() {
 		transitions := ip.selectEventlessTransitions()
 		if len(transitions) == 0 {
 			if len(ip.internalQueue) == 0 {
-				return
+				// The macrostep is otherwise done: start any invocations
+				// for states entered during it (SCXML mainEventLoop's
+				// "for state in statesToInvoke... invoke(inv)"), then loop
+				// once more in case doing so raised anything -- mirroring
+				// "if not internalQueue.isEmpty(): continue" immediately
+				// after that step.
+				ip.processInvokes()
+				if len(ip.internalQueue) == 0 {
+					return
+				}
+				continue
 			}
 			ev := ip.internalQueue[0]
 			ip.internalQueue = ip.internalQueue[1:]
@@ -756,7 +884,7 @@ func (ip *interpretation) runToStable() {
 }
 
 // start enters the chart's initial configuration and runs to the first
-// stable point (interpret(), minus datamodel/global-script/invoke concerns).
+// stable point (interpret(), minus datamodel/global-script concerns).
 func (ip *interpretation) start() {
 	entrySet := map[*compiledState]bool{}
 	forDefault := map[*compiledState]bool{}
@@ -793,6 +921,7 @@ func (ip *interpretation) processNextExternal() bool {
 	ev := ip.externalQueue[0]
 	ip.externalQueue = ip.externalQueue[1:]
 	ip.lastEvent, ip.hasLastEvent = ev, true
+	ip.applyFinalize(ev)
 
 	transitions := ip.selectTransitions(ev)
 	if len(transitions) > 0 {
