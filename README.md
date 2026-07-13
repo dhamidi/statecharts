@@ -6,30 +6,39 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/dhamidi/statecharts"
 )
 
 func main() {
 	chart, err := statecharts.Build(
-		statecharts.Compound("door", "closed",
+		statecharts.Compound("conn", "disconnected",
 			statecharts.Children(
-				statecharts.Atomic("closed", statecharts.On("open", statecharts.Target("open"))),
-				statecharts.Atomic("open", statecharts.On("close", statecharts.Target("closed"))),
+				statecharts.Atomic("disconnected", statecharts.On("connect", statecharts.Target("open"))),
+				statecharts.Atomic("open", statecharts.On("drop", statecharts.Target("disconnected"))),
 			),
 		),
 	)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	door := statecharts.New(chart, nil)
+	conn := statecharts.New(chart, nil)
 	ctx := context.Background()
-	door.Start(ctx)
-	defer door.Stop(ctx)
+	if err := conn.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := conn.Stop(ctx); err != nil {
+			log.Fatal(err)
+		}
+	}()
 
-	door.Send(ctx, statecharts.Event{Name: "open", Type: statecharts.EventExternal})
-	fmt.Println(door.Configuration()) // [open]
+	if err := conn.Send(ctx, statecharts.Event{Name: "connect", Type: statecharts.EventExternal}); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(conn.Configuration()) // [open]
 }
 ```
 
@@ -89,8 +98,14 @@ go get github.com/dhamidi/statecharts
 
 ## Quickstart
 
-A slightly more realistic chart: a door with a lock, a guarded transition,
-and an action that mutates the caller's own datamodel.
+A client connection's lifecycle in full: dialing, a guarded,
+attempt-count-limited retry, and a drop that triggers reconnection
+automatically.
+`Dialer` and `Conn` stand in for a real transport -- Go's standard library
+has no native WebSocket client, and pulling in one of the maintained
+third-party ones (gorilla/websocket, github.com/coder/websocket) just for
+this example would be disproportionate. A real deployment satisfies `Dialer`
+with one of those instead of `flakyDialer` below.
 
 ```go
 package main
@@ -98,58 +113,144 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/dhamidi/statecharts"
 )
 
-type Door struct {
-	Locked    bool
-	OpenCount int
+// Conn is a live connection.
+type Conn interface {
+	Close() error
 }
 
-func main() {
-	notLocked := statecharts.Cond(func(d *Door, ec statecharts.ExecContext) bool {
-		return !d.Locked
+// Dialer opens a new Conn.
+type Dialer interface {
+	Dial(ctx context.Context) (Conn, error)
+}
+
+type fakeConn struct{}
+
+func (fakeConn) Close() error { return nil }
+
+// flakyDialer fails its first n dials, then succeeds -- standing in for a
+// server that's briefly unreachable.
+type flakyDialer struct {
+	n       int
+	attempt int
+}
+
+func (d *flakyDialer) Dial(ctx context.Context) (Conn, error) {
+	d.attempt++
+	if d.attempt <= d.n {
+		return nil, fmt.Errorf("dial attempt %d: connection refused", d.attempt)
+	}
+	return fakeConn{}, nil
+}
+
+type Connection struct {
+	Dialer     Dialer
+	Retries    int
+	MaxRetries int
+	conn       Conn
+}
+
+func buildChart() (*statecharts.Chart, error) {
+	underRetryLimit := statecharts.Cond(func(c *Connection, ec statecharts.ExecContext) bool {
+		return c.Retries < c.MaxRetries
 	})
-	recordOpen := statecharts.Action(func(d *Door, ec statecharts.ExecContext) error {
-		d.OpenCount++
+
+	// dial calls out to the transport and reports the outcome with Raise,
+	// not error.execution: a failed dial here is an expected outcome the
+	// chart's own guarded retry already handles, not a bug in the action
+	// itself -- see Error events below for the case that is a bug.
+	dial := statecharts.Action(func(c *Connection, ec statecharts.ExecContext) error {
+		c.Retries++
+		conn, err := c.Dialer.Dial(context.Background())
+		if err != nil {
+			ec.Raise(statecharts.Event{Name: "dial.failed", Data: err})
+			return nil
+		}
+		c.conn = conn
+		ec.Raise(statecharts.Event{Name: "dial.ok"})
+		return nil
+	})
+	recordOpen := statecharts.Action(func(c *Connection, ec statecharts.ExecContext) error {
+		c.Retries = 0
+		return nil
+	})
+	giveUp := statecharts.Action(func(c *Connection, ec statecharts.ExecContext) error {
+		fmt.Printf("giving up after %d attempts\n", c.Retries)
 		return nil
 	})
 
-	chart, err := statecharts.Build(
-		statecharts.Compound("door", "closed",
+	return statecharts.Build(
+		statecharts.Compound("connection", "disconnected",
 			statecharts.Children(
-				statecharts.Atomic("closed",
-					statecharts.On("open.request",
-						statecharts.Target("open"),
-						statecharts.If(notLocked),
-						statecharts.Then(recordOpen),
-					),
+				statecharts.Atomic("disconnected",
+					statecharts.On("connect", statecharts.Target("connecting")),
+				),
+				statecharts.Atomic("connecting",
+					statecharts.OnEntry(dial),
+					statecharts.On("dial.ok", statecharts.Target("open"), statecharts.Then(recordOpen)),
+					statecharts.On("dial.failed", statecharts.Target("connecting"), statecharts.If(underRetryLimit)),
+					statecharts.On("dial.failed", statecharts.Target("disconnected"), statecharts.Then(giveUp)),
 				),
 				statecharts.Atomic("open",
-					statecharts.On("close.request", statecharts.Target("closed")),
+					statecharts.On("drop", statecharts.Target("connecting")),
+					statecharts.On("close", statecharts.Target("disconnected")),
 				),
 			),
 		),
 	)
+}
+
+func run(ctx context.Context) (err error) {
+	chart, err := buildChart()
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	door := &Door{Locked: true}
-	in := statecharts.New(chart, door)
-	ctx := context.Background()
-	in.Start(ctx)
-	defer in.Stop(ctx)
+	conn := statecharts.New(chart, &Connection{Dialer: &flakyDialer{n: 2}, MaxRetries: 3})
+	if err := conn.Start(ctx); err != nil {
+		return err
+	}
+	defer func() {
+		if stopErr := conn.Stop(ctx); stopErr != nil && err == nil {
+			err = stopErr
+		}
+	}()
 
-	in.Send(ctx, statecharts.Event{Name: "open.request", Type: statecharts.EventExternal})
-	fmt.Println(in.Configuration(), door.OpenCount) // [closed] 0 -- still locked
+	if err := conn.Send(ctx, statecharts.Event{Name: "connect", Type: statecharts.EventExternal}); err != nil {
+		return err
+	}
+	fmt.Println(conn.Configuration()) // [open] -- two failed dials, then a third that succeeds
 
-	door.Locked = false
-	in.Send(ctx, statecharts.Event{Name: "open.request", Type: statecharts.EventExternal})
-	fmt.Println(in.Configuration(), door.OpenCount) // [open] 1
+	if err := conn.Send(ctx, statecharts.Event{Name: "drop", Type: statecharts.EventExternal}); err != nil {
+		return err
+	}
+	fmt.Println(conn.Configuration()) // [open] -- reconnected before Send returned
+
+	if err := conn.Send(ctx, statecharts.Event{Name: "close", Type: statecharts.EventExternal}); err != nil {
+		return err
+	}
+	fmt.Println(conn.Configuration()) // [disconnected]
+
+	return nil
+}
+
+func main() {
+	if err := run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
+
+`connecting`'s two `dial.failed` transitions are tried in document order: the
+first, guarded by `underRetryLimit`, retries by re-entering `connecting`
+itself, which re-runs `dial` on entry; the second, unconditional, is only
+reached once the guard fails, and gives up. `open`'s `drop` handler routes a
+dropped connection through the same `connecting` state a fresh `connect`
+would, so reconnection and initial connection share one retry path.
 
 ## What is SCXML?
 
@@ -190,22 +291,30 @@ space-separated event names) or `Eventless` (fires automatically once its
 guard is true), and configured with `Target`, `If`, `Then`, and
 `AsInternal`.
 
-Parallel regions transition independently of one another:
+Parallel regions transition independently of one another. Generating
+thumbnails at several sizes for one upload is three independent regions, one
+per size, each moving from `pending` to `done` on its own:
 
 ```go
 chart, err := statecharts.Build(
-	statecharts.Parallel("machine",
+	statecharts.Parallel("thumbnails",
 		statecharts.Children(
-			statecharts.Compound("motor", "off",
+			statecharts.Compound("small", "small.pending",
 				statecharts.Children(
-					statecharts.Atomic("off", statecharts.On("motor.start", statecharts.Target("on"))),
-					statecharts.Atomic("on", statecharts.On("motor.stop", statecharts.Target("off"))),
+					statecharts.Atomic("small.pending", statecharts.On("small.done", statecharts.Target("small.done"))),
+					statecharts.Atomic("small.done"),
 				),
 			),
-			statecharts.Compound("light", "dark",
+			statecharts.Compound("medium", "medium.pending",
 				statecharts.Children(
-					statecharts.Atomic("dark", statecharts.On("light.on", statecharts.Target("lit"))),
-					statecharts.Atomic("lit", statecharts.On("light.off", statecharts.Target("dark"))),
+					statecharts.Atomic("medium.pending", statecharts.On("medium.done", statecharts.Target("medium.done"))),
+					statecharts.Atomic("medium.done"),
+				),
+			),
+			statecharts.Compound("large", "large.pending",
+				statecharts.Children(
+					statecharts.Atomic("large.pending", statecharts.On("large.done", statecharts.Target("large.done"))),
+					statecharts.Atomic("large.done"),
 				),
 			),
 		),
@@ -213,28 +322,29 @@ chart, err := statecharts.Build(
 )
 ```
 
-Sending `motor.start` moves the `motor` region from `off` to `on` and
-leaves `light` untouched — both regions are active in the configuration at
-once.
+Sending `small.done` moves the `small` region from `small.pending` to
+`small.done` and leaves `medium` and `large` untouched — all three regions
+are active in the configuration at once.
 
 A history pseudostate remembers where a compound state's children were
 before it was exited, so re-entering it can resume there instead of
-starting over:
+starting over. A multi-step job re-entering its parent state after being
+paused resumes at whichever step it last reached:
 
 ```go
-statecharts.Compound("running", "step1",
+statecharts.Compound("job", "validating",
 	statecharts.Children(
-		statecharts.Atomic("step1", statecharts.On("next", statecharts.Target("step2"))),
-		statecharts.Atomic("step2", statecharts.On("next", statecharts.Target("step3"))),
-		statecharts.Atomic("step3"),
-		statecharts.History("running.hist", statecharts.Shallow, "step1"),
+		statecharts.Atomic("validating", statecharts.On("next", statecharts.Target("thumbnailing"))),
+		statecharts.Atomic("thumbnailing", statecharts.On("next", statecharts.Target("notifying"))),
+		statecharts.Atomic("notifying"),
+		statecharts.History("job.hist", statecharts.Shallow, "validating"),
 	),
 ),
 ```
 
-A transition targeting `"running.hist"` re-enters whichever of `step1`,
-`step2`, or `step3` was active when `running` was last exited — or
-`step1`, the given default, the first time.
+A transition targeting `"job.hist"` re-enters whichever of `validating`,
+`thumbnailing`, or `notifying` was active when `job` was last exited — or
+`validating`, the given default, the first time.
 
 </details>
 
@@ -248,12 +358,12 @@ spawns its interpreter goroutine. From there, an `Instance` is driven
 entirely through plain method calls:
 
 ```go
-in := statecharts.New(chart, myDatamodel)
+in := statecharts.New(chart, myJob)
 if err := in.Start(ctx); err != nil {
 	// ...
 }
 
-if err := in.Send(ctx, statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+if err := in.Send(ctx, statecharts.Event{Name: "start", Type: statecharts.EventExternal}); err != nil {
 	// ...
 }
 
@@ -284,20 +394,20 @@ time the outer `Send` returns — unlike `Send` to a different actor, which
 only enqueues delivery elsewhere:
 
 ```go
-settle := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
-	ec.Raise(statecharts.Event{Name: "settle"})
+validate := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
+	ec.Raise(statecharts.Event{Name: "validated"})
 	return nil
 })
 
 chart, err := statecharts.Build(
-	statecharts.Compound("door", "closed",
+	statecharts.Compound("job", "uploading",
 		statecharts.Children(
-			statecharts.Atomic("closed", statecharts.On("open.request", statecharts.Target("opening"))),
-			statecharts.Atomic("opening",
-				statecharts.OnEntry(settle),
-				statecharts.On("settle", statecharts.Target("open")),
+			statecharts.Atomic("uploading", statecharts.On("upload.received", statecharts.Target("validating"))),
+			statecharts.Atomic("validating",
+				statecharts.OnEntry(validate),
+				statecharts.On("validated", statecharts.Target("thumbnailing")),
 			),
-			statecharts.Atomic("open"),
+			statecharts.Atomic("thumbnailing"),
 		),
 	),
 )
@@ -309,12 +419,13 @@ in := statecharts.New(chart, nil)
 in.Start(ctx)
 defer in.Stop(ctx)
 
-in.Send(ctx, statecharts.Event{Name: "open.request", Type: statecharts.EventExternal})
-fmt.Println(in.Configuration()) // [open] -- "settle" already fired
+in.Send(ctx, statecharts.Event{Name: "upload.received", Type: statecharts.EventExternal})
+fmt.Println(in.Configuration()) // [thumbnailing] -- "validated" already fired
 ```
 
-`opening` is never visible outside the action that raises past it: by the
-time `Send` returns, `settle` has already moved the chart on to `open`.
+`validating` is never visible outside the action that raises past it: by the
+time `Send` returns, `validated` has already moved the chart on to
+`thumbnailing`.
 
 </details>
 
@@ -332,23 +443,24 @@ and actions are Go functions that operate on it directly.
 type into the `ActionFunc`/`CondFunc` a chart stores:
 
 ```go
-type Cart struct {
-	Items []string
+type Job struct {
+	Source string
+	Sizes  []int
 }
 
-addItem := statecharts.Action(func(c *Cart, ec statecharts.ExecContext) error {
+addSize := statecharts.Action(func(j *Job, ec statecharts.ExecContext) error {
 	ev, ok := ec.Event()
 	if !ok {
 		return nil
 	}
-	if item, ok := statecharts.Payload[string](ev); ok {
-		c.Items = append(c.Items, item)
+	if size, ok := statecharts.Payload[int](ev); ok {
+		j.Sizes = append(j.Sizes, size)
 	}
 	return nil
 })
 
-hasItems := statecharts.Cond(func(c *Cart, ec statecharts.ExecContext) bool {
-	return len(c.Items) > 0
+hasSizes := statecharts.Cond(func(j *Job, ec statecharts.ExecContext) bool {
+	return len(j.Sizes) > 0
 })
 ```
 
@@ -357,25 +469,26 @@ hasItems := statecharts.Cond(func(c *Cart, ec statecharts.ExecContext) bool {
 
 ```go
 chart, err := statecharts.Build(
-	statecharts.Atomic("cart", statecharts.On("add", statecharts.Then(addItem))),
+	statecharts.Atomic("job", statecharts.On("thumbnail.done", statecharts.Then(addSize))),
 )
 if err != nil {
-	panic(err)
+	// ...
 }
 
-cart := &Cart{}
-in := statecharts.New(chart, cart)
+job := &Job{Source: "uploads/photo.png"}
+in := statecharts.New(chart, job)
 in.Start(ctx)
 defer in.Stop(ctx)
 
-in.Send(ctx, statecharts.Event{Name: "add", Type: statecharts.EventExternal, Data: "widget"})
-fmt.Println(cart.Items) // [widget]
+in.Send(ctx, statecharts.Event{Name: "thumbnail.done", Type: statecharts.EventExternal, Data: 128})
+fmt.Println(job.Sizes) // [128]
 ```
 
 `ExecContext`, passed to every callback, gives access to the event
 currently being processed (`Event`), the SCXML `In()` predicate for
-testing whether a state is active, and the ability to raise, send, or
-cancel further events.
+testing whether a state is active, the ability to raise, send, or
+cancel further events, and the session's own identity — `SessionID()`
+and `Name()`, SCXML 5.10's `_sessionid` and `_name`.
 
 </details>
 
@@ -394,9 +507,9 @@ effects.
 Go-API equivalent of SCXML's `<send>`, including delayed delivery:
 
 ```go
-statecharts.On("submit",
-	statecharts.Target("waiting"),
-	statecharts.Then(statecharts.SendEvent("timeout", statecharts.SendOptions{
+statecharts.On("job.start",
+	statecharts.Target("thumbnailing"),
+	statecharts.Then(statecharts.SendEvent("thumbnailing.timeout", statecharts.SendOptions{
 		Delay: 30 * time.Second,
 	})),
 )
@@ -407,6 +520,46 @@ default `Instance` uses `NoopIOProcessor`, which suppresses all outbound
 dispatch; `LocalIOProcessor` is a starting point for a single-process
 `IOProcessor` implementation, and any type satisfying the `IOProcessor`
 interface can be supplied with `WithIOProcessor`.
+
+Updating a database record and sending a notification once a job finishes is
+an ordinary `IOProcessor`: the chart never touches a database or a mail
+client directly, only `SendEvent`/`ec.Send`, targeting whatever name the
+`IOProcessor` recognizes:
+
+```go
+type notifyProcessor struct{}
+
+func (p *notifyProcessor) Attach(d statecharts.Dispatcher) {}
+
+func (p *notifyProcessor) Send(ctx context.Context, req statecharts.SendRequest) error {
+	if req.Target != "notifier" {
+		return fmt.Errorf("no transport for target %q", req.Target)
+	}
+	jobID, _ := req.Data.(string)
+	// db.ExecContext(ctx, `UPDATE jobs SET status = 'done' WHERE id = ?`, jobID)
+	// mailer.Send(ctx, ownerEmail(jobID), "your thumbnails are ready")
+	return nil
+}
+
+func (p *notifyProcessor) Cancel(ctx context.Context, sendID statecharts.Identifier) error {
+	return nil
+}
+```
+
+```go
+statecharts.On("job.done",
+	statecharts.Target("done"),
+	statecharts.Then(statecharts.SendEvent("notify", statecharts.SendOptions{
+		Target: "notifier",
+		Data:   "job-482",
+	})),
+)
+```
+
+`in := statecharts.New(chart, myJob, statecharts.WithIOProcessor(&notifyProcessor{}))` is
+what wires the two together -- `notifyProcessor.Send` runs whenever `notify`
+reaches the `IOProcessor` seam, whether that's from this transition's
+`SendEvent` or from an `ec.Send` call inside any other action.
 
 </details>
 
@@ -423,16 +576,16 @@ a sibling transition can match against, carrying the error itself as its
 
 ```go
 validate := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
-	return errors.New("payment declined")
+	return errors.New("corrupt image: unexpected EOF")
 })
 
 recordFailure := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	fmt.Println(ev.Data) // payment declined
+	fmt.Println(ev.Data) // corrupt image: unexpected EOF
 	return nil
 })
 
-statecharts.Atomic("paying",
+statecharts.Atomic("validating",
 	statecharts.OnEntry(validate),
 	statecharts.On(string(statecharts.ErrEventExecution), statecharts.Target("failed"), statecharts.Then(recordFailure)),
 )
@@ -443,7 +596,11 @@ dispatch that fails at the `IOProcessor` — no `IOProcessor` configured for
 the target, or the configured one returning an error — produces
 `error.communication` instead of a Go error at the `Send` call site, for
 the same reason `error.execution` exists: SCXML executable content has no
-synchronous error return, only further events.
+synchronous error return, only further events. The `notifyProcessor` from
+IOProcessor above failing to reach `"notifier"` -- an unreachable mail
+server, say -- is exactly this case: `job.done` fails to dispatch, and
+`error.communication` is what a job chart reacts to instead of the failure
+vanishing at the `Send` call site.
 
 </details>
 
@@ -459,9 +616,9 @@ and unlike `Raise`, it never produces an event a transition could match
 against.
 
 ```go
-greet := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
+logSize := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	ec.Log("received", ev.Name)
+	ec.Log("thumbnail.done", ev.Data)
 	return nil
 })
 ```
@@ -491,23 +648,17 @@ macrostep settles, and is cancelled automatically if the state is exited
 before the service finishes on its own:
 
 ```go
-clock := statecharts.Invoke(
+resize := statecharts.Invoke(
 	func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
-		t := time.NewTicker(time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return nil, nil
-			case now := <-t.C:
-				io.Deliver(statecharts.Event{Name: "tick", Data: now})
-			}
-		}
+		size, _ := params.(int)
+		// stand-in for the actual image-resize work
+		return fmt.Sprintf("thumb-%dpx.jpg", size), nil
 	},
-	statecharts.WithInvokeID("clock"),
+	statecharts.WithInvokeID("resize"),
+	statecharts.WithInvokeParams(func(ec statecharts.ExecContext) any { return 128 }),
 )
 
-statecharts.Atomic("running", clock, statecharts.On("tick", ...))
+statecharts.Atomic("thumbnailing", resize, statecharts.On("done.invoke.resize", statecharts.Target("notifying")))
 ```
 
 A finished invocation's own (non-cancelled) return generates
@@ -623,13 +774,15 @@ standing in for "actor definition":
 
 ### Quickstart
 
-Two actors, addressed by name instead of by Go reference:
+Two actors, addressed by name instead of by Go reference: a `conn-1`
+connection actor, and a `gateway` actor that tells it to open:
 
 ```go
 package main
 
 import (
 	"context"
+	"log"
 	"os"
 	"time"
 
@@ -637,48 +790,64 @@ import (
 	"github.com/dhamidi/statecharts/actors"
 )
 
-func main() {
-	ctx := context.Background()
-
-	greet := func(ec statecharts.ExecContext) error {
+func run(ctx context.Context) error {
+	onOpen := func(ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		ec.Log("received", ev)
+		ec.Log("opened", ev)
 		return nil
 	}
-	greeterChart, err := statecharts.Build(
-		statecharts.Atomic("greeter", statecharts.On("hello", statecharts.Then(greet))),
+	connChart, err := statecharts.Build(
+		statecharts.Atomic("conn", statecharts.On("open", statecharts.Then(onOpen))),
 		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
 	)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	sendHello := func(ec statecharts.ExecContext) error {
-		ec.Send("hello", statecharts.SendOptions{Target: "alice"})
+	notifyConn := func(ec statecharts.ExecContext) error {
+		ec.Send("open", statecharts.SendOptions{Target: "conn-1"})
 		return nil
 	}
-	callerChart, err := statecharts.Build(
-		statecharts.Atomic("caller", statecharts.On("start", statecharts.Then(sendHello))),
+	gatewayChart, err := statecharts.Build(
+		statecharts.Atomic("gateway", statecharts.On("accept", statecharts.Then(notifyConn))),
 		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
 	)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	sys := actors.NewSystem(actors.WithLogger(statecharts.NewWriterLogger(os.Stdout)))
-	sys.Register(greeterChart)
-	sys.Register(callerChart)
 
-	sys.Spawn(ctx, "alice", greeterChart.ID())
-	sys.Spawn(ctx, "bob", callerChart.ID())
+	if err := sys.Register(connChart); err != nil {
+		return err
+	}
+	if err := sys.Register(gatewayChart); err != nil {
+		return err
+	}
 
-	sys.Tell(ctx, "bob", statecharts.Event{Name: "start", Type: statecharts.EventExternal})
+	if err := sys.Spawn(ctx, "conn-1", connChart.ID()); err != nil {
+		return err
+	}
+	if err := sys.Spawn(ctx, "gateway", gatewayChart.ID()); err != nil {
+		return err
+	}
+
+	if err := sys.Tell(ctx, "gateway", statecharts.Event{Name: "accept", Type: statecharts.EventExternal}); err != nil {
+		return err
+	}
 	time.Sleep(50 * time.Millisecond) // peer delivery hops through a goroutine
-	sys.Stop(ctx)
+
+	return sys.Stop(ctx)
+}
+
+func main() {
+	if err := run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
-`bob` addresses `alice` by name from inside its own chart, the same way
+`gateway` addresses `conn-1` by name from inside its own chart, the same way
 it would address any other executable content target. Neither actor holds
 a Go reference to the other.
 
@@ -712,16 +881,16 @@ it -- paging an actor back in reconstructs its `Instance` from the
 registered `Chart`, since the chart's Go value itself is never persisted:
 
 ```go
-sys.Register(warehouseChart)
-sys.Register(orderChart)
+sys.Register(notifierChart)
+sys.Register(jobChart)
 ```
 
 `Spawn` gives an actor a name -- its address within the system -- and
 starts it running under the chart registered for `kind` (`chart.ID()`):
 
 ```go
-sys.Spawn(ctx, "warehouse", "warehouse")               // not durable
-sys.Spawn(ctx, "order-482", "order", actors.Durable()) // durable
+sys.Spawn(ctx, "notifier", "notifier")             // not durable
+sys.Spawn(ctx, "job-482", "job", actors.Durable()) // durable
 ```
 
 Without `Durable()`, `Spawn` behaves like `statecharts.New` plus `Start`:
@@ -731,7 +900,7 @@ of what it does. If the process restarts, it's gone.
 `Durable()` changes that. A durable actor's messages are appended to the
 system's `Log` before they're applied, and its name doubles as its
 session ID. One call handles both "start fresh" and "resume": if
-`"order-482"` has no prior log entries, `Spawn` starts it fresh; if it
+`"job-482"` has no prior log entries, `Spawn` starts it fresh; if it
 already has history -- because the process restarted, or because it was
 previously paged out -- `Spawn` loads its latest checkpoint and replays
 everything since, landing the actor back in the exact state it was in
@@ -748,10 +917,10 @@ Addressing another actor from inside a chart is ordinary executable
 content -- `Target` is just the other actor's name:
 
 ```go
-placeOrder := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
-	ec.Send("reserve.request", statecharts.SendOptions{
-		Target: "warehouse",
-		Data:   o.SKU,
+sendNotify := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
+	ec.Send("job.done", statecharts.SendOptions{
+		Target: "notifier",
+		Data:   j.Source,
 	})
 	return nil
 })
@@ -762,15 +931,11 @@ event a `System` delivers carries `Origin` set to the sender's own name,
 so a reply is just another `Send` targeting `ev.Origin`:
 
 ```go
-reserve := statecharts.Action(func(w *Warehouse, ec statecharts.ExecContext) error {
+notify := statecharts.Action(func(n *Notifier, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	sku, _ := statecharts.Payload[string](ev)
-	reply := statecharts.Identifier("reserve.denied")
-	if w.Stock[sku] > 0 {
-		w.Stock[sku]--
-		reply = "reserve.ok"
-	}
-	ec.Send(reply, statecharts.SendOptions{Target: ev.Origin})
+	source, _ := statecharts.Payload[string](ev)
+	fmt.Println("notifying owner of", source) // stand-in for actually sending a notification
+	ec.Send("notified", statecharts.SendOptions{Target: ev.Origin})
 	return nil
 })
 ```
@@ -779,10 +944,10 @@ Application code outside any chart addresses an actor the same way, with
 `System.Tell`:
 
 ```go
-sys.Tell(ctx, "order-482", statecharts.Event{
-	Name: "order.place",
+sys.Tell(ctx, "job-482", statecharts.Event{
+	Name: "job.start",
 	Type: statecharts.EventExternal,
-	Data: &skuPayload{TypeName: "sku", Value: "WIDGET-1"},
+	Data: &sourcePayload{TypeName: "source", Value: "uploads/482.png"},
 })
 ```
 
@@ -836,13 +1001,14 @@ Paging applies to durable actors only. A non-durable actor has no `Log`
 to rebuild itself from, so evicting one from memory would destroy it
 rather than hibernate it; `actors` keeps non-durable actors resident for
 as long as the system itself runs, which is the right behavior for
-something meant to always be around, like a `"warehouse"` singleton.
+something meant to always be around, like a `"notifier"` singleton.
 
 ### A full example
 
-A warehouse actor holds stock. An order actor reserves against it and
-records whether the reservation succeeded. The order is durable, so it
-survives a restart in whatever state it last reached:
+A notifier actor stands in for the outside world: it prints (in place of
+actually sending mail) whenever a job finishes. A job actor validates,
+thumbnails, and notifies in sequence, recording its own outcome. The job is
+durable, so it survives a restart in whatever state it last reached:
 
 ```go
 package main
@@ -851,6 +1017,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -860,94 +1027,102 @@ import (
 	"github.com/dhamidi/statecharts/sqllog"
 )
 
-type Warehouse struct {
-	Stock map[string]int
-}
+type Notifier struct{}
 
-type OrderData struct {
-	SKU    string
+type JobData struct {
+	Source string
 	Status string
 }
 
-// skuPayload is the DataMarshaler wrapper "order.place" carries its SKU
-// in. A durable actor's incoming events are appended to the Log before
+// sourcePayload is the DataMarshaler wrapper "job.start" carries its source
+// path in. A durable actor's incoming events are appended to the Log before
 // they're applied, so any Event.Data reaching one must implement
 // statecharts.DataMarshaler; JSONData is a ready-made implementation.
-// "reserve.request" and the replies below target actors that are either
-// non-durable (warehouse) or carry no Data at all, so they need no such
+// "job.done" and the "notified" reply below target actors that are either
+// non-durable (notifier) or carry no Data at all, so they need no such
 // wrapper.
-type skuPayload = statecharts.JSONData[string]
+type sourcePayload = statecharts.JSONData[string]
 
 func init() {
-	statecharts.RegisterDataType("sku", func() statecharts.DataUnmarshaler {
-		return &skuPayload{TypeName: "sku"}
+	statecharts.RegisterDataType("source", func() statecharts.DataUnmarshaler {
+		return &sourcePayload{TypeName: "source"}
 	})
 }
 
-func buildWarehouseChart() *statecharts.Chart {
-	reserve := statecharts.Action(func(w *Warehouse, ec statecharts.ExecContext) error {
+func buildNotifierChart() (*statecharts.Chart, error) {
+	notify := statecharts.Action(func(n *Notifier, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		sku, _ := statecharts.Payload[string](ev)
-		reply := statecharts.Identifier("reserve.denied")
-		if w.Stock[sku] > 0 {
-			w.Stock[sku]--
-			reply = "reserve.ok"
-		}
-		ec.Send(reply, statecharts.SendOptions{Target: ev.Origin})
+		source, _ := statecharts.Payload[string](ev)
+		fmt.Println("notifying owner of", source) // stand-in for actually sending a notification
+		ec.Send("notified", statecharts.SendOptions{Target: ev.Origin})
 		return nil
 	})
-	chart, err := statecharts.Build(
-		statecharts.Atomic("warehouse", statecharts.On("reserve.request", statecharts.Then(reserve))),
-		statecharts.WithNewDatamodel(func() any {
-			return &Warehouse{Stock: map[string]int{"WIDGET-1": 100}}
-		}),
+	return statecharts.Build(
+		statecharts.Atomic("notifier", statecharts.On("job.done", statecharts.Then(notify))),
+		statecharts.WithNewDatamodel(func() any { return &Notifier{} }),
 	)
-	if err != nil {
-		panic(err)
-	}
-	return chart
 }
 
-func buildOrderChart() *statecharts.Chart {
-	placeOrder := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
+func buildJobChart() (*statecharts.Chart, error) {
+	recordSource := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		if payload, ok := statecharts.Payload[*skuPayload](ev); ok {
-			o.SKU = payload.Value
+		if payload, ok := statecharts.Payload[*sourcePayload](ev); ok {
+			j.Source = payload.Value
 		}
-		ec.Send("reserve.request", statecharts.SendOptions{Target: "warehouse", Data: o.SKU})
 		return nil
 	})
-	recordConfirmed := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
-		o.Status = "confirmed"
+	validate := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
+		// stand-in for real image validation
+		ec.Raise(statecharts.Event{Name: "validated"})
 		return nil
 	})
-	recordFailed := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
-		o.Status = "failed"
+	thumbnail := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
+		// stand-in for real thumbnail generation
+		ec.Raise(statecharts.Event{Name: "thumbnailed"})
 		return nil
 	})
-	chart, err := statecharts.Build(
-		statecharts.Compound("order", "new",
+	sendNotify := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
+		ec.Send("job.done", statecharts.SendOptions{Target: "notifier", Data: j.Source})
+		return nil
+	})
+	recordDone := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
+		j.Status = "done"
+		return nil
+	})
+	recordFailed := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
+		j.Status = "failed"
+		return nil
+	})
+
+	return statecharts.Build(
+		statecharts.Compound("job", "queued",
 			statecharts.Children(
-				statecharts.Atomic("new",
-					statecharts.On("order.place", statecharts.Target("reserving"), statecharts.Then(placeOrder)),
+				statecharts.Atomic("queued",
+					statecharts.On("job.start", statecharts.Target("validating"), statecharts.Then(recordSource)),
 				),
-				statecharts.Atomic("reserving",
-					statecharts.On("reserve.ok", statecharts.Target("confirmed"), statecharts.Then(recordConfirmed)),
-					statecharts.On("reserve.denied", statecharts.Target("failed"), statecharts.Then(recordFailed)),
+				statecharts.Atomic("validating",
+					statecharts.OnEntry(validate),
+					statecharts.On("validated", statecharts.Target("thumbnailing")),
+					statecharts.On(string(statecharts.ErrEventExecution), statecharts.Target("failed"), statecharts.Then(recordFailed)),
 				),
-				statecharts.Atomic("confirmed"),
+				statecharts.Atomic("thumbnailing",
+					statecharts.OnEntry(thumbnail),
+					statecharts.On("thumbnailed", statecharts.Target("notifying")),
+					statecharts.On(string(statecharts.ErrEventExecution), statecharts.Target("failed"), statecharts.Then(recordFailed)),
+				),
+				statecharts.Atomic("notifying",
+					statecharts.OnEntry(sendNotify),
+					statecharts.On("notified", statecharts.Target("done"), statecharts.Then(recordDone)),
+				),
+				statecharts.Atomic("done"),
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &OrderData{} }),
+		statecharts.WithNewDatamodel(func() any { return &JobData{} }),
 	)
-	if err != nil {
-		panic(err)
-	}
-	return chart
 }
 
-func buildSystem(log *sqllog.Log) *actors.System {
+func buildSystem(log *sqllog.Log) (*actors.System, error) {
 	sys := actors.NewSystem(
 		actors.WithNodeName("main"),
 		actors.WithLog(log),
@@ -955,63 +1130,82 @@ func buildSystem(log *sqllog.Log) *actors.System {
 		actors.WithIdleTimeout(5*time.Minute),
 		actors.WithMaxResident(10_000),
 	)
-	if err := sys.Register(buildWarehouseChart()); err != nil {
-		panic(err)
+	notifierChart, err := buildNotifierChart()
+	if err != nil {
+		return nil, err
 	}
-	if err := sys.Register(buildOrderChart()); err != nil {
-		panic(err)
+	if err := sys.Register(notifierChart); err != nil {
+		return nil, err
 	}
-	return sys
+	jobChart, err := buildJobChart()
+	if err != nil {
+		return nil, err
+	}
+	if err := sys.Register(jobChart); err != nil {
+		return nil, err
+	}
+	return sys, nil
 }
 
-func main() {
-	ctx := context.Background()
-
+func run(ctx context.Context) error {
 	db, err := sql.Open("sqlite", "actors.db")
 	if err != nil {
-		panic(err)
+		return err
 	}
 	log, err := sqllog.New(db, sqllog.SQLite)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	sys := buildSystem(log)
-
-	if err := sys.Spawn(ctx, "warehouse", "warehouse"); err != nil {
-		panic(err)
-	}
-	if err := sys.Spawn(ctx, "order-482", "order", actors.Durable()); err != nil {
-		panic(err)
+	sys, err := buildSystem(log)
+	if err != nil {
+		return err
 	}
 
-	if err := sys.Tell(ctx, "order-482", statecharts.Event{
-		Name: "order.place",
+	if err := sys.Spawn(ctx, "notifier", "notifier"); err != nil {
+		return err
+	}
+	if err := sys.Spawn(ctx, "job-482", "job", actors.Durable()); err != nil {
+		return err
+	}
+
+	if err := sys.Tell(ctx, "job-482", statecharts.Event{
+		Name: "job.start",
 		Type: statecharts.EventExternal,
-		Data: &skuPayload{TypeName: "sku", Value: "WIDGET-1"},
+		Data: &sourcePayload{TypeName: "source", Value: "uploads/482.png"},
 	}); err != nil {
-		panic(err)
+		return err
 	}
 
 	time.Sleep(50 * time.Millisecond) // peer delivery hops through a goroutine
 
 	if err := sys.Stop(ctx); err != nil {
-		panic(err)
+		return err
 	}
 
 	// Later, possibly in a different process entirely, against the same Log:
-	sys2 := buildSystem(log)
-	if err := sys2.Spawn(ctx, "order-482", "order", actors.Durable()); err != nil {
-		panic(err)
+	sys2, err := buildSystem(log)
+	if err != nil {
+		return err
 	}
-	// order-482 resumes in "confirmed" without replaying "order.place" or
-	// "reserve.ok" as new messages against the warehouse -- they're already
-	// baked into its checkpointed state.
+	if err := sys2.Spawn(ctx, "job-482", "job", actors.Durable()); err != nil {
+		return err
+	}
+	// job-482 resumes in "done" without replaying "job.start" or "notified"
+	// as new messages against the notifier -- they're already baked into
+	// its checkpointed state.
 	if err := sys2.Stop(ctx); err != nil {
-		panic(err)
+		return err
 	}
 
-	fmt.Println("order-482 resumed")
+	fmt.Println("job-482 resumed")
+	return nil
+}
+
+func main() {
+	if err := run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
@@ -1033,10 +1227,10 @@ instead of between actors inside one.
 `Bridge` is a ready-made fallback `IOProcessor` for connecting two
 `System`s. It's configured with a namespace and a target `System`: `Send`
 accepts only targets whose first segment is that namespace, strips it, and
-delivers what's left to the target via `Tell`. An actor in `sysA` reaches
-an actor named `"billing"` in `sysB` by addressing
-`"warehouse-b.billing"`, once `sysA` is built with a `Bridge` for the
-`"warehouse-b"` namespace pointed at `sysB`.
+delivers what's left to the target via `Tell`. An actor in `gatewaySystem`
+reaches an actor named `"job-482"` in `jobsSystem` by addressing
+`"jobs-system.job-482"`, once `gatewaySystem` is built with a `Bridge` for
+the `"jobs-system"` namespace pointed at `jobsSystem`.
 
 Replies work the same way, in reverse. `Bridge` stamps `Origin` with its
 own namespace, so a reply -- an ordinary `Send` targeting `ev.Origin`,
@@ -1051,16 +1245,16 @@ wants a complete `IOProcessor` -- before the other one exists.
 fills it in once both `System`s exist, before either receives any traffic:
 
 ```go
-toOrders := actors.NewBridge("orders-system", nil, "warehouse-system")
-warehouseSystem := actors.NewSystem(actors.WithFallback(toOrders))
-// ... register charts and spawn actors on warehouseSystem ...
+toJobs := actors.NewBridge("jobs-system", nil, "gateway-system")
+gatewaySystem := actors.NewSystem(actors.WithFallback(toJobs))
+// ... register charts and spawn actors on gatewaySystem ...
 
-ordersSystem := actors.NewSystem(actors.WithFallback(
-	actors.NewBridge("warehouse-system", warehouseSystem, "orders-system"),
+jobsSystem := actors.NewSystem(actors.WithFallback(
+	actors.NewBridge("gateway-system", gatewaySystem, "jobs-system"),
 ))
-// ... register charts and spawn actors on ordersSystem ...
+// ... register charts and spawn actors on jobsSystem ...
 
-toOrders.SetTarget(ordersSystem)
+toJobs.SetTarget(jobsSystem)
 ```
 
 `Bridge.Send` never blocks on delivery, the same way a `System`'s own
@@ -1070,9 +1264,14 @@ lookups -- and hands the actual delivery off to a goroutine before
 returning. A slow or wedged actor on the far side of a bridge holds up only
 that goroutine, never the sender's own.
 
-A complete example: `warehouse-system` holds a warehouse actor,
-`orders-system` holds an order actor, and an order in one reserves stock in
-the other by addressing it across the bridge:
+A complete example: `gateway-system` holds a connection actor,
+`jobs-system` holds a job actor. Connections churn fast and are numerous
+but cheap to lose; jobs are heavier and durable -- different lifecycles and
+different scaling characteristics are exactly the reason to run them as two
+`System`s instead of one. The connection actor forwards an upload to the
+job actor across the bridge; the job actor, once it finishes, sends the
+result back to the connection actor that started it, by name, across the
+same bridge in reverse:
 
 ```go
 package main
@@ -1080,125 +1279,134 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
 )
 
-type Warehouse struct {
-	Stock map[string]int
+type ConnData struct {
+	Result string
 }
 
-type OrderData struct {
-	Status string
-}
-
-func buildWarehouseChart() *statecharts.Chart {
-	reserve := statecharts.Action(func(w *Warehouse, ec statecharts.ExecContext) error {
-		ev, _ := ec.Event()
-		sku, _ := statecharts.Payload[string](ev)
-		reply := statecharts.Identifier("reserve.denied")
-		if w.Stock[sku] > 0 {
-			w.Stock[sku]--
-			reply = "reserve.ok"
-		}
-		ec.Send(reply, statecharts.SendOptions{Target: ev.Origin})
-		return nil
-	})
-	chart, err := statecharts.Build(
-		statecharts.Atomic("warehouse", statecharts.On("reserve.request", statecharts.Then(reserve))),
-		statecharts.WithNewDatamodel(func() any {
-			return &Warehouse{Stock: map[string]int{"WIDGET-1": 100}}
-		}),
-	)
-	if err != nil {
-		panic(err)
-	}
-	return chart
-}
-
-func buildOrderChart() *statecharts.Chart {
-	placeOrder := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
-		ec.Send("reserve.request", statecharts.SendOptions{
-			Target: "warehouse-system.warehouse",
-			Data:   "WIDGET-1",
+func buildConnChart() (*statecharts.Chart, error) {
+	forwardUpload := statecharts.Action(func(c *ConnData, ec statecharts.ExecContext) error {
+		ec.Send("job.start", statecharts.SendOptions{
+			Target: "jobs-system.job-482",
+			Data:   "uploads/482.png",
 		})
 		return nil
 	})
-	recordConfirmed := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
-		o.Status = "confirmed"
+	recordResult := statecharts.Action(func(c *ConnData, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		c.Result, _ = statecharts.Payload[string](ev)
 		return nil
 	})
-	recordFailed := statecharts.Action(func(o *OrderData, ec statecharts.ExecContext) error {
-		o.Status = "failed"
-		return nil
-	})
-	chart, err := statecharts.Build(
-		statecharts.Compound("order", "new",
+	return statecharts.Build(
+		statecharts.Compound("conn", "open",
 			statecharts.Children(
-				statecharts.Atomic("new",
-					statecharts.On("order.place", statecharts.Target("reserving"), statecharts.Then(placeOrder)),
+				statecharts.Atomic("open",
+					statecharts.On("upload", statecharts.Then(forwardUpload)),
+					statecharts.On("job.result", statecharts.Target("delivered"), statecharts.Then(recordResult)),
 				),
-				statecharts.Atomic("reserving",
-					statecharts.On("reserve.ok", statecharts.Target("confirmed"), statecharts.Then(recordConfirmed)),
-					statecharts.On("reserve.denied", statecharts.Target("failed"), statecharts.Then(recordFailed)),
-				),
-				statecharts.Atomic("confirmed"),
-				statecharts.Atomic("failed"),
+				statecharts.Atomic("delivered"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &OrderData{} }),
+		statecharts.WithNewDatamodel(func() any { return &ConnData{} }),
 	)
+}
+
+type JobData struct {
+	Origin statecharts.Identifier
+	Status string
+}
+
+func buildJobChart() (*statecharts.Chart, error) {
+	startJob := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		j.Origin = ev.Origin
+		// stand-in for validating, thumbnailing, and notifying
+		ec.Raise(statecharts.Event{Name: "job.finished"})
+		return nil
+	})
+	reply := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
+		j.Status = "done"
+		ec.Send("job.result", statecharts.SendOptions{Target: j.Origin, Data: "thumbnails ready"})
+		return nil
+	})
+	return statecharts.Build(
+		statecharts.Compound("job", "queued",
+			statecharts.Children(
+				statecharts.Atomic("queued",
+					statecharts.On("job.start", statecharts.Target("processing"), statecharts.Then(startJob)),
+				),
+				statecharts.Atomic("processing",
+					statecharts.On("job.finished", statecharts.Target("done"), statecharts.Then(reply)),
+				),
+				statecharts.Atomic("done"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &JobData{} }),
+	)
+}
+
+func run(ctx context.Context) error {
+	// gatewaySystem's Bridge needs jobsSystem as its target, but jobsSystem's
+	// own Bridge needs gatewaySystem -- built first here -- as its target.
+	// NewBridge accepts a nil target to break the cycle; toJobs is wired up
+	// with SetTarget once jobsSystem exists.
+	toJobs := actors.NewBridge("jobs-system", nil, "gateway-system")
+	gatewaySystem := actors.NewSystem(actors.WithFallback(toJobs))
+	connChart, err := buildConnChart()
 	if err != nil {
-		panic(err)
+		return err
 	}
-	return chart
+	if err := gatewaySystem.Register(connChart); err != nil {
+		return err
+	}
+	if err := gatewaySystem.Spawn(ctx, "gateway-1", "conn"); err != nil {
+		return err
+	}
+
+	jobsSystem := actors.NewSystem(actors.WithFallback(
+		actors.NewBridge("gateway-system", gatewaySystem, "jobs-system"),
+	))
+	jobChart, err := buildJobChart()
+	if err != nil {
+		return err
+	}
+	if err := jobsSystem.Register(jobChart); err != nil {
+		return err
+	}
+	if err := jobsSystem.Spawn(ctx, "job-482", "job"); err != nil {
+		return err
+	}
+	toJobs.SetTarget(jobsSystem)
+
+	if err := gatewaySystem.Tell(ctx, "gateway-1", statecharts.Event{
+		Name: "upload",
+		Type: statecharts.EventExternal,
+	}); err != nil {
+		return err
+	}
+
+	time.Sleep(50 * time.Millisecond) // the result round-trips through both bridges
+
+	if err := gatewaySystem.Stop(ctx); err != nil {
+		return err
+	}
+	if err := jobsSystem.Stop(ctx); err != nil {
+		return err
+	}
+
+	fmt.Println("gateway-1 delivered a job result received from a different System entirely")
+	return nil
 }
 
 func main() {
-	ctx := context.Background()
-
-	// warehouseSystem's Bridge needs ordersSystem as its target, but
-	// ordersSystem's own Bridge needs warehouseSystem -- built first here
-	// -- as its target. NewBridge accepts a nil target to break the cycle;
-	// toOrders is wired up with SetTarget once ordersSystem exists.
-	toOrders := actors.NewBridge("orders-system", nil, "warehouse-system")
-	warehouseSystem := actors.NewSystem(actors.WithFallback(toOrders))
-	if err := warehouseSystem.Register(buildWarehouseChart()); err != nil {
-		panic(err)
+	if err := run(context.Background()); err != nil {
+		log.Fatal(err)
 	}
-	if err := warehouseSystem.Spawn(ctx, "warehouse", "warehouse"); err != nil {
-		panic(err)
-	}
-
-	ordersSystem := actors.NewSystem(actors.WithFallback(
-		actors.NewBridge("warehouse-system", warehouseSystem, "orders-system"),
-	))
-	if err := ordersSystem.Register(buildOrderChart()); err != nil {
-		panic(err)
-	}
-	if err := ordersSystem.Spawn(ctx, "order-482", "order"); err != nil {
-		panic(err)
-	}
-	toOrders.SetTarget(ordersSystem)
-
-	if err := ordersSystem.Tell(ctx, "order-482", statecharts.Event{
-		Name: "order.place",
-		Type: statecharts.EventExternal,
-	}); err != nil {
-		panic(err)
-	}
-
-	time.Sleep(50 * time.Millisecond) // the reservation round-trips through both bridges
-
-	if err := warehouseSystem.Stop(ctx); err != nil {
-		panic(err)
-	}
-	if err := ordersSystem.Stop(ctx); err != nil {
-		panic(err)
-	}
-
-	fmt.Println("order-482 reserved WIDGET-1 in a different System entirely")
 }
 ```
