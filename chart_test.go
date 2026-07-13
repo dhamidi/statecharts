@@ -209,3 +209,60 @@ func TestBuildValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestChartIDReturnsRootStateID(t *testing.T) {
+	chart, err := Build(
+		Compound("door", "closed",
+			Children(
+				Atomic("closed", On("open.request", Target("open"))),
+				Atomic("open"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if chart.ID() != "door" {
+		t.Fatalf("ID() = %q, want %q", chart.ID(), "door")
+	}
+}
+
+func TestChartNewDatamodelRoundTrips(t *testing.T) {
+	chart, err := Build(
+		Atomic("solo"),
+		WithNewDatamodel(func() any { return &Door{OpenCount: 42} }),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	v, ok := chart.NewDatamodel()
+	if !ok {
+		t.Fatalf("NewDatamodel() ok = false, want true")
+	}
+	d, ok := v.(*Door)
+	if !ok {
+		t.Fatalf("NewDatamodel() = %T, want *Door", v)
+	}
+	if d.OpenCount != 42 {
+		t.Fatalf("NewDatamodel().OpenCount = %d, want 42", d.OpenCount)
+	}
+
+	// Each call produces a fresh value, not a shared one.
+	v2, _ := chart.NewDatamodel()
+	d2 := v2.(*Door)
+	d2.OpenCount = 99
+	if d.OpenCount != 42 {
+		t.Fatalf("NewDatamodel() values are not independent: mutating one changed the other")
+	}
+}
+
+func TestChartWithoutNewDatamodelReportsNotOK(t *testing.T) {
+	chart, err := Build(Atomic("solo"))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if _, ok := chart.NewDatamodel(); ok {
+		t.Fatalf("NewDatamodel() ok = true, want false (no WithNewDatamodel given)")
+	}
+}

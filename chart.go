@@ -5,9 +5,38 @@ import "fmt"
 // Chart is an immutable, validated, indexed chart definition produced by
 // Build. It is safe for concurrent use by multiple Instances.
 type Chart struct {
-	root  *compiledState
-	byID  map[Identifier]*compiledState
-	order []*compiledState // document order (pre-order traversal of the state tree)
+	root         *compiledState
+	byID         map[Identifier]*compiledState
+	order        []*compiledState // document order (pre-order traversal of the state tree)
+	newDatamodel func() any
+}
+
+// BuildOption configures a Chart being built by Build.
+type BuildOption func(*Chart)
+
+// WithNewDatamodel gives chart a way to produce a fresh datamodel value on
+// its own, for callers that build Instances of chart without constructing a
+// datamodel themselves. The actors package depends on this to page a
+// chart's instances into and out of memory on demand, reconstructing each
+// one's datamodel from scratch as it pages back in.
+func WithNewDatamodel(fn func() any) BuildOption {
+	return func(c *Chart) { c.newDatamodel = fn }
+}
+
+// ID returns the chart's root state's ID, which identifies the chart itself
+// wherever a chart-level identity is needed. A Chart is otherwise
+// anonymous -- only its states have names.
+func (c *Chart) ID() Identifier {
+	return c.root.id
+}
+
+// NewDatamodel calls the factory registered with WithNewDatamodel, if one
+// was. ok is false if none was.
+func (c *Chart) NewDatamodel() (v any, ok bool) {
+	if c.newDatamodel == nil {
+		return nil, false
+	}
+	return c.newDatamodel(), true
 }
 
 type compiledState struct {
@@ -46,7 +75,7 @@ func (c *Chart) States() []Identifier {
 // Build compiles root and its descendants into a Chart, resolving and
 // validating every Initial/Target/history-default Identifier reference.
 // Errors are static, discovered here rather than at interpretation time.
-func Build(root StateSpec) (*Chart, error) {
+func Build(root StateSpec, opts ...BuildOption) (*Chart, error) {
 	c := &Chart{byID: make(map[Identifier]*compiledState)}
 	docOrder := 0
 	compiled, err := compileState(c, root, nil, &docOrder)
@@ -56,6 +85,9 @@ func Build(root StateSpec) (*Chart, error) {
 	c.root = compiled
 	if err := c.validateReferences(); err != nil {
 		return nil, err
+	}
+	for _, opt := range opts {
+		opt(c)
 	}
 	return c, nil
 }
