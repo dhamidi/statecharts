@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -512,4 +513,55 @@ type alwaysFailingSnapshotStore struct {
 
 func (a *alwaysFailingSnapshotStore) Save(ctx context.Context, sessionID string, cp statecharts.Checkpoint) error {
 	return fmt.Errorf("alwaysFailingSnapshotStore: Save always fails")
+}
+
+// TestStopAggregatesAllTeardownErrors is the regression test for Stop's
+// error handling: with two resident durable actors that both fail their
+// checkpoint during teardown, Stop must report both failures instead of
+// keeping only whichever one happened to win the race to record itself
+// first. Each actor's own goroutine hits the same failing SnapshotStore.Save
+// independently, so this exercises the exact concurrent race the old
+// first-error-wins logic lost data to.
+func TestStopAggregatesAllTeardownErrors(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	failingStore := &alwaysFailingSnapshotStore{SnapshotStore: log}
+
+	var dms []*counterModel
+	chart := buildLadderChart(&dms)
+
+	sys := NewSystem(WithLog(log), WithSnapshotStore(failingStore))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	names := []statecharts.Identifier{"failing-1", "failing-2"}
+	for _, name := range names {
+		if err := sys.Spawn(ctx, name, chart.ID(), Durable()); err != nil {
+			t.Fatalf("Spawn(%q): %v", name, err)
+		}
+	}
+
+	err := sys.Stop(ctx)
+	if err == nil {
+		t.Fatalf("Stop: expected a non-nil aggregated error, got nil")
+	}
+
+	// errors.Join's result implements Unwrap() []error (see the errors
+	// package doc) -- unwrapping it, rather than pattern-matching on a
+	// single sentinel, is how a caller distinguishes "aggregated every
+	// failure" from "kept only one and discarded the rest".
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		t.Fatalf("Stop error %v does not implement Unwrap() []error -- not an errors.Join result", err)
+	}
+	sub := joined.Unwrap()
+	if len(sub) != len(names) {
+		t.Fatalf("Stop error aggregates %d error(s), want %d (one per failed actor): %v", len(sub), len(names), err)
+	}
+	for _, name := range names {
+		if !strings.Contains(err.Error(), string(name)) {
+			t.Fatalf("Stop error %v does not mention failed actor %q -- lost under first-error-wins", err, name)
+		}
+	}
 }

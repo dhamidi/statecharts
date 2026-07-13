@@ -2,6 +2,7 @@ package actors
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -651,6 +652,14 @@ func (s *System) runSweep() {
 // has no Log to rebuild itself from. The idle-timeout sweep is cancelled.
 // Stop is idempotent: calling it again is a no-op.
 //
+// Stop returns every actor's teardown error via errors.Join, not just
+// whichever one happened to finish first -- one wedged or misbehaving actor
+// never hides another's failure. A caller that cares about a specific cause
+// should unwrap the result (errors.Is, errors.As, or a type assertion on
+// the interface{ Unwrap() []error } an errors.Join result implements)
+// rather than assume it names a single error. Stop returns nil once every
+// actor tears down cleanly.
+//
 // Marking the system stopped and snapshotting the table to iterate over
 // happen inside the same tableMu critical section (see entryFor's own doc
 // comment) so a Spawn racing this call either completes entirely first --
@@ -690,15 +699,13 @@ func (s *System) Stop(ctx context.Context) error {
 	s.sweepMu.Unlock()
 
 	var errMu sync.Mutex
-	var firstErr error
+	var errs []error
 	recordErr := func(err error) {
 		if err == nil {
 			return
 		}
 		errMu.Lock()
-		if firstErr == nil {
-			firstErr = err
-		}
+		errs = append(errs, err)
 		errMu.Unlock()
 	}
 
@@ -735,7 +742,7 @@ func (s *System) Stop(ctx context.Context) error {
 	recordErr(awaitWithContext(ctx, &wg))
 	recordErr(awaitWithContext(ctx, &s.asyncWG))
 
-	return firstErr
+	return errors.Join(errs...)
 }
 
 // awaitWithContext blocks until wg.Wait() would return or ctx fires,
