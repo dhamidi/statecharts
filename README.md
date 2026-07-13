@@ -713,14 +713,62 @@ The child's own `Send(name, statecharts.SendOptions{Target: "#_parent"})`
 reaches back into the invoking chart, tagged with the invocation's ID —
 the special `"#_parent"` target SCXML's Event I/O Processor defines.
 
-An invocation is a real-world side effect, so `Rehydrate` never restarts
-one: a state's `<invoke>` still counts as active for as long as that
-state stays in the restored configuration, but `Rehydrate` delivers
-`error.communication` for it instead of actually running it again, since
-there's no way to guarantee the original invocation's process survived
-the restart. An actor system built on `actors.System` also never pages
-out an actor with an active invocation — see
-[Automatic paging](#automatic-paging).
+An invocation is a real-world side effect, so `Rehydrate` never blindly
+restarts one: a state's `<invoke>` still counts as active for as long as
+that state stays in the restored configuration, but by default
+`Rehydrate` delivers `error.communication` for it instead of running it
+again, since a plain `InvokeFunc` gives no way to tell whether the
+original process survived the restart. An actor system built on
+`actors.System` also never pages out an actor with an active invocation —
+see [Automatic paging](#automatic-paging).
+
+The Go goroutine running an `InvokeFunc` dies the moment its process
+does, but the real thing it was managing — a subprocess, a job in an
+external queue, a container — might still be alive on the other side of a
+restart. `WithInvokeResume` gives an invocation a way to check instead of
+being written off automatically: once replay catches up, `Rehydrate`
+calls it in place of `error.communication`, and its return is treated
+exactly like `Start`'s — an error still becomes `error.communication`,
+but this time an informed one, and a clean return (immediate, or after
+blocking on `io.Incoming` like any other invocation) becomes
+`done.invoke.<id>`. Extending the thumbnailing example with a real
+subprocess, keyed by its PID:
+
+```go
+resize := statecharts.Invoke(
+	func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
+		cmd := exec.CommandContext(ctx, "resize-thumb", fmt.Sprint(params))
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		// recordPID("resize", cmd.Process.Pid) -- durable store WithInvokeResume reads back
+		return fmt.Sprintf("thumb-%dpx.jpg", params), cmd.Wait()
+	},
+	statecharts.WithInvokeID("resize"),
+	statecharts.WithInvokeParams(func(ec statecharts.ExecContext) any { return 128 }),
+	statecharts.WithInvokeResume(func(ctx context.Context, id statecharts.Identifier, params any, io statecharts.InvokeIO) (any, error) {
+		pid := 0 // loadPID(id) -- read back whatever the live invocation recorded
+		proc, err := os.FindProcess(pid)
+		if err != nil || proc.Signal(syscall.Signal(0)) != nil {
+			return nil, fmt.Errorf("resize subprocess %d is gone", pid)
+		}
+		for proc.Signal(syscall.Signal(0)) == nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Second):
+			}
+		}
+		return fmt.Sprintf("thumb-%dpx.jpg", params), nil
+	}),
+)
+```
+
+`id` is the same invocation ID either way — `"resize"`, from `WithInvokeID`
+— so `Resume` needs no ID scheme of its own; it only needs whatever the
+live invocation used to find its subprocess again to still be durable
+across the restart, which a PID (or a queue job ID, or a container name)
+already is.
 
 </details>
 
@@ -730,8 +778,11 @@ out an actor with an active invocation — see
 <summary>Show Persistence Examples</summary>
 
 An `Instance`'s state — its active configuration, recorded history, queued
-events, and any outstanding delayed sends — can be captured at any point
-with `Instance.Snapshot` and later restored with `Restore`:
+events, any outstanding delayed sends, and which invocations were active —
+can be captured at any point with `Instance.Snapshot` and later restored
+with `Restore`. A checkpoint taken mid-invoke restores that invocation's
+bookkeeping along with everything else, so it's still recognized as active
+afterward even with nothing left in a `Log` to replay it back into place:
 
 ```go
 snap, err := in.Snapshot(ctx)
@@ -752,9 +803,13 @@ in, err := statecharts.Rehydrate(ctx, chart, myDatamodel, log, snapshotStore, se
 `Rehydrate` loads the latest checkpoint if one exists, to avoid replaying
 from the very first message, then replays everything since. Real dispatch
 through the `IOProcessor` is suppressed until replay catches up, so
-reconstructing state never repeats a real-world effect — and an `<invoke>`
-attached to a restored state is never actually restarted either, for the
-same reason (see [Invoke](#invoke)).
+reconstructing state never repeats a real-world effect. Once it catches
+up, every invocation still active — restored from the checkpoint, replayed
+back into its state, or both — is reconciled exactly once: `Rehydrate`
+resumes it for real if its `<invoke>` was configured with
+`WithInvokeResume`, or reports `error.communication` for it otherwise,
+rather than leaving it looking alive with nothing actually running (see
+[Invoke](#invoke)).
 
 </details>
 
