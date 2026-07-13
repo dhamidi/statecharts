@@ -241,6 +241,52 @@ func Durable() SpawnOption {
 // can test for this with errors.Is.
 var ErrSystemStopped = errors.New("actors: system is stopped")
 
+// ErrKindNotRegistered is returned by Spawn, and by any activation
+// (including a page-in triggered by routing) that reaches a kind with no
+// matching Register call, when kind names a chart the System has never
+// seen. Register it before spawning or delivering to a name of that kind;
+// retrying without registering the chart fails the same way every time.
+var ErrKindNotRegistered = errors.New("actors: kind is not registered")
+
+// ErrDurabilityUnsupported is returned by Spawn when called with Durable
+// against a System missing WithLog, WithSnapshotStore, or both. Configure
+// both options when constructing the System, or drop Durable from this
+// Spawn call; the error does not depend on anything about the call itself
+// that a retry could change.
+var ErrDurabilityUnsupported = errors.New("actors: durable spawn requires WithLog and WithSnapshotStore")
+
+// ErrKindMismatch is returned by Spawn when name was already spawned under
+// a different kind. A name's kind is fixed by whichever Spawn call first
+// creates its entry; every later Spawn for that name must agree. The
+// error's message (via Error) reports the name along with the original and
+// attempted kind; a caller that only needs to know that a mismatch
+// occurred, not the specific values, can test for it with errors.Is.
+var ErrKindMismatch = errors.New("actors: name was spawned under a different kind")
+
+// ErrDurabilityMismatch is returned by Spawn when name was already spawned
+// with a different durability setting than this call requests. A name's
+// durability, like its kind, is fixed by its first Spawn and cannot change
+// on a later call for the same name.
+var ErrDurabilityMismatch = errors.New("actors: name's durability is fixed by its first Spawn")
+
+// ErrResidencyExhausted is returned by Spawn, and by any activation
+// (including a page-in triggered by routing) that finds the residency
+// limit (see WithResidencyLimit) still exceeded after evicting every
+// durable resident actor eligible for eviction. Unlike ErrKindNotRegistered
+// or ErrDurabilityMismatch, this failure is not a property of the call that
+// triggered it -- it depends on which other actors happen to be resident at
+// the moment, so a caller may reasonably retry it, e.g. after backing off
+// or after other actors have gone idle and been paged out on their own.
+var ErrResidencyExhausted = errors.New("actors: residency limit reached and no evictable actor available")
+
+// ErrUnknownActor is returned by Tell (via deliver) when name has never been
+// Spawned in this System. It is distinct from the error.communication event
+// a chart's own Send raises for the same condition (see routingProcessor.Send
+// in router.go): that path is internal to the interpreter and never reaches
+// Go code as an error value, while ErrUnknownActor is what a direct caller
+// of Tell observes and can test for with errors.Is.
+var ErrUnknownActor = errors.New("actors: unknown actor")
+
 // Spawn gives an actor a name -- its address within the system -- and
 // starts it running under the Chart registered for kind. Spawn is
 // idempotent for a name that is already resident: calling it again for the
@@ -267,10 +313,10 @@ func (s *System) Spawn(ctx context.Context, name, kind statecharts.Identifier, o
 	}
 
 	if _, ok := s.chartFor(kind); !ok {
-		return fmt.Errorf("actors: Spawn: kind %q was never Registered", kind)
+		return fmt.Errorf("actors: Spawn: kind %q was never Registered: %w", kind, ErrKindNotRegistered)
 	}
 	if cfg.durable && (s.cfg.log == nil || s.cfg.snapshots == nil) {
-		return fmt.Errorf("actors: Spawn: Durable() requires WithLog and WithSnapshotStore")
+		return fmt.Errorf("actors: Spawn: %w", ErrDurabilityUnsupported)
 	}
 
 	entry, err := s.entryFor(name, kind, cfg.durable)
@@ -301,10 +347,10 @@ func (s *System) entryFor(name, kind statecharts.Identifier, durable bool) (*act
 	}
 	if e, ok := s.table[name]; ok {
 		if e.kind != kind {
-			return nil, fmt.Errorf("actors: %q was spawned as kind %q, not %q", name, e.kind, kind)
+			return nil, fmt.Errorf("actors: %q was spawned as kind %q, not %q: %w", name, e.kind, kind, ErrKindMismatch)
 		}
 		if e.durable != durable {
-			return nil, fmt.Errorf("actors: %q durability is fixed at its first Spawn (durable=%v)", name, e.durable)
+			return nil, fmt.Errorf("actors: %q durability is fixed at its first Spawn (durable=%v): %w", name, e.durable, ErrDurabilityMismatch)
 		}
 		return e, nil
 	}
@@ -358,7 +404,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 
 	chart, ok := s.chartFor(entry.kind)
 	if !ok {
-		return fmt.Errorf("actors: activate %q: kind %q is not registered", entry.name, entry.kind)
+		return fmt.Errorf("actors: activate %q: kind %q is not registered: %w", entry.name, entry.kind, ErrKindNotRegistered)
 	}
 	dm, _ := chart.NewDatamodel()
 	proc := newRoutingProcessor(s, entry.name)
@@ -401,7 +447,7 @@ func (s *System) admit(ctx context.Context, exclude *actorEntry) error {
 	for s.cfg.residencyLimit(s.residentCount()) {
 		victim := s.pickEvictionVictim(exclude)
 		if victim == nil {
-			return fmt.Errorf("actors: residency limit reached (resident=%d) and no evictable actor available", s.residentCount())
+			return fmt.Errorf("actors: residency limit reached (resident=%d): %w", s.residentCount(), ErrResidencyExhausted)
 		}
 		err := s.evictLocked(ctx, victim)
 		victim.mu.Unlock()
@@ -523,7 +569,7 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 	}
 	entry, ok := s.resolve(name)
 	if !ok {
-		return fmt.Errorf("actors: unknown actor %q", name)
+		return fmt.Errorf("actors: unknown actor %q: %w", name, ErrUnknownActor)
 	}
 
 	entry.mu.Lock()

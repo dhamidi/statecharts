@@ -42,8 +42,9 @@ func TestRegisterRejectsDuplicateChartID(t *testing.T) {
 
 func TestSpawnRejectsUnregisteredKind(t *testing.T) {
 	sys := NewSystem()
-	if err := sys.Spawn(context.Background(), "x", "never-registered"); err == nil {
-		t.Fatalf("Spawn: expected error for a kind that was never Registered")
+	err := sys.Spawn(context.Background(), "x", "never-registered")
+	if !errors.Is(err, ErrKindNotRegistered) {
+		t.Fatalf("Spawn: err = %v, want ErrKindNotRegistered", err)
 	}
 }
 
@@ -56,8 +57,38 @@ func TestSpawnDurableRejectsMissingLogOrSnapshotStore(t *testing.T) {
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if err := sys.Spawn(context.Background(), "d-1", chart.ID(), Durable()); err == nil {
-		t.Fatalf("Spawn(Durable()): expected error without WithLog/WithSnapshotStore")
+	spawnErr := sys.Spawn(context.Background(), "d-1", chart.ID(), Durable())
+	if !errors.Is(spawnErr, ErrDurabilityUnsupported) {
+		t.Fatalf("Spawn(Durable()): err = %v, want ErrDurabilityUnsupported", spawnErr)
+	}
+}
+
+// TestSpawnFailsWithResidencyExhaustedWhenNothingEvictable covers admit's
+// failure path: a non-durable resident actor can never be evicted to make
+// room (pickEvictionVictim only ever returns durable actors, since a
+// non-durable actor has no Log to rebuild itself from), so a residency
+// limit that is already met by non-durable occupants alone leaves Spawn
+// with nothing it can free up.
+func TestSpawnFailsWithResidencyExhaustedWhenNothingEvictable(t *testing.T) {
+	ctx := context.Background()
+	var dms []*counterModel
+	chart := buildLadderChart(&dms)
+
+	sys := NewSystem(WithMaxResident(1))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "keep-1", chart.ID()); err != nil {
+		t.Fatalf("Spawn(keep-1): %v", err)
+	}
+
+	spawnErr := sys.Spawn(ctx, "second-1", chart.ID())
+	if !errors.Is(spawnErr, ErrResidencyExhausted) {
+		t.Fatalf("Spawn(second-1): err = %v, want ErrResidencyExhausted", spawnErr)
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }
 
