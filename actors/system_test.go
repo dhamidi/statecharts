@@ -547,7 +547,7 @@ type alwaysFailingSnapshotStore struct {
 	statecharts.SnapshotStore
 }
 
-func (a *alwaysFailingSnapshotStore) Save(ctx context.Context, sessionID string, cp statecharts.Checkpoint) error {
+func (a *alwaysFailingSnapshotStore) Save(ctx context.Context, sessionID statecharts.SessionID, cp statecharts.Checkpoint) error {
 	return fmt.Errorf("alwaysFailingSnapshotStore: Save always fails")
 }
 

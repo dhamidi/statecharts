@@ -192,7 +192,7 @@ func TestSnapshotStoreSaveLoad(t *testing.T) {
 func TestRehydrateAgainstRealDatabase(t *testing.T) {
 	log := openTestLog(t)
 	ctx := context.Background()
-	sessionID := "door-1"
+	sessionID := statecharts.SessionID("door-1")
 
 	notLocked := statecharts.Cond(func(d *doorModel, ec statecharts.ExecContext) bool { return !d.Locked })
 	recordOpen := statecharts.Action(func(d *doorModel, ec statecharts.ExecContext) error { d.OpenCount++; return nil })

@@ -418,13 +418,13 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 		// explicit Log.Append System.deliver performs before every
 		// externally-originated message (Tell, peer Send). Without this, a
 		// durable actor's self-scheduled sends would never be durable.
-		inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, string(entry.name), proc,
+		inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, statecharts.SessionID(entry.name), proc,
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger),
-			statecharts.WithTimerFiredHook(statecharts.LoggingTimerFiredHook(s.cfg.log, string(entry.name))),
+			statecharts.WithTimerFiredHook(statecharts.LoggingTimerFiredHook(s.cfg.log, statecharts.SessionID(entry.name))),
 		)
 	} else {
-		inst = statecharts.New(chart, dm, statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock), statecharts.WithLogger(s.cfg.logger), statecharts.WithSessionID(string(entry.name)))
+		inst = statecharts.New(chart, dm, statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock), statecharts.WithLogger(s.cfg.logger), statecharts.WithSessionID(statecharts.SessionID(entry.name)))
 		err = inst.Start(ctx)
 	}
 	if err != nil {
@@ -520,11 +520,11 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 	if err != nil {
 		return fmt.Errorf("actors: snapshot %q: %w", entry.name, err)
 	}
-	seq, err := s.cfg.log.LastSeq(ctx, string(entry.name))
+	seq, err := s.cfg.log.LastSeq(ctx, statecharts.SessionID(entry.name))
 	if err != nil {
 		return fmt.Errorf("actors: last seq %q: %w", entry.name, err)
 	}
-	if err := s.cfg.snapshots.Save(ctx, string(entry.name), statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
+	if err := s.cfg.snapshots.Save(ctx, statecharts.SessionID(entry.name), statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
 		return fmt.Errorf("actors: save checkpoint %q: %w", entry.name, err)
 	}
 	if err := inst.Stop(ctx); err != nil {
@@ -596,7 +596,7 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 		// message since the last checkpoint instead of just the one
 		// in-flight macrostep.
 		if _, err := s.cfg.log.Append(ctx, statecharts.LogEntry{
-			SessionID: string(name),
+			SessionID: statecharts.SessionID(name),
 			Kind:      statecharts.KindExternalEvent,
 			Timestamp: time.Now().UTC(),
 			Event:     ev,

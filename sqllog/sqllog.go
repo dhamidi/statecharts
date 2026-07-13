@@ -74,7 +74,7 @@ func (l *Log) Append(ctx context.Context, entry statecharts.LogEntry) (uint64, e
 }
 
 // Read implements statecharts.Log.
-func (l *Log) Read(ctx context.Context, sessionID string, from uint64) iter.Seq2[statecharts.LogEntry, error] {
+func (l *Log) Read(ctx context.Context, sessionID statecharts.SessionID, from uint64) iter.Seq2[statecharts.LogEntry, error] {
 	return func(yield func(statecharts.LogEntry, error) bool) {
 		rows, err := l.db.QueryContext(ctx, selectLogSQL[l.dialect], sessionID, from)
 		if err != nil {
@@ -137,7 +137,7 @@ func (l *Log) Read(ctx context.Context, sessionID string, from uint64) iter.Seq2
 }
 
 // LastSeq implements statecharts.Log.
-func (l *Log) LastSeq(ctx context.Context, sessionID string) (uint64, error) {
+func (l *Log) LastSeq(ctx context.Context, sessionID statecharts.SessionID) (uint64, error) {
 	var last sql.NullInt64
 	if err := l.db.QueryRowContext(ctx, maxSeqSQL[l.dialect], sessionID).Scan(&last); err != nil {
 		return 0, fmt.Errorf("sqllog: query max seq: %w", err)
@@ -149,7 +149,7 @@ func (l *Log) LastSeq(ctx context.Context, sessionID string) (uint64, error) {
 }
 
 // Save implements statecharts.SnapshotStore.
-func (l *Log) Save(ctx context.Context, sessionID string, cp statecharts.Checkpoint) error {
+func (l *Log) Save(ctx context.Context, sessionID statecharts.SessionID, cp statecharts.Checkpoint) error {
 	b, err := json.Marshal(cp.Snapshot)
 	if err != nil {
 		return fmt.Errorf("sqllog: marshal snapshot: %w", err)
@@ -161,7 +161,7 @@ func (l *Log) Save(ctx context.Context, sessionID string, cp statecharts.Checkpo
 }
 
 // Load implements statecharts.SnapshotStore.
-func (l *Log) Load(ctx context.Context, sessionID string) (statecharts.Checkpoint, bool, error) {
+func (l *Log) Load(ctx context.Context, sessionID statecharts.SessionID) (statecharts.Checkpoint, bool, error) {
 	var seq uint64
 	var b []byte
 	err := l.db.QueryRowContext(ctx, selectSnapshotSQL[l.dialect], sessionID).Scan(&seq, &b)

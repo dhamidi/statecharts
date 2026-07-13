@@ -20,7 +20,7 @@ import (
 type interpretation struct {
 	chart         *Chart
 	datamodel     any
-	sessionID     string     // SCXML 5.10's _sessionid, bound for this session's lifetime
+	sessionID     SessionID  // SCXML 5.10's _sessionid, bound for this session's lifetime
 	name          Identifier // SCXML 5.10's _name, bound to chart.ID() for this session's lifetime
 	configuration map[*compiledState]bool
 	historyValue  map[*compiledState][]*compiledState
@@ -340,7 +340,7 @@ func (ip *interpretation) execContext() ExecContext {
 		event:     ip.lastEvent,
 		hasEvent:  ip.hasLastEvent,
 		datamodel: ip.datamodel,
-		sessionID: ip.sessionID,
+		sessionID: string(ip.sessionID),
 		name:      ip.name,
 		active: func(id Identifier) bool {
 			s := ip.chart.byID[id]

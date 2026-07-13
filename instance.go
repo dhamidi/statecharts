@@ -54,7 +54,7 @@ type instanceConfig struct {
 	inboxSize      int
 	timerFiredHook func(Identifier, Event) error
 	idGen          IDGenerator
-	sessionID      string
+	sessionID      SessionID
 }
 
 // WithIOProcessor sets the IOProcessor used for genuinely external dispatch.
@@ -107,7 +107,7 @@ func WithIDGenerator(g IDGenerator) Option {
 // an id the caller already has -- e.g. from a Log -- instead of minting a
 // fresh one. It takes priority over both the configured IDGenerator and,
 // for Restore, any id recorded in the Snapshot being restored from.
-func WithSessionID(id string) Option {
+func WithSessionID(id SessionID) Option {
 	return func(c *instanceConfig) { c.sessionID = id }
 }
 
@@ -117,7 +117,7 @@ func defaultInstanceConfig() instanceConfig {
 		clock:     NewRealClock(),
 		logger:    NoopLogger,
 		inboxSize: 1,
-		idGen:     IDGeneratorFunc(rand.Text),
+		idGen:     IDGeneratorFunc(func() SessionID { return SessionID(rand.Text()) }),
 	}
 }
 
@@ -138,7 +138,7 @@ func New(chart *Chart, datamodel any, opts ...Option) *Instance {
 	return newInstance(chart, newInterpretation(chart, datamodel), cfg, id)
 }
 
-func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id string) *Instance {
+func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id SessionID) *Instance {
 	in := &Instance{
 		chart:   chart,
 		inbox:   make(chan actorRequest, cfg.inboxSize),
@@ -163,7 +163,7 @@ func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id string
 // of precedence, it is an explicit WithSessionID, an id recorded in the
 // Snapshot Restore was called with, or one minted by the configured
 // IDGenerator. It is stable for the lifetime of the Instance.
-func (in *Instance) ID() string {
+func (in *Instance) ID() SessionID {
 	return in.ip.sessionID
 }
 

@@ -28,7 +28,7 @@ const (
 // LogEntry is one recorded message. SessionID+Seq is monotonically
 // increasing and gapless, assigned by Log.Append.
 type LogEntry struct {
-	SessionID string
+	SessionID SessionID
 	Seq       uint64
 	Kind      EntryKind
 
@@ -59,17 +59,17 @@ type Log interface {
 	// Read streams entries for sessionID in ascending Seq order, starting
 	// at from (inclusive). Iteration stops as soon as the consumer stops
 	// ranging, or on the first yielded error.
-	Read(ctx context.Context, sessionID string, from uint64) iter.Seq2[LogEntry, error]
+	Read(ctx context.Context, sessionID SessionID, from uint64) iter.Seq2[LogEntry, error]
 
 	// LastSeq returns the highest Seq recorded for sessionID, or 0 if none.
-	LastSeq(ctx context.Context, sessionID string) (uint64, error)
+	LastSeq(ctx context.Context, sessionID SessionID) (uint64, error)
 }
 
 // SnapshotStore persists Checkpoints, letting Rehydrate skip replaying a
 // Log from the very beginning.
 type SnapshotStore interface {
-	Save(ctx context.Context, sessionID string, cp Checkpoint) error
-	Load(ctx context.Context, sessionID string) (Checkpoint, bool, error)
+	Save(ctx context.Context, sessionID SessionID, cp Checkpoint) error
+	Load(ctx context.Context, sessionID SessionID) (Checkpoint, bool, error)
 }
 
 // LoggingTimerFiredHook returns a callback for WithTimerFiredHook that
@@ -79,7 +79,7 @@ type SnapshotStore interface {
 // for an application to log itself. Explicit application Sends must
 // separately call log.Append(ctx, LogEntry{Kind: KindExternalEvent, ...})
 // before calling Instance.Send; that ordinary call site needs no hook.
-func LoggingTimerFiredHook(log Log, sessionID string) func(Identifier, Event) error {
+func LoggingTimerFiredHook(log Log, sessionID SessionID) func(Identifier, Event) error {
 	return func(sendID Identifier, ev Event) error {
 		_, err := log.Append(context.Background(), LogEntry{
 			SessionID: sessionID,

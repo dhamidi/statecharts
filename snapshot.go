@@ -20,7 +20,7 @@ import (
 // every time (see Checkpoint, Rehydrate in replay.go).
 type Snapshot struct {
 	Version       int
-	ID            string // SCXML 5.10's _sessionid for this session; Restore preserves it unless WithSessionID overrides it
+	ID            SessionID // SCXML 5.10's _sessionid for this session; Restore preserves it unless WithSessionID overrides it
 	Configuration []Identifier
 	HistoryValue  map[Identifier][]Identifier
 	InternalQueue []Event
@@ -200,7 +200,7 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 
 type snapshotWire struct {
 	Version       int                         `json:"version"`
-	ID            string                      `json:"id,omitempty"`
+	ID            SessionID                   `json:"id,omitempty"`
 	Configuration []Identifier                `json:"configuration"`
 	HistoryValue  map[Identifier][]Identifier `json:"history_value,omitempty"`
 	InternalQueue []EncodedEvent              `json:"internal_queue,omitempty"`

@@ -156,7 +156,7 @@ func TestRehydrateSuppressesLoggerDuringReplayThenGoesLive(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := "sess-logger"
+	sessionID := SessionID("sess-logger")
 
 	logAction := func(ec ExecContext) error {
 		ec.Log("transition", nil)

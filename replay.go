@@ -70,7 +70,7 @@ func (g *replayGate) goLive() { g.live.Store(true) }
 // calls are both suppressed until replay catches up; the returned Instance
 // is then left fully live (further Sends dispatch, and Log calls write, for
 // real).
-func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapshots SnapshotStore, sessionID string, realIO IOProcessor, opts ...Option) (*Instance, error) {
+func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapshots SnapshotStore, sessionID SessionID, realIO IOProcessor, opts ...Option) (*Instance, error) {
 	// Logger, unlike IOProcessor, has no explicit Rehydrate parameter -- it
 	// only ever arrives via a WithLogger call inside opts, defaulting to
 	// NoopLogger otherwise. Apply opts to a throwaway config just to read

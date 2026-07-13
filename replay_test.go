@@ -12,10 +12,10 @@ import (
 // memLog is a minimal in-memory Log test double.
 type memLog struct {
 	mu      sync.Mutex
-	entries map[string][]LogEntry
+	entries map[SessionID][]LogEntry
 }
 
-func newMemLog() *memLog { return &memLog{entries: map[string][]LogEntry{}} }
+func newMemLog() *memLog { return &memLog{entries: map[SessionID][]LogEntry{}} }
 
 func (l *memLog) Append(ctx context.Context, entry LogEntry) (uint64, error) {
 	l.mu.Lock()
@@ -26,7 +26,7 @@ func (l *memLog) Append(ctx context.Context, entry LogEntry) (uint64, error) {
 	return seq, nil
 }
 
-func (l *memLog) Read(ctx context.Context, sessionID string, from uint64) iter.Seq2[LogEntry, error] {
+func (l *memLog) Read(ctx context.Context, sessionID SessionID, from uint64) iter.Seq2[LogEntry, error] {
 	return func(yield func(LogEntry, error) bool) {
 		l.mu.Lock()
 		entries := append([]LogEntry(nil), l.entries[sessionID]...)
@@ -42,7 +42,7 @@ func (l *memLog) Read(ctx context.Context, sessionID string, from uint64) iter.S
 	}
 }
 
-func (l *memLog) LastSeq(ctx context.Context, sessionID string) (uint64, error) {
+func (l *memLog) LastSeq(ctx context.Context, sessionID SessionID) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entries := l.entries[sessionID]
@@ -55,21 +55,21 @@ func (l *memLog) LastSeq(ctx context.Context, sessionID string) (uint64, error) 
 // memSnapshotStore is a minimal in-memory SnapshotStore test double.
 type memSnapshotStore struct {
 	mu sync.Mutex
-	cp map[string]Checkpoint
+	cp map[SessionID]Checkpoint
 }
 
 func newMemSnapshotStore() *memSnapshotStore {
-	return &memSnapshotStore{cp: map[string]Checkpoint{}}
+	return &memSnapshotStore{cp: map[SessionID]Checkpoint{}}
 }
 
-func (s *memSnapshotStore) Save(ctx context.Context, sessionID string, cp Checkpoint) error {
+func (s *memSnapshotStore) Save(ctx context.Context, sessionID SessionID, cp Checkpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cp[sessionID] = cp
 	return nil
 }
 
-func (s *memSnapshotStore) Load(ctx context.Context, sessionID string) (Checkpoint, bool, error) {
+func (s *memSnapshotStore) Load(ctx context.Context, sessionID SessionID) (Checkpoint, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp, ok := s.cp[sessionID]
@@ -270,7 +270,7 @@ func TestRehydrateReplaysExplicitSends(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := "sess-1"
+	sessionID := SessionID("sess-1")
 
 	// Live phase: append-then-Send for each explicit external event, so
 	// the log is always written ahead of the event being applied.
@@ -329,7 +329,7 @@ func TestRehydrateUsesCheckpointToSkipReplay(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := "sess-2"
+	sessionID := SessionID("sess-2")
 
 	chart := doorChart(t)
 	d := &Door{}
@@ -386,7 +386,7 @@ func TestRehydrateSuppressesRealDispatchDuringReplayThenGoesLive(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := "sess-3"
+	sessionID := SessionID("sess-3")
 
 	// A chart whose transition sends to a genuinely external target,
 	// so we can observe whether the real IOProcessor was invoked.
@@ -451,7 +451,7 @@ func TestRehydrateIOProcessorsReportedDuringAndAfterReplay(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := "sess-ioprocessors"
+	sessionID := SessionID("sess-ioprocessors")
 
 	var seen []IOProcessorInfo
 	record := func(ec ExecContext) error {
@@ -528,7 +528,7 @@ func TestRehydrateWithNilLoggerDoesNotPanicOnceLive(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := "sess-nil-logger"
+	sessionID := SessionID("sess-nil-logger")
 
 	logAction := func(ec ExecContext) error {
 		ec.Log("transition", nil)
