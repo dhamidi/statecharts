@@ -101,11 +101,6 @@ go get github.com/dhamidi/statecharts
 A client connection's lifecycle in full: dialing, a guarded,
 attempt-count-limited retry, and a drop that triggers reconnection
 automatically.
-`Dialer` and `Conn` stand in for a real transport -- Go's standard library
-has no native WebSocket client, and pulling in one of the maintained
-third-party ones (gorilla/websocket, github.com/coder/websocket) just for
-this example would be disproportionate. A real deployment satisfies `Dialer`
-with one of those instead of `flakyDialer` below.
 
 ```go
 package main
@@ -118,7 +113,11 @@ import (
 	"github.com/dhamidi/statecharts"
 )
 
-// Conn is a live connection.
+// Conn is a live connection. A real deployment satisfies Dialer against an
+// actual transport -- Go's standard library has no native WebSocket client,
+// so gorilla/websocket or github.com/coder/websocket are the usual choices.
+// flakyDialer below stands in for one so this example has no dependencies
+// to install.
 type Conn interface {
 	Close() error
 }
@@ -179,7 +178,7 @@ func buildChart() (*statecharts.Chart, error) {
 		return nil
 	})
 	giveUp := statecharts.Action(func(c *Connection, ec statecharts.ExecContext) error {
-		fmt.Printf("giving up after %d attempts\n", c.Retries)
+		ec.Log("giving up", c.Retries)
 		return nil
 	})
 
@@ -561,6 +560,27 @@ what wires the two together -- `notifyProcessor.Send` runs whenever `notify`
 reaches the `IOProcessor` seam, whether that's from this transition's
 `SendEvent` or from an `ec.Send` call inside any other action.
 
+An `IOProcessor` that also implements `IOProcessorDescriber` -- adding an
+`IOProcessors() []IOProcessorInfo` method -- has an address to advertise for
+the current session: one another session could set as its own
+`SendOptions.Target` to reach it back. `ExecContext.IOProcessors()` (per
+SCXML 5.10's `_ioprocessors`) exposes that list to any action, and
+`ExecContext.IOProcessorLocation(typ)` looks up one processor's `Location`
+by `Type` directly:
+
+```go
+notify := func(ec statecharts.ExecContext) error {
+	replyTo, _ := ec.IOProcessorLocation("actors")
+	ec.Send("job.notify", statecharts.SendOptions{Target: "notifier", Data: replyTo})
+	return nil
+}
+```
+
+`NoopIOProcessor`/`LocalIOProcessor` don't implement `IOProcessorDescriber`
+-- neither has a real transport to advertise an address for -- so
+`IOProcessors()` is empty and `IOProcessorLocation` reports `ok=false` on a
+default `Instance`.
+
 </details>
 
 ### Error events
@@ -581,7 +601,7 @@ validate := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
 
 recordFailure := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	fmt.Println(ev.Data) // corrupt image: unexpected EOF
+	ec.Log("validation failed", ev.Data) // "corrupt image: unexpected EOF"
 	return nil
 })
 
@@ -934,7 +954,7 @@ so a reply is just another `Send` targeting `ev.Origin`:
 notify := statecharts.Action(func(n *Notifier, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
 	source, _ := statecharts.Payload[string](ev)
-	fmt.Println("notifying owner of", source) // stand-in for actually sending a notification
+	ec.Log("notifying owner of", source) // stand-in for actually sending a notification
 	ec.Send("notified", statecharts.SendOptions{Target: ev.Origin})
 	return nil
 })
@@ -1005,7 +1025,7 @@ something meant to always be around, like a `"notifier"` singleton.
 
 ### A full example
 
-A notifier actor stands in for the outside world: it prints (in place of
+A notifier actor stands in for the outside world: it logs (in place of
 actually sending mail) whenever a job finishes. A job actor validates,
 thumbnails, and notifies in sequence, recording its own outcome. The job is
 durable, so it survives a restart in whatever state it last reached:
@@ -1018,6 +1038,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -1053,7 +1074,7 @@ func buildNotifierChart() (*statecharts.Chart, error) {
 	notify := statecharts.Action(func(n *Notifier, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
 		source, _ := statecharts.Payload[string](ev)
-		fmt.Println("notifying owner of", source) // stand-in for actually sending a notification
+		ec.Log("notifying owner of", source) // stand-in for actually sending a notification
 		ec.Send("notified", statecharts.SendOptions{Target: ev.Origin})
 		return nil
 	})
@@ -1129,6 +1150,7 @@ func buildSystem(log *sqllog.Log) (*actors.System, error) {
 		actors.WithSnapshotStore(log),
 		actors.WithIdleTimeout(5*time.Minute),
 		actors.WithMaxResident(10_000),
+		actors.WithLogger(statecharts.NewWriterLogger(os.Stdout)),
 	)
 	notifierChart, err := buildNotifierChart()
 	if err != nil {
