@@ -195,8 +195,29 @@ var dispatchFrame = statecharts.Action(func(d *linkModel, ec statecharts.ExecCon
 	if f.ID != "" {
 		if n, err := strconv.Atoi(f.ID); err == nil {
 			seq = n
-			d.LastSeq = n
 		}
+	}
+	if f.EventName == "message" && seq > 0 && d.LastSeq > 0 && seq != d.LastSeq+1 {
+		// Gap: a durable "message" frame arrived out of sequence, meaning at
+		// least one earlier entry never reached this connection (see
+		// connection.go's pushFrame -- it drops rather than blocks the
+		// server's own actor loop when a connection's buffered channel is
+		// full). Don't accept seq as the new LastSeq -- that would silently
+		// strand whatever fell in the gap, exactly the "no missed messages"
+		// guarantee this example advertises -- and don't dispatch this frame
+		// out of order either. Instead force a fresh connect cycle: leaving
+		// d.LastSeq where it was means the next dialSSE (driven through
+		// backoff/reconnect, see BuildLinkChart) re-dials with the old
+		// Last-Event-ID, so the server replays every entry from there
+		// forward out of its own durable History (see conversation.go's
+		// replyWithCatchup) -- which recovers the "lost" entries losslessly,
+		// since History, not this connection's in-flight delivery, is the
+		// actual source of truth.
+		ec.Send("resync", statecharts.SendOptions{})
+		return nil
+	}
+	if seq > 0 {
+		d.LastSeq = seq
 	}
 	switch f.EventName {
 	case "message":
@@ -284,6 +305,12 @@ func BuildLinkChart(serverAddr string, tools []protocol.ToolName) (*statecharts.
 					),
 					statecharts.Invoke(dialSSE, statecharts.WithInvokeParams(computeInvokeParams)),
 					statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("backoff")),
+					// dispatchFrame raises this when a "message" frame arrives with a
+					// gap before it in the seq space -- force the same
+					// reconnect-with-backoff cycle a transport error does, so the next
+					// dialSSE resumes from the last contiguous seq and the server's own
+					// catchup replays whatever this connection missed.
+					statecharts.On("resync", statecharts.Target("backoff")),
 				),
 				statecharts.Atomic("backoff",
 					statecharts.OnEntry(reportReconnecting, scheduleReconnect),
