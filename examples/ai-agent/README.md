@@ -102,18 +102,38 @@ with everything else.
 `EchoProvider` needs no credentials and makes no network calls, but it
 still needs to be told when to stream a plain reply, when to "think," and
 when to decide on a tool call, since there's no real model behind it to
-decide on its own. It looks at the *last* message in the conversation:
+decide on its own. It treats the most recent user message as a **script**:
+one or more steps separated by `;;`, run one per turn (one tool call, or
+one final reply, exactly like a real model would do it), resuming from
+wherever the script left off each time it's asked to generate again --
+recomputed fresh from the conversation's own history every time, never
+stored anywhere separately.
 
-- If it's a tool result, EchoProvider streams that tool's own output,
-  upper-cased, as its final reply (the "give the model the result back"
-  half of a tool call).
-- Otherwise, a message starting with `!` is EchoProvider's tool-call
-  trigger: it emits one `thinking` chunk, then decides to call
-  `shell_command` with everything after the `!` as the command. For
-  example, sending `!echo hi` makes EchoProvider "decide" to run `echo hi`.
-- Any other message streams its own upper-cased text back, word by word,
-  roughly 30ms apart -- slow enough to see it streaming in the UI, fast
-  enough not to be tedious.
+- A step starting with `!` is a tool-call step: after a short, randomly
+  jittered pause, EchoProvider emits a `thinking` chunk, then (after
+  another jittered pause) decides to call `shell_command` with the text
+  after `!` as the command. For example, `!echo hi` makes EchoProvider
+  "decide" to run `echo hi`.
+- A step *not* starting with `!` is a text step: EchoProvider streams it
+  back, upper-cased, word by word (roughly 30ms apart, itself jittered --
+  slow enough to see it streaming in the UI, fast enough not to be
+  tedious), as a final reply. Like a real model's own final reply, this
+  ends the turn and returns the conversation to `idle` -- so only a
+  script's *last* step can usefully be a text step; an earlier one would
+  just end the script before any later step ever ran.
+- A script that's nothing but `!` steps, with no trailing text step, falls
+  back to streaming the final tool's own output, upper-cased -- the
+  original single-tool-call convention (`!echo hi` on its own is simply a
+  one-step script).
+- A plain message with no `!` anywhere is a one-step, all-text script: it
+  streams its own upper-cased text back immediately, same as always.
+
+For example, sending `!echo one;; !sleep 1 && echo two;; done with both` in
+a single message runs `shell_command` twice in sequence -- each with its
+own jittered thinking pause and tool call -- then replies "DONE WITH BOTH"
+once both results are back, all from that one initial message: a
+realistic-looking multi-tool-call turn without having to drive each step
+by hand.
 
 This convention has no meaning to `--llm=genai`'s real provider, which
 decides on its own when to call a tool.
