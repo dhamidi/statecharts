@@ -381,7 +381,17 @@ body {
 .new-form input { flex: 1; min-width: 0; padding: 6px; }
 .dialog-close { margin-top: 12px; flex: none; align-self: flex-end; }
 .layout { flex: 1; min-height: 0; display: flex; }
-.main { flex: 1; padding: 20px 24px; max-width: 800px; margin: 0 auto; overflow-wrap: break-word; overflow-y: auto; }
+/* .main is a full-height flex column (its own height comes from .layout's
+   flex: 1 inside a min-height:0 ancestor chain up to <body>, itself a
+   height:100% flex column -- see html, body above): #message-list is the
+   ONLY child that scrolls (flex: 1; min-height: 0; overflow-y: auto), so
+   .send-form -- a flex: none sibling, not a flow child of that scrolling
+   region -- stays pinned to the bottom of the viewport no matter how long
+   the transcript grows. This needs renderMain to wrap the message bubbles
+   in their own #message-list div, distinct from the form, rather than the
+   older flat list of bubbles-then-form as direct children of #main. */
+.main { flex: 1; min-height: 0; max-width: 800px; margin: 0 auto; width: 100%; display: flex; flex-direction: column; }
+#message-list { flex: 1; min-height: 0; overflow-y: auto; overflow-wrap: break-word; padding: 20px 24px; }
 .placeholder { color: #888; padding: 8px 0; }
 .bubble { margin: 8px 0; padding: 8px 12px; border-radius: 10px; overflow-wrap: break-word; white-space: pre-wrap; }
 .bubble-role { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; opacity: .6; display: block; margin-bottom: 2px; }
@@ -390,12 +400,16 @@ body {
 .bubble-tool { background: #fff8e1; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
 .bubble-thinking { color: #888; font-style: italic; background: transparent; padding-left: 0; }
 .bubble-toolcall { background: #fff4e5; color: #a5600a; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
-.send-form { display: flex; gap: 6px; margin-top: 18px; }
+/* flex: none (not a scrolling flow child of #message-list) plus its own
+   background + border-top is what keeps the composer legible and pinned
+   below the transcript instead of scrolling away with it. */
+.send-form { flex: none; display: flex; gap: 6px; padding: 12px 24px 18px; border-top: 1px solid #e0e0e0; background: #fafafa; }
 .send-form input[type=text] { flex: 1; min-width: 0; padding: 8px; }
 button { cursor: pointer; }
 
 @media (max-width: 700px) {
-	.main { padding: 14px 16px; }
+	#message-list { padding: 14px 16px; }
+	.send-form { padding: 10px 16px 14px; }
 	/* 16px keeps iOS Safari from zooming the page in on focus. */
 	.new-form input, .send-form input[type=text], .conv-filter { font-size: 16px; padding: 10px; }
 	.new-form button, .send-form button { padding: 10px 14px; font-size: 16px; }
@@ -547,10 +561,19 @@ func bubble(class, role, text string) *htmlutil.Element {
 
 // renderMain's own id is what lets Datastar morph in a live push from
 // ui.go's pushMain every time the open conversation's own state changes.
+//
+// #main is always exactly two children: #message-list (the only child that
+// scrolls -- every bubble, including the placeholder-conversation state,
+// lives inside it) and, when a conversation is open, .send-form as a
+// flex:none sibling right after it -- see the .main/#message-list/.send-form
+// layout in pageCSS, which is what keeps the composer pinned to the bottom
+// of the viewport instead of scrolling away with a long transcript.
 func renderMain(snap uiSnapshot) *htmlutil.Element {
 	if snap.ConversationID == "" {
 		return htmlutil.New("div", map[string]string{"id": "main", "class": "main"},
-			htmlutil.New("p", map[string]string{"class": "placeholder"}, htmlutil.Text("Select or create a conversation from the sidebar.")),
+			htmlutil.New("div", map[string]string{"id": "message-list"},
+				htmlutil.New("p", map[string]string{"class": "placeholder"}, htmlutil.Text("Select or create a conversation from the sidebar.")),
+			),
 		)
 	}
 
@@ -569,13 +592,12 @@ func renderMain(snap uiSnapshot) *htmlutil.Element {
 			fmt.Sprintf("%s %v", snap.PendingToolCall.Name, map[string]any(snap.PendingToolCall.Args))))
 	}
 
-	children = append(children,
+	return htmlutil.New("div", map[string]string{"id": "main", "class": "main"},
+		htmlutil.New("div", map[string]string{"id": "message-list"}, children...),
 		htmlutil.New("form", map[string]string{"method": "POST", "action": "/send", "class": "send-form"},
 			htmlutil.New("input", map[string]string{"type": "hidden", "name": "conversation", "value": snap.ConversationID.String()}),
 			htmlutil.New("input", map[string]string{"type": "text", "name": "text", "autofocus": "autofocus", "autocomplete": "off"}),
 			htmlutil.New("button", map[string]string{"type": "submit"}, htmlutil.Text("Send")),
 		),
 	)
-
-	return htmlutil.New("div", map[string]string{"id": "main", "class": "main"}, children...)
 }
