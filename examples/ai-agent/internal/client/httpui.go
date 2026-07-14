@@ -341,53 +341,67 @@ func (h *uiHTTP) handleSend(w http.ResponseWriter, r *http.Request) {
 // and the Datastar vendoring above).
 const pageCSS = `
 :root {
-	/* Base text/surface colors. */
-	--color-text: #1a1a1a;
-	--color-text-secondary: #333;
-	--color-text-subtle: #888;
-	--color-bg: #fafafa;
-	--color-surface: #fff;
-	--color-surface-hover: #f3f3f3;
-	--color-border: #e0e0e0;
-	--color-border-input: #ccc;
-	--color-overlay: rgba(0, 0, 0, .35);
-	--color-shadow: rgba(0, 0, 0, .25);
+	/* Base text/surface colors: an earthy/forestry palette -- warm soil
+	   browns for ink, parchment/paper tones for surfaces, khaki borders --
+	   rather than a neutral gray scale. --color-surface sits a shade
+	   lighter than --color-bg (paper vs. the room it's sitting in) so
+	   cards/bubbles still lift off the page without resorting to true
+	   white, which would read as sterile/tech against the rest of this
+	   palette. */
+	--color-text: #2b2418;
+	--color-text-secondary: #5c5240;
+	--color-text-subtle: #8a7d63;
+	--color-bg: #f3efe2;
+	--color-surface: #faf7ee;
+	--color-surface-hover: #e9e2cd;
+	--color-border: #d8cdae;
+	--color-border-input: #b7a97e;
+	--color-overlay: rgba(43, 36, 24, .45);
+	--color-shadow: rgba(43, 36, 24, .18);
 
-	/* Semantic status colors, each an -fg/-bg pair. --color-success is used
-	   for both the network link's "connected" state and a conversation's
-	   "idle" badge -- deliberately the same color, since both mean "all
-	   good" and never appear together in a way that would confuse the two.
-	   --color-danger, by contrast, is split into a "network" and a
-	   "conversation" variant: LinkActor's own reconnect banner and a
-	   conversation's awaiting-tool badge are both "something's blocked"
-	   reds that CAN be on screen at the same time (banner up top, badge in
-	   the sidebar), so they get distinct hues -- an orange-red for the link
-	   and a magenta-red for the conversation -- rather than the one literal
-	   hex both used to share. */
-	--color-success-bg: #e6f4ea;
-	--color-success-fg: #1e7e34;
-	--color-warning-bg: #fff4e5;
-	--color-warning-fg: #a5600a;
-	--color-info-bg: #eee;
-	--color-info-fg: #666;
-	--color-danger-network-bg: #fde8e8;
-	--color-danger-network-fg: #c0392b;
-	--color-danger-conversation-bg: #fce4ec;
-	--color-danger-conversation-fg: #ad1457;
+	/* Semantic status colors, each an -fg/-bg pair: four hues spaced around
+	   the wheel (olive/ochre/rust/wine) so no two are mistakable even when
+	   several are visible at once, each fg chosen dark/saturated enough to
+	   read clearly against its own bg tint (not against the page surface --
+	   these are always used as a tinted badge or banner, never bare text).
+	   --color-success is used for both the network link's "connected"
+	   state and a conversation's "idle" badge -- deliberately the same
+	   color, since both mean "all good" and never appear together in a way
+	   that would confuse the two. --color-danger, by contrast, is split
+	   into a "network" and a "conversation" variant: LinkActor's own
+	   reconnect banner and a conversation's awaiting-tool badge are both
+	   "something's blocked" states that CAN be on screen at the same time
+	   (banner up top, badge in the sidebar), so they get distinct hues --
+	   rust (orange-leaning red) for the link, wine (purple-leaning red)
+	   for the conversation -- rather than one color shared by both.
+	   --color-success (olive/leaf green) is deliberately more yellow than
+	   --color-accent (pine) below, so the two greens in this palette stay
+	   distinguishable rather than reading as "the same green, twice." */
+	--color-success-bg: #e3ecd0;
+	--color-success-fg: #4a7c2f;
+	--color-warning-bg: #f0e0b0;
+	--color-warning-fg: #8a5a1f;
+	--color-info-bg: #e6e0cd;
+	--color-info-fg: #6b5f47;
+	--color-danger-network-bg: #edd6c4;
+	--color-danger-network-fg: #a1442b;
+	--color-danger-conversation-bg: #e8d3d6;
+	--color-danger-conversation-fg: #7a2e3d;
 
 	/* Accent: the currently-selected conversation link and the user's own
-	   chat bubbles. -hover/-active are fixed, pre-mixed shades (rather than
-	   a runtime color-mix()) so a primary button's hover/press states stay
-	   token-driven instead of one-off hex, without depending on color-mix
-	   support. */
-	--color-accent-bg: #e8f0fe;
-	--color-accent-fg: #1a56db;
-	--color-accent-fg-hover: #164bc4;
-	--color-accent-fg-active: #123fa8;
+	   chat bubbles. A deep pine/forest green, blue-leaning enough to read
+	   distinctly from --color-success's warmer olive above. -hover/-active
+	   are fixed, pre-mixed shades (rather than a runtime color-mix()) so a
+	   primary button's hover/press states stay token-driven instead of
+	   one-off hex, without depending on color-mix support. */
+	--color-accent-bg: #dde6cf;
+	--color-accent-fg: #2f5233;
+	--color-accent-fg-hover: #24402a;
+	--color-accent-fg-active: #1a2f1e;
 
 	/* One-off surfaces that don't fit a status/accent semantic. */
-	--color-bubble-assistant-bg: #f0f0f0;
-	--color-bubble-tool-bg: #fff8e1;
+	--color-bubble-assistant-bg: #eae2c9;
+	--color-bubble-tool-bg: #f2e8c8;
 
 	/* Typographic scale: four sizes tied to semantic roles (meta labels,
 	   secondary/dense text, body copy, and the one mobile-only size that
@@ -418,14 +432,19 @@ const pageCSS = `
 	--space-5: 20px;
 	--space-6: 24px;
 
-	/* Radius scale: four steps from "barely rounded" (inputs/buttons) up to
-	   a true pill (badges). Bubbles and the sidebar dialog sit a notch
-	   above the button/input radius so the whole UI reads as soft-cornered
-	   without every element sharing the exact same curvature. */
-	--radius-sm: 6px;
-	--radius-md: 10px;
-	--radius-lg: 14px;
-	--radius-pill: 999px;
+	/* Radius scale: every corner in the app is square by design (an
+	   intentional, considered choice -- not an oversight), so all four
+	   steps are 0. Kept as a scale (rather than deleting border-radius
+	   from every rule) so every component still references a role
+	   (--radius-sm for inputs/buttons, --radius-pill for badges, etc.)
+	   instead of a bare 0 sprinkled everywhere -- if a future pass ever
+	   wants rounding back, or wants it on some elements but not others,
+	   there's one place to change it per role rather than a grep-and-edit
+	   across the whole file. */
+	--radius-sm: 0;
+	--radius-md: 0;
+	--radius-lg: 0;
+	--radius-pill: 0;
 
 	/* Elevation scale: subtle, restrained shadows -- reusing --color-shadow
 	   as the one shared shadow color rather than introducing new literals.
@@ -433,13 +452,16 @@ const pageCSS = `
 	   (topbar, buttons, bubbles); --shadow-md is for genuinely floating
 	   surfaces (the sidebar dialog); --shadow-focus is the accent-colored
 	   ring used for :focus-visible everywhere, in place of the browser's
-	   default outline -- a fixed rgba() matching --color-accent-fg (#1a56db)
-	   at 22% opacity, since CSS custom properties can't derive an alpha
-	   variant of another property's color without color-mix(), which isn't
-	   worth the support risk here. */
+	   default outline -- a fixed rgba() matching --color-accent-fg (#2f5233)
+	   at 30% opacity (a touch stronger than a typical bright-accent ring,
+	   since this pine green needs more opacity than a vivid blue/violet
+	   would to still read clearly against the parchment surfaces), since
+	   CSS custom properties can't derive an alpha variant of another
+	   property's color without color-mix(), which isn't worth the support
+	   risk here. */
 	--shadow-sm: 0 1px 2px var(--color-shadow);
 	--shadow-md: 0 12px 32px -8px var(--color-shadow);
-	--shadow-focus: 0 0 0 3px rgba(26, 86, 219, .22);
+	--shadow-focus: 0 0 0 3px rgba(47, 82, 51, .3);
 
 	/* Transition timing: one shared duration/easing so every interactive
 	   element animates the same way instead of some snapping and some
