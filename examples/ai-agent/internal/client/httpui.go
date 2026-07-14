@@ -510,14 +510,24 @@ body {
 
 /* The conversation list lives behind .sidebar-toggle, in this native
    <dialog> -- rather than a permanent column -- so it scales the same way
-   whether the workspace has 3 conversations or 300, and on any screen size
-   without a separate mobile layout for it. Only its own child #sidebar
-   (see renderSidebar) is ever replaced by a live Datastar patch, never this
-   <dialog> element itself, so an open/closed dialog's own state survives
-   every sidebar update untouched. */
+   whether the workspace has 3 conversations or 300, and doesn't cost
+   layout space on the main chat view when closed. Styled as a docked
+   drawer (flush to the left edge, full viewport height) rather than a
+   centered floating card, and widened to fill the whole screen below the
+   existing 700px mobile breakpoint (see the media query at the bottom of
+   this file) rather than staying a fixed-width panel on a phone-sized
+   screen. Only its own child #sidebar (see renderSidebar) is ever
+   replaced by a live Datastar patch, never this <dialog> element itself,
+   so an open/closed dialog's own state survives every sidebar update
+   untouched. */
 .sidebar-dialog {
-	padding: var(--space-4); border: none; border-radius: var(--radius-lg); box-shadow: var(--shadow-md);
-	width: min(340px, 92vw); max-height: 80vh; margin: auto;
+	position: fixed; top: 0; left: 0; bottom: 0; margin: 0;
+	/* The UA stylesheet gives <dialog> its own max-width/max-height (around
+	   calc(100% - 6px - 2em)), sized for a centered floating card -- left
+	   in place, it would clip a docked, edge-to-edge panel before it ever
+	   reaches the width/height set below. */
+	width: min(320px, 100vw); height: 100%; max-width: none; max-height: none;
+	padding: var(--space-4); border: none; box-shadow: var(--shadow-md);
 }
 /* A <dialog> with no "open" attribute is display:none by the UA stylesheet
    already -- flex only needs to apply once showModal() sets [open], or it
@@ -632,6 +642,11 @@ body {
 button { cursor: pointer; font-size: var(--font-size-base); }
 
 @media (max-width: 700px) {
+	/* Below the same breakpoint every other mobile override in this file
+	   uses: the conversation drawer stops being a 320px-wide panel and
+	   fills the entire screen, like a full-screen nav rather than a sliver
+	   docked at the edge. */
+	.sidebar-dialog { width: 100vw; }
 	#message-list { padding: var(--space-3) var(--space-4); }
 	.send-form { padding: var(--space-2) var(--space-4) var(--space-3); }
 	/* 16px keeps iOS Safari from zooming the page in on focus -- that's
