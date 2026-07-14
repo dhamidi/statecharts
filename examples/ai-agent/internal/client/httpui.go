@@ -383,6 +383,11 @@ body {
 .sidebar h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #888; }
 .conv-filter { padding: 7px 9px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 6px; flex: none; }
 .sidebar-list { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+/* .placeholder's own rule (below, shared with #message-list) only sets
+   vertical padding; give it the same horizontal inset as .conv-link here so
+   the "no conversations yet" message lines up with where rows would sit
+   instead of touching the sidebar's edges. */
+.sidebar-list .placeholder { padding: 8px 10px; }
 .conv-link {
 	display: block; padding: 8px 10px; border-radius: 6px; text-decoration: none;
 	color: #333; margin-bottom: 2px; overflow-wrap: anywhere;
@@ -552,6 +557,16 @@ func renderSidebar(snap uiSnapshot) *htmlutil.Element {
 			htmlutil.Text(c.Title),
 			htmlutil.New("span", map[string]string{"class": "badge badge-" + string(c.State)}, htmlutil.Text(stateLabel(c.State))),
 		))
+	}
+	// The workspace-is-empty case is handled here, server-side, since
+	// snap.Conversations is already known at render time. A "filter matches
+	// nothing" empty state (convfilter typed but no .conv-link's data-show
+	// passes) is a related but distinct case -- it'd need its own
+	// client-side Datastar reactive expression to show/hide, since filtering
+	// itself never round trips to the server (see the data-show comment
+	// above). Left as a known gap rather than bolted on here.
+	if len(snap.Conversations) == 0 {
+		rows = append(rows, htmlutil.New("p", map[string]string{"class": "placeholder"}, htmlutil.Text("No conversations yet -- create one below.")))
 	}
 	return htmlutil.New("div", map[string]string{"id": "sidebar", "class": "sidebar"},
 		htmlutil.New("h3", nil, htmlutil.Text("Conversations")),
