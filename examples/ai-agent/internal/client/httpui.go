@@ -343,7 +343,7 @@ body {
 	text-align: center; letter-spacing: .02em;
 }
 .link-connected { background: #e6f4ea; color: #1e7e34; }
-.link-connecting { background: #eee; color: #666; }
+.link-connecting, .link-idle { background: #eee; color: #666; }
 .link-reconnecting { background: #fde8e8; color: #c0392b; animation: pulse 1s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
 
@@ -417,8 +417,12 @@ func linkStatusLabel(status string) string {
 	switch status {
 	case "connected":
 		return "● connected to server"
+	case "connecting":
+		return "connecting to server…"
 	case "reconnecting":
 		return "⚠ reconnecting to server…"
+	case "idle":
+		return "no conversation selected"
 	default:
 		return "connecting to server…"
 	}
@@ -432,6 +436,12 @@ func linkStatusLabel(status string) string {
 // conversation you may not even have open yet. Its own id is what lets
 // Datastar morph a live update into place (see ui.go's recordLinkStatus).
 func renderLinkBanner(status string) *htmlutil.Element {
+	if status == "" {
+		// The brief window before "link" (LinkActor) reports its own real
+		// state -- see ui.go's newUIModel -- looks the same as its actual
+		// initial state, "idle": neither one means a dial is in flight.
+		status = "idle"
+	}
 	return htmlutil.New("div", map[string]string{"id": "link-banner", "class": "link-banner link-" + status},
 		htmlutil.Text(linkStatusLabel(status)))
 }

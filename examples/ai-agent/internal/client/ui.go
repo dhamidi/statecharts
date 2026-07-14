@@ -38,7 +38,7 @@ type uiModel struct {
 	ThinkingDelta   string
 	TextDelta       string
 	PendingToolCall *protocol.ToolCallFrame
-	LinkStatus      string // "connecting" | "connected" | "reconnecting"
+	LinkStatus      string // "" (not yet heard from link) | "idle" | "connecting" | "connected" | "reconnecting"
 
 	// Conversations is the sidebar's own data: the whole workspace's
 	// conversation list, kept current by directorylink's single upstream
@@ -50,7 +50,14 @@ type uiModel struct {
 }
 
 func newUIModel() *uiModel {
-	return &uiModel{Messages: map[int]protocol.MessageFrame{}, LinkStatus: "connecting"}
+	// LinkStatus starts "" (not "connecting"): link.go's LinkActor actually
+	// starts in "idle" and stays there until the first "switch", emitting
+	// its own "link_status" almost immediately after this actor spawns (see
+	// link.go's reportIdle) -- so "" only lasts for the brief startup window
+	// before the real state arrives, rather than being a guess that could
+	// otherwise sit uncorrected forever (see renderLinkBanner, which treats
+	// "" the same as "idle").
+	return &uiModel{Messages: map[int]protocol.MessageFrame{}}
 }
 
 // uiSnapshot is "get_snapshot"'s reply payload: a point-in-time copy of
