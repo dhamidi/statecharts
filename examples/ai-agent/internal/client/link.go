@@ -185,6 +185,24 @@ var reportReconnecting = statecharts.Action(func(d *linkModel, ec statecharts.Ex
 	return nil
 })
 
+// reportIdle fires on entering "idle" -- the chart's actual initial state,
+// held until the first "switch" -- so "ui" learns promptly that nothing is
+// selected yet rather than sitting on whatever it guessed at startup (see
+// ui.go's newUIModel).
+var reportIdle = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: "idle"})
+	return nil
+})
+
+// reportConnecting fires on entering "online.connecting" -- a dial is
+// actually in flight (see dialSSE) -- distinct from "idle" so the UI banner
+// can tell "nothing is happening yet" apart from "actively trying and not
+// there yet".
+var reportConnecting = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: "connecting"})
+	return nil
+})
+
 var dispatchFrame = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
 	f, ok := statecharts.Payload[serverFrame](ev)
@@ -293,10 +311,13 @@ func BuildLinkChart(serverAddr string, tools []protocol.ToolName) (*statecharts.
 	return statecharts.Build(
 		statecharts.Compound("link", "idle",
 			statecharts.Children(
-				statecharts.Atomic("idle"),
+				statecharts.Atomic("idle",
+					statecharts.OnEntry(reportIdle),
+				),
 				statecharts.Compound("online", "connecting",
 					statecharts.Children(
 						statecharts.Atomic("connecting",
+							statecharts.OnEntry(reportConnecting),
 							statecharts.On("connected", statecharts.Target("connected"), statecharts.Then(resetBackoff)),
 						),
 						statecharts.Atomic("connected",
