@@ -37,6 +37,16 @@ type toolOffer struct {
 type toolLease struct {
 	Owner     protocol.ConnectionID
 	ExpiresAt time.Time
+
+	// DeliveredCallID is the CallID of the last offer actually handed to
+	// Owner via "tool_call", or "" if none yet. offerToRegistry consults
+	// this to avoid re-delivering the same call to a still-current owner
+	// while it may still be running it -- see the doc comment there. It is
+	// carried forward across a renewal claim from the same Owner (so an
+	// in-flight call's delivery record survives leaseRenewInterval ticks)
+	// but reset to "" whenever Owner changes, since a fresh executor has
+	// never been handed anything.
+	DeliveredCallID protocol.CallID
 }
 
 // toolRegistryModel is ToolRegistryActor's (non-durable) datamodel: one
@@ -52,7 +62,16 @@ func claimLease(clock statecharts.Clock) statecharts.ActionFunc {
 		if !ok {
 			return nil
 		}
-		d.Leases[c.Tool] = toolLease{Owner: c.Owner, ExpiresAt: clock.Now().Add(leaseTTL)}
+		next := toolLease{Owner: c.Owner, ExpiresAt: clock.Now().Add(leaseTTL)}
+		if existing, ok := d.Leases[c.Tool]; ok && existing.Owner == c.Owner {
+			// A renewal claim from the same owner (see connection.go's
+			// renewLeases, on leaseRenewInterval) -- not a new executor, so
+			// carry the delivery record forward rather than letting a
+			// renewal that lands mid-execution make offerToRegistry think
+			// this owner has never seen the pending call.
+			next.DeliveredCallID = existing.DeliveredCallID
+		}
+		d.Leases[c.Tool] = next
 		return nil
 	})
 }
@@ -69,6 +88,19 @@ var releaseLease = statecharts.Action(func(d *toolRegistryModel, ec statecharts.
 	return nil
 })
 
+// offerToRegistry hands a pending call to whichever connection currently
+// holds the lease for its tool -- but only once per (tool, owner, CallID):
+// ConversationActor's awaiting_tool retries this same offer every
+// toolOfferRetryInterval for as long as it's waiting on a "tool_result", with
+// no idea whether an executor has already started running it (that
+// knowledge lives here, not there). Re-sending "tool_call" for a CallID
+// already delivered to its still-current owner would make ToolActor queue
+// and later re-run it a second time once the first run finishes (see
+// tool.go's dequeueNext) -- a real duplicated side effect for anything that
+// takes longer than toolOfferRetryInterval to run. Comparing against
+// lease.DeliveredCallID distinguishes that ("already handed to the owner
+// that may be running it, don't resend") from "nobody has the lease yet, or
+// the owner changed" (worth (re)delivering).
 func offerToRegistry(clock statecharts.Clock) statecharts.ActionFunc {
 	return statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
@@ -80,6 +112,11 @@ func offerToRegistry(clock statecharts.Clock) statecharts.ActionFunc {
 		if !ok || clock.Now().After(lease.ExpiresAt) {
 			return nil // nobody currently holds the lease; ConversationActor's own retry loop tries again later
 		}
+		if lease.DeliveredCallID == offer.CallID {
+			return nil // already delivered to this exact, still-current owner; it may still be running -- resending would risk running it twice
+		}
+		lease.DeliveredCallID = offer.CallID
+		d.Leases[offer.Tool] = lease
 		ec.Send("tool_call", statecharts.SendOptions{
 			Target: statecharts.Identifier(lease.Owner),
 			Data: toolCallDelivery{
