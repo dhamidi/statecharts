@@ -15,10 +15,16 @@ import (
 // Option configures a System built by NewSystem.
 type Option func(*systemConfig)
 
+// Storage is the durable boundary for one System. It stores both the event
+// log and checkpoint cache for every durable actor in that System.
+type Storage interface {
+	statecharts.DurableLog
+	statecharts.SnapshotStore
+}
+
 type systemConfig struct {
 	nodeName       string
-	log            statecharts.Log
-	snapshots      statecharts.SnapshotStore
+	storage        Storage
 	idleTimeout    time.Duration
 	residencyLimit func(resident int) bool
 	dispatchLimit  int
@@ -26,8 +32,19 @@ type systemConfig struct {
 	logger         statecharts.Logger
 	onSweepError   func(name statecharts.Identifier, err error)
 	onResidency    func(ResidencyChange)
-	fallback       statecharts.IOProcessor
+	scxmlPeer      statecharts.IOProcessor
+	processors     []processorRegistration
 }
+
+type processorRegistration struct {
+	typ     statecharts.Identifier
+	factory IOProcessorFactory
+}
+
+// IOProcessorFactory creates the processor binding for one actor Instance.
+// The returned value may be shared only when Attach is stateless and all
+// other methods are safe for concurrent use.
+type IOProcessorFactory func() statecharts.IOProcessor
 
 // ActorID is a stable actor identity within a System. It is an alias of
 // statecharts.Identifier, so IDs may be hierarchical (for example,
@@ -55,25 +72,17 @@ type ResidencyChange struct {
 // WithNodeName sets this System's routing location. An actor with ID
 // "accounts.invoice-42" on node "host-a" has routing key
 // "accounts.invoice-42@host-a". The node does not affect Instance session
-// IDs, Log keys, or SnapshotStore keys, so a System can retain its isolated
+// IDs or storage keys, so a System can retain its isolated
 // durable history when it moves to another host.
 func WithNodeName(name string) Option {
 	return func(c *systemConfig) { c.nodeName = name }
 }
 
-// WithLog supplies the Log every Durable actor's messages are appended to
-// before they are applied. A System with no Log configured still works --
-// Spawn without Durable never touches it -- but Spawn with Durable returns
-// an error if either WithLog or WithSnapshotStore is missing.
-func WithLog(log statecharts.Log) Option {
-	return func(c *systemConfig) { c.log = log }
-}
-
-// WithSnapshotStore supplies where a Durable actor's checkpoints are saved
-// and loaded from. It is commonly the same value passed to WithLog, since
-// *sqllog.Log satisfies both.
-func WithSnapshotStore(store statecharts.SnapshotStore) Option {
-	return func(c *systemConfig) { c.snapshots = store }
+// WithStorage supplies the single durable storage boundary for this System.
+// Spawn without Durable never touches it. A System's node name is only a
+// routing location and does not partition storage.
+func WithStorage(storage Storage) Option {
+	return func(c *systemConfig) { c.storage = storage }
 }
 
 // WithIdleTimeout sets how long a durable actor may sit resident without
@@ -147,20 +156,26 @@ func WithOnSweepError(fn func(name statecharts.Identifier, err error)) Option {
 	return func(c *systemConfig) { c.onSweepError = fn }
 }
 
-// WithFallback adds an IOProcessor behind the System's actor router. A Send
-// with a custom processor type is routed directly to it. For the SCXML and
-// "actors" types, a name the System already knows -- resident or not -- is
-// resolved locally first and the fallback is consulted only when lookup
-// misses. Without WithFallback, a custom type is unsupported and an
-// unrecognized actor name is an ordinary "unknown actor" error.
-//
-// This is what lets two independent Systems address each other: an actor in
-// one addresses a name that belongs to the other, the local System's own
-// routing doesn't recognize it, and the fallback is the one other place left
-// to try before giving up. Bridge is a ready-made fallback for exactly this
-// case.
-func WithFallback(io statecharts.IOProcessor) Option {
-	return func(c *systemConfig) { c.fallback = io }
+// WithSCXMLPeer handles SCXML locations not owned by this System.
+func WithSCXMLPeer(io statecharts.IOProcessor) Option {
+	return func(c *systemConfig) { c.scxmlPeer = io }
+}
+
+// WithIOProcessor registers an exact custom processor type on every actor.
+// factory is called once per actor activation because IOProcessor.Attach
+// binds the returned processor to that actor's Dispatcher.
+func WithIOProcessor(typ statecharts.Identifier, factory IOProcessorFactory) Option {
+	return func(c *systemConfig) {
+		if typ == "" || typ == statecharts.SCXMLEventProcessor || factory == nil {
+			panic("actors: invalid custom IOProcessor registration")
+		}
+		for _, p := range c.processors {
+			if p.typ == typ {
+				panic("actors: duplicate IOProcessor type")
+			}
+		}
+		c.processors = append(c.processors, processorRegistration{typ, factory})
+	}
 }
 
 func defaultSystemConfig() systemConfig {
@@ -305,11 +320,21 @@ var ErrSystemStopped = errors.New("actors: system is stopped")
 var ErrKindNotRegistered = errors.New("actors: kind is not registered")
 
 // ErrDurabilityUnsupported is returned by Spawn when called with Durable
-// against a System missing WithLog, WithSnapshotStore, or both. Configure
-// both options when constructing the System, or drop Durable from this
+// against a System missing WithStorage. Configure storage when constructing
+// the System, or drop Durable from this
 // Spawn call; the error does not depend on anything about the call itself
 // that a retry could change.
-var ErrDurabilityUnsupported = errors.New("actors: durable spawn requires WithLog and WithSnapshotStore")
+var ErrDurabilityUnsupported = errors.New("actors: durable spawn requires WithStorage")
+
+// ErrDurableChartUnversioned is returned because durable snapshot caches
+// require an explicit application compatibility version.
+var ErrDurableChartUnversioned = errors.New("actors: durable spawn requires a nonempty chart version")
+
+// ErrDurableIOProcessorUnavailable is returned while recovering an actor
+// whose outbox contains unresolved work for a processor type that is no
+// longer registered. Register that exact processor type before retrying;
+// silently starting the actor would strand accepted durable work.
+var ErrDurableIOProcessorUnavailable = errors.New("actors: durable outbox requires an unavailable IOProcessor")
 
 // ErrKindMismatch is returned by Spawn when name was already spawned under
 // a different kind. A name's kind is fixed by whichever Spawn call first
@@ -379,11 +404,15 @@ func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Ident
 		opt(&cfg)
 	}
 
-	if _, ok := s.chartFor(kind); !ok {
+	chart, ok := s.chartFor(kind)
+	if !ok {
 		return fmt.Errorf("actors: Spawn: kind %q was never Registered: %w", kind, ErrKindNotRegistered)
 	}
-	if cfg.durable && (s.cfg.log == nil || s.cfg.snapshots == nil) {
+	if cfg.durable && s.cfg.storage == nil {
 		return fmt.Errorf("actors: Spawn: %w", ErrDurabilityUnsupported)
+	}
+	if cfg.durable && chart.Version() == "" {
+		return fmt.Errorf("actors: Spawn: chart %q: %w", kind, ErrDurableChartUnversioned)
 	}
 
 	entry, err := s.entryFor(name, kind, cfg.durable)
@@ -518,12 +547,51 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 	address := s.address(entry.name)
 	sessionID := statecharts.SessionID(entry.name)
 	proc := newRoutingProcessor(s, address)
+	processorOpts := make([]statecharts.Option, 0, 1+len(s.cfg.processors))
+	processorValues := make([]statecharts.IOProcessor, 0, 1+len(s.cfg.processors))
+	processors := append([]processorRegistration{{typ: statecharts.SCXMLEventProcessor, factory: func() statecharts.IOProcessor { return proc }}}, s.cfg.processors...)
+	var outbounds []statecharts.OutboundMessage
+	var recovery *durableRecovery
+	if entry.durable {
+		var loadErr error
+		outbounds, loadErr = s.cfg.storage.Outbounds(ctx, sessionID)
+		if loadErr != nil {
+			return fmt.Errorf("actors: load outbox for %q: %w", entry.name, loadErr)
+		}
+		available := make(map[statecharts.Identifier]bool, len(processors))
+		for _, registered := range processors {
+			available[registered.typ] = true
+		}
+		for _, message := range outbounds {
+			if message.Status == statecharts.OutboundPending && !available[message.Request.Type] {
+				return fmt.Errorf("actors: activate %q: pending delivery %q requires IOProcessor %q: %w", entry.name, message.DeliveryID, message.Request.Type, ErrDurableIOProcessorUnavailable)
+			}
+		}
+		recovery = newDurableRecovery(outbounds)
+	}
+	for _, registered := range processors {
+		io := registered.factory()
+		if io == nil {
+			return fmt.Errorf("actors: activate %q: IOProcessor factory for %q returned nil", entry.name, registered.typ)
+		}
+		if entry.durable {
+			io = newDurableProcessor(s.cfg.storage, sessionID, registered.typ, io, actorIngressDispatcher{s, entry.name}, recovery)
+		}
+		processorValues = append(processorValues, io)
+		processorOpts = append(processorOpts, statecharts.WithIOProcessor(registered.typ, io))
+	}
 	ingressHook := func(ev statecharts.Event) error {
 		entry.lastActive.Store(s.cfg.clock.Now().UnixNano())
 		if !entry.durable {
 			return nil
 		}
-		if _, err := s.cfg.log.Append(context.Background(), statecharts.LogEntry{
+		// Identified peer ingress is appended atomically by System.deliver,
+		// which can acknowledge a duplicate without applying it. Unidentified
+		// direct/invocation ingress retains the ordinary hook boundary.
+		if ev.DeliveryID != "" {
+			return nil
+		}
+		if _, err := s.cfg.storage.Append(context.Background(), statecharts.LogEntry{
 			SessionID: sessionID,
 			Kind:      statecharts.KindExternalEvent,
 			Timestamp: s.cfg.clock.Now().UTC(),
@@ -546,17 +614,18 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger),
 			statecharts.WithIngressHook(ingressHook),
-			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.log, sessionID, s.cfg.clock)),
+			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.storage, sessionID, s.cfg.clock)),
+			statecharts.WithDeliveryNamespace(fmt.Sprintf("%d:%s:%s", len(sessionID), sessionID, chart.Version())),
 		}
 		hasLogEntries := false
-		for _, readErr := range s.cfg.log.Read(ctx, sessionID, 1) {
+		for _, readErr := range s.cfg.storage.Read(ctx, sessionID, 1) {
 			if readErr != nil {
 				return fmt.Errorf("actors: inspect log for %q: %w", entry.name, readErr)
 			}
 			hasLogEntries = true
 			break
 		}
-		_, hasCheckpoint, loadErr := s.cfg.snapshots.Load(ctx, sessionID)
+		_, hasCheckpoint, loadErr := s.cfg.storage.Load(ctx, sessionID)
 		if loadErr != nil {
 			return fmt.Errorf("actors: inspect checkpoint for %q: %w", entry.name, loadErr)
 		}
@@ -565,27 +634,30 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			// live is what lets initial <invoke> content run. Persist the start
 			// boundary first so a crash before the first ordinary message cannot
 			// make a later process mistake the actor for new and invoke twice.
-			if _, err := s.cfg.log.Append(ctx, statecharts.LogEntry{
+			if _, err := s.cfg.storage.Append(ctx, statecharts.LogEntry{
 				SessionID: sessionID,
 				Kind:      statecharts.KindSessionStarted,
 				Timestamp: s.cfg.clock.Now().UTC(),
 			}); err != nil {
 				return fmt.Errorf("actors: record session start for %q: %w", entry.name, err)
 			}
-			liveOpts := append(instanceOpts,
-				statecharts.WithIOProcessor(proc),
+			liveOpts := append(instanceOpts, processorOpts...)
+			liveOpts = append(liveOpts,
 				statecharts.WithSessionID(sessionID),
 			)
 			inst = statecharts.New(chart, dm, liveOpts...)
 			err = inst.Start(ctx)
 		} else {
-			inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, sessionID, proc, instanceOpts...)
+			// Rehydrate's explicit SCXML processor is the already-wrapped first
+			// registration; remaining registrations arrive through options.
+			inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.storage, s.cfg.storage, sessionID, processorValues[0], append(instanceOpts, processorOpts[1:]...)...)
 		}
 	} else {
-		inst = statecharts.New(chart, dm,
-			statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock),
+		opts := append(processorOpts,
+			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger), statecharts.WithIngressHook(ingressHook),
 			statecharts.WithSessionID(sessionID))
+		inst = statecharts.New(chart, dm, opts...)
 		err = inst.Start(ctx)
 	}
 	if err != nil {
@@ -763,11 +835,11 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 	}
 	err := inst.Checkpoint(ctx, func(snap statecharts.Snapshot) error {
 		sessionID := statecharts.SessionID(entry.name)
-		seq, err := s.cfg.log.LastSeq(ctx, sessionID)
+		seq, err := s.cfg.storage.LastSeq(ctx, sessionID)
 		if err != nil {
 			return fmt.Errorf("actors: last seq %q: %w", entry.name, err)
 		}
-		if err := s.cfg.snapshots.Save(ctx, sessionID, statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
+		if err := s.cfg.storage.Save(ctx, sessionID, statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
 			return fmt.Errorf("actors: save checkpoint %q: %w", entry.name, err)
 		}
 		return nil
@@ -824,6 +896,18 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 			return err
 		}
 		inst = entry.instance.Load()
+	}
+	if entry.durable && ev.DeliveryID != "" {
+		_, appended, appendErr := s.cfg.storage.AppendIngress(ctx, statecharts.LogEntry{
+			SessionID: statecharts.SessionID(entry.name), Kind: statecharts.KindExternalEvent,
+			Timestamp: s.cfg.clock.Now().UTC(), Event: ev,
+		}, ev.DeliveryID)
+		if appendErr != nil {
+			return fmt.Errorf("actors: append %q: %w", entry.name, appendErr)
+		}
+		if !appended {
+			return nil
+		}
 	}
 
 	err := inst.Deliver(ctx, ev)

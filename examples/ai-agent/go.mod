@@ -6,7 +6,6 @@ require (
 	github.com/dhamidi/statecharts v0.0.0
 	github.com/google/uuid v1.6.0
 	google.golang.org/genai v1.63.0
-	modernc.org/sqlite v1.53.0
 )
 
 require (
@@ -33,6 +32,7 @@ require (
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
+	modernc.org/sqlite v1.53.0 // indirect
 )
 
 replace github.com/dhamidi/statecharts => ../..

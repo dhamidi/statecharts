@@ -4,33 +4,37 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"time"
 )
 
-// Snapshot is a point-in-time capture of everything about a running chart's
-// state except the datamodel: the session id, the active configuration,
-// recorded history, both event queues, the running flag, any outstanding
-// delayed sends, and which invocations were active. The datamodel is
-// explicitly excluded -- it is the caller's own Go value(s), serialized by
-// the caller if desired.
+// Snapshot is a point-in-time cache of a running chart's datamodel and
+// interpreter state: the session id, active configuration, recorded history,
+// both event queues, running flag, outstanding delayed sends, and active
+// invocation bookkeeping. Datamodel encoding is controlled by the Chart's
+// DatamodelCodec (JSON by default).
 //
 // Snapshot is a derivable checkpoint, not an independent source of truth: it
 // captures exactly what replaying a Log up to some point would produce, and
 // exists purely so a cold start doesn't need to replay from the beginning
 // every time (see Checkpoint, Rehydrate in replay.go).
 type Snapshot struct {
-	Version       int
-	ID            SessionID // SCXML 5.10's _sessionid for this session; Restore preserves it unless WithSessionID overrides it
-	Configuration []Identifier
-	HistoryValue  map[Identifier][]Identifier
-	InternalQueue []Event
-	ExternalQueue []Event
-	Running       bool
-	SendSeq       int // high-water mark for auto-generated send.<n> IDs
-	InvokeSeq     int // high-water mark for auto-generated <state>.invoke<n> IDs
-	PendingSends  []PendingSend
-	ActiveInvokes []ActiveInvoke
+	Version           int
+	ChartVersion      string
+	Datamodel         []byte
+	ID                SessionID // SCXML 5.10's _sessionid for this session; Restore preserves it unless WithSessionID overrides it
+	Configuration     []Identifier
+	HistoryValue      map[Identifier][]Identifier
+	InternalQueue     []Event
+	ExternalQueue     []Event
+	Running           bool
+	SendSeq           int // high-water mark for auto-generated send.<n> IDs
+	InvokeSeq         int // high-water mark for auto-generated <state>.invoke<n> IDs
+	DispatchSeq       uint64
+	DeliveryNamespace string
+	PendingSends      []PendingSend
+	ActiveInvokes     []ActiveInvoke
 }
 
 // PendingSend describes one delayed <send> that has not yet fired or been
@@ -59,23 +63,23 @@ type Checkpoint struct {
 	Seq      uint64
 }
 
-const snapshotVersion = 2
+const snapshotVersion = 3
 
 // Snapshot captures this Instance's current state (safely, by running on
 // the interpreter's own goroutine), suitable for persisting and later
 // passing to Restore.
 func (in *Instance) Snapshot(ctx context.Context) (Snapshot, error) {
-	req := actorRequest{kind: reqSnapshot, snapOut: make(chan Snapshot, 1)}
+	req := actorRequest{kind: reqSnapshot, snapOut: make(chan snapshotResult, 1)}
 	if err := in.submit(ctx, req); err != nil {
 		return Snapshot{}, err
 	}
 	select {
-	case snap := <-req.snapOut:
-		return snap, nil
+	case result := <-req.snapOut:
+		return result.snapshot, result.err
 	case <-in.doneCh:
 		select {
-		case snap := <-req.snapOut:
-			return snap, nil
+		case result := <-req.snapOut:
+			return result.snapshot, result.err
 		default:
 			return Snapshot{}, ErrInstanceStopped
 		}
@@ -84,18 +88,26 @@ func (in *Instance) Snapshot(ctx context.Context) (Snapshot, error) {
 	}
 }
 
-func (in *Instance) buildSnapshot() Snapshot {
+func (in *Instance) buildSnapshot() (Snapshot, error) {
 	ip := in.ip
+	datamodel, err := in.chart.codec.Encode(ip.datamodel)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("statecharts: snapshot datamodel: %w", err)
+	}
 	snap := Snapshot{
-		Version:       snapshotVersion,
-		ID:            ip.sessionID,
-		Configuration: ip.activeStates(),
-		HistoryValue:  map[Identifier][]Identifier{},
-		InternalQueue: append([]Event(nil), ip.internalQueue...),
-		ExternalQueue: append([]Event(nil), ip.externalQueue...),
-		Running:       ip.running,
-		SendSeq:       ip.sendSeq,
-		InvokeSeq:     ip.invokeSeq,
+		Version:           snapshotVersion,
+		ChartVersion:      in.chart.version,
+		Datamodel:         datamodel,
+		ID:                ip.sessionID,
+		Configuration:     ip.activeStates(),
+		HistoryValue:      map[Identifier][]Identifier{},
+		InternalQueue:     append([]Event(nil), ip.internalQueue...),
+		ExternalQueue:     append([]Event(nil), ip.externalQueue...),
+		Running:           ip.running,
+		SendSeq:           ip.sendSeq,
+		InvokeSeq:         ip.invokeSeq,
+		DispatchSeq:       ip.dispatchSeq,
+		DeliveryNamespace: ip.deliveryNamespace,
 	}
 	for hs, states := range ip.historyValue {
 		ids := make([]Identifier, len(states))
@@ -138,7 +150,7 @@ func (in *Instance) buildSnapshot() Snapshot {
 	sort.Slice(snap.ActiveInvokes, func(i, j int) bool {
 		return snap.ActiveInvokes[i].ID < snap.ActiveInvokes[j].ID
 	})
-	return snap
+	return snap, nil
 }
 
 // Restore reconstructs a paused Instance directly from a Snapshot, without
@@ -156,7 +168,24 @@ func (in *Instance) buildSnapshot() Snapshot {
 // is constructed but not started; call Start to spawn its goroutine.
 func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Instance, error) {
 	if snap.Version != snapshotVersion {
-		return nil, fmt.Errorf("statecharts: restore: unsupported snapshot version %d (want %d)", snap.Version, snapshotVersion)
+		return nil, fmt.Errorf("%w: unsupported snapshot version %d (want %d)", ErrInvalidSnapshot, snap.Version, snapshotVersion)
+	}
+	if snap.ChartVersion != chart.version {
+		return nil, fmt.Errorf("%w: chart version mismatch", ErrInvalidSnapshot)
+	}
+	var decoded any
+	var err error
+	if datamodel == nil && len(snap.Datamodel) == 0 {
+		// A nil datamodel has no payload to encode. In particular, preserve
+		// control-state-only snapshots written with an empty SQL blob.
+		decoded = nil
+	} else {
+		// Never let a codec mutate the caller's observable value before all
+		// snapshot control state has also passed validation.
+		decoded, err = chart.codec.Decode(snap.Datamodel, freshDecodePrototype(datamodel))
+		if err != nil {
+			return nil, fmt.Errorf("%w: decode datamodel: %v", ErrInvalidSnapshot, err)
+		}
 	}
 	cfg := defaultInstanceConfig()
 	for _, opt := range opts {
@@ -173,12 +202,65 @@ func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Insta
 	if id == "" {
 		id = cfg.idGen.NewID()
 	}
-	ip := newInterpretation(chart, datamodel)
+	ip := newInterpretation(chart, decoded)
 	in := newInstance(chart, ip, cfg, id)
 	if err := ip.restoreFrom(chart, snap); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSnapshot, err)
 	}
+	// Validation is complete. Commit the decoded state to the supplied
+	// datamodel where its shape is mutable, then ensure future actions see
+	// that same caller-observable value.
+	ip.datamodel = commitDecodedDatamodel(datamodel, decoded)
 	return in, nil
+}
+
+func freshDecodePrototype(datamodel any) any {
+	if datamodel == nil {
+		return nil
+	}
+	t := reflect.TypeOf(datamodel)
+	if t.Kind() == reflect.Pointer {
+		return reflect.New(t.Elem()).Interface()
+	}
+	return reflect.New(t).Elem().Interface()
+}
+
+func commitDecodedDatamodel(datamodel, decoded any) any {
+	if datamodel == nil || decoded == nil {
+		return decoded
+	}
+	dst, src := reflect.ValueOf(datamodel), reflect.ValueOf(decoded)
+	switch dst.Kind() {
+	case reflect.Pointer:
+		if !dst.IsNil() {
+			if src.Type() == dst.Type() && !src.IsNil() {
+				dst.Elem().Set(src.Elem())
+				return datamodel
+			}
+			if src.Type().AssignableTo(dst.Elem().Type()) {
+				dst.Elem().Set(src)
+				return datamodel
+			}
+		}
+	case reflect.Map:
+		if !dst.IsNil() && src.Type() == dst.Type() {
+			dst.Clear()
+			for _, key := range src.MapKeys() {
+				dst.SetMapIndex(key, src.MapIndex(key))
+			}
+			return datamodel
+		}
+	case reflect.Slice:
+		// A slice header passed through an interface is not settable. It is
+		// nevertheless fully observable when its length already matches.
+		if !dst.IsNil() && src.Type() == dst.Type() && dst.Len() == src.Len() {
+			reflect.Copy(dst, src)
+			return datamodel
+		}
+	}
+	// Non-pointer scalars (and shapes that cannot be replaced through the
+	// interface) are explicitly allowed to use the decoded value.
+	return decoded
 }
 
 func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
@@ -215,6 +297,10 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 	ip.running = snap.Running
 	ip.sendSeq = snap.SendSeq
 	ip.invokeSeq = snap.InvokeSeq
+	ip.dispatchSeq = snap.DispatchSeq
+	if snap.DeliveryNamespace != "" {
+		ip.deliveryNamespace = snap.DeliveryNamespace
+	}
 
 	ip.pending = map[*pendingSendRecord]bool{}
 	for i, ps := range snap.PendingSends {
@@ -275,17 +361,21 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 // arbitrary Go value) needs help, via EncodeEvent/DecodeEvent (event_codec.go).
 
 type snapshotWire struct {
-	Version       int                         `json:"version"`
-	ID            SessionID                   `json:"id,omitempty"`
-	Configuration []Identifier                `json:"configuration"`
-	HistoryValue  map[Identifier][]Identifier `json:"history_value,omitempty"`
-	InternalQueue []EncodedEvent              `json:"internal_queue,omitempty"`
-	ExternalQueue []EncodedEvent              `json:"external_queue,omitempty"`
-	Running       bool                        `json:"running"`
-	SendSeq       int                         `json:"send_seq,omitempty"`
-	InvokeSeq     int                         `json:"invoke_seq,omitempty"`
-	PendingSends  []pendingSendWire           `json:"pending_sends,omitempty"`
-	ActiveInvokes []ActiveInvoke              `json:"active_invokes,omitempty"`
+	Version           int                         `json:"version"`
+	ChartVersion      string                      `json:"chart_version"`
+	Datamodel         []byte                      `json:"datamodel"`
+	ID                SessionID                   `json:"id,omitempty"`
+	Configuration     []Identifier                `json:"configuration"`
+	HistoryValue      map[Identifier][]Identifier `json:"history_value,omitempty"`
+	InternalQueue     []EncodedEvent              `json:"internal_queue,omitempty"`
+	ExternalQueue     []EncodedEvent              `json:"external_queue,omitempty"`
+	Running           bool                        `json:"running"`
+	SendSeq           int                         `json:"send_seq,omitempty"`
+	InvokeSeq         int                         `json:"invoke_seq,omitempty"`
+	DispatchSeq       uint64                      `json:"dispatch_seq,omitempty"`
+	DeliveryNamespace string                      `json:"delivery_namespace,omitempty"`
+	PendingSends      []pendingSendWire           `json:"pending_sends,omitempty"`
+	ActiveInvokes     []ActiveInvoke              `json:"active_invokes,omitempty"`
 }
 
 type pendingSendWire struct {
@@ -299,14 +389,18 @@ type pendingSendWire struct {
 // MarshalJSON implements json.Marshaler.
 func (s Snapshot) MarshalJSON() ([]byte, error) {
 	wire := snapshotWire{
-		Version:       s.Version,
-		ID:            s.ID,
-		Configuration: s.Configuration,
-		HistoryValue:  s.HistoryValue,
-		Running:       s.Running,
-		SendSeq:       s.SendSeq,
-		InvokeSeq:     s.InvokeSeq,
-		ActiveInvokes: s.ActiveInvokes,
+		Version:           s.Version,
+		ChartVersion:      s.ChartVersion,
+		Datamodel:         s.Datamodel,
+		ID:                s.ID,
+		Configuration:     s.Configuration,
+		HistoryValue:      s.HistoryValue,
+		Running:           s.Running,
+		SendSeq:           s.SendSeq,
+		InvokeSeq:         s.InvokeSeq,
+		DispatchSeq:       s.DispatchSeq,
+		DeliveryNamespace: s.DeliveryNamespace,
+		ActiveInvokes:     s.ActiveInvokes,
 	}
 	for _, ev := range s.InternalQueue {
 		enc, err := EncodeEvent(ev)
@@ -341,12 +435,16 @@ func (s *Snapshot) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	s.Version = wire.Version
+	s.ChartVersion = wire.ChartVersion
+	s.Datamodel = wire.Datamodel
 	s.ID = wire.ID
 	s.Configuration = wire.Configuration
 	s.HistoryValue = wire.HistoryValue
 	s.Running = wire.Running
 	s.SendSeq = wire.SendSeq
 	s.InvokeSeq = wire.InvokeSeq
+	s.DispatchSeq = wire.DispatchSeq
+	s.DeliveryNamespace = wire.DeliveryNamespace
 	s.ActiveInvokes = wire.ActiveInvokes
 
 	s.InternalQueue = nil

@@ -104,7 +104,7 @@ var releaseLease = statecharts.Action(func(d *toolRegistryModel, ec statecharts.
 func offerToRegistry(clock statecharts.Clock) statecharts.ActionFunc {
 	return statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		offer, ok := statecharts.Payload[toolOffer](ev)
+		offer, ok := statecharts.Payload[*toolOffer](ev)
 		if !ok {
 			return nil
 		}
@@ -168,6 +168,5 @@ func BuildToolRegistryChart(clock statecharts.Clock) (*statecharts.Chart, error)
 		),
 		statecharts.WithNewDatamodel(func() any {
 			return &toolRegistryModel{Leases: map[protocol.ToolName]toolLease{}}
-		}),
-	)
+		}), statecharts.WithVersion("v1"))
 }

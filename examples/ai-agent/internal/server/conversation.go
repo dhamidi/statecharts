@@ -116,7 +116,7 @@ var broadcastLastMessage = statecharts.Action(func(d *conversationModel, ec stat
 	last := d.History[len(d.History)-1]
 	ec.Send("broadcast", statecharts.SendOptions{
 		Target: "fanout",
-		Data: fanoutBroadcast{
+		Data: &fanoutBroadcast{
 			ConversationID: convID,
 			Kind:           "message",
 			Seq:            len(d.History),
@@ -151,7 +151,7 @@ var startRequest = statecharts.Action(func(d *conversationModel, ec statecharts.
 	ec.Send("generate", statecharts.SendOptions{
 		Target: reqName,
 		Type:   "llm",
-		Data: dispatchPayload{
+		Data: &dispatchPayload{
 			ConversationID: convID,
 			Request:        llm.GenerateRequest{History: history, Tools: staticToolDefs},
 		},
@@ -213,7 +213,7 @@ var offerToolCall = statecharts.Action(func(d *conversationModel, ec statecharts
 	}
 	ec.Send("offer", statecharts.SendOptions{
 		Target: "toolregistry",
-		Data: toolOffer{
+		Data: &toolOffer{
 			ConversationID: convID,
 			Tool:           d.PendingToolName,
 			CallID:         d.PendingCallID,
@@ -352,7 +352,7 @@ var replyWithCatchup = statecharts.Action(func(d *conversationModel, ec statecha
 		m := d.History[i]
 		ec.Send("catchup_message", statecharts.SendOptions{
 			Target: statecharts.Identifier(payload.Value.Connection),
-			Data:   catchupMessage{Seq: i + 1, Frame: protocol.MessageFrame{Role: mapRole(m.Role), Text: m.Text}},
+			Data:   &catchupMessage{Seq: i + 1, Frame: protocol.MessageFrame{Role: mapRole(m.Role), Text: m.Text}},
 		})
 	}
 	return nil
@@ -413,6 +413,5 @@ func BuildConversationChart() (*statecharts.Chart, error) {
 			),
 			statecharts.On("catchup", statecharts.Then(replyWithCatchup)),
 		),
-		statecharts.WithNewDatamodel(func() any { return &conversationModel{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &conversationModel{} }), statecharts.WithVersion("v1"))
 }

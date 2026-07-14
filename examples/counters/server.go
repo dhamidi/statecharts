@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,24 +15,10 @@ import (
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
 	"github.com/dhamidi/statecharts/sqllog"
-	_ "modernc.org/sqlite"
 )
 
-func openLog(path string) (*sqllog.Log, *sql.DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return nil, nil, err
-	}
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, nil, err
-	}
-	db.SetMaxOpenConns(1)
-	l, err := sqllog.New(db, sqllog.SQLite)
-	if err != nil {
-		db.Close()
-		return nil, nil, err
-	}
-	return l, db, nil
+func openLog(path string) (*sqllog.Storage, error) {
+	return sqllog.OpenSQLite(path)
 }
 
 type streamTransport struct {
@@ -45,8 +29,7 @@ type streamTransport struct {
 func newStreamTransport() *streamTransport {
 	return &streamTransport{outputs: map[statecharts.Identifier]chan []byte{}}
 }
-func (t *streamTransport) Attach(statecharts.Dispatcher)                        {}
-func (t *streamTransport) Cancel(context.Context, statecharts.Identifier) error { return nil }
+func (t *streamTransport) Attach(statecharts.Dispatcher) {}
 func (t *streamTransport) register(id statecharts.Identifier) <-chan []byte {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -91,6 +74,7 @@ func (t *streamTransport) Send(ctx context.Context, req statecharts.SendRequest)
 type counterRuntime struct {
 	counters, ui *actors.System
 	streams      *streamTransport
+	storage      *sqllog.Storage
 }
 
 func setupCounters(ctx context.Context, store *sqllog.Log) (*counterRuntime, error) {
@@ -104,7 +88,7 @@ func setupCounters(ctx context.Context, store *sqllog.Log) (*counterRuntime, err
 		return nil, err
 	}
 	transport := newStreamTransport()
-	ui := actors.NewSystem(actors.WithNodeName("ui"), actors.WithFallback(transport))
+	ui := actors.NewSystem(actors.WithNodeName("ui"), actors.WithIOProcessor("sse", func() statecharts.IOProcessor { return transport }))
 	cleanup := func() { _ = ui.Stop(context.Background()) }
 	if err = ui.Register(hubChart); err != nil {
 		cleanup()
@@ -124,8 +108,7 @@ func setupCounters(ctx context.Context, store *sqllog.Log) (*counterRuntime, err
 		cleanup()
 		return nil, err
 	}
-	snapshots := fullReplaySnapshots{SnapshotStore: store}
-	counters := actors.NewSystem(actors.WithNodeName("counters"), actors.WithLog(store), actors.WithSnapshotStore(snapshots), actors.WithMaxResident(3), actors.WithIdleTimeout(time.Minute), actors.WithFallback(bridge), actors.WithResidencyObserver(func(change actors.ResidencyChange) {
+	counters := actors.NewSystem(actors.WithNodeName("counters"), actors.WithStorage(store), actors.WithMaxResident(3), actors.WithIdleTimeout(time.Minute), actors.WithSCXMLPeer(bridge), actors.WithResidencyObserver(func(change actors.ResidencyChange) {
 		_ = ui.Tell(context.Background(), "hub", statecharts.Event{Name: "residency", Type: statecharts.EventExternal, Data: change})
 	}))
 	fail := func(e error) (*counterRuntime, error) {
@@ -147,7 +130,7 @@ func setupCounters(ctx context.Context, store *sqllog.Log) (*counterRuntime, err
 			return fail(err)
 		}
 	}
-	rt := &counterRuntime{counters: counters, ui: ui, streams: transport}
+	rt := &counterRuntime{counters: counters, ui: ui, streams: transport, storage: store}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		ps, e := rt.query(ctx, colors)
@@ -160,13 +143,6 @@ func setupCounters(ctx context.Context, store *sqllog.Log) (*counterRuntime, err
 		time.Sleep(time.Millisecond)
 	}
 	return rt, nil
-}
-
-type fullReplaySnapshots struct{ statecharts.SnapshotStore }
-
-func (s fullReplaySnapshots) Save(ctx context.Context, id statecharts.SessionID, cp statecharts.Checkpoint) error {
-	cp.Seq = 0
-	return s.SnapshotStore.Save(ctx, id, cp)
 }
 
 func (rt *counterRuntime) query(ctx context.Context, selected []string) ([]projection, error) {
@@ -182,10 +158,10 @@ func (rt *counterRuntime) query(ctx context.Context, selected []string) ([]proje
 	}
 }
 func (rt *counterRuntime) stop(ctx context.Context) error {
-	if err := rt.counters.Stop(ctx); err != nil {
-		return err
-	}
-	return rt.ui.Stop(ctx)
+	countersErr := rt.counters.Stop(ctx)
+	uiErr := rt.ui.Stop(ctx)
+	closeErr := rt.storage.Close()
+	return errors.Join(countersErr, uiErr, closeErr)
 }
 
 func counterHandler(rt *counterRuntime) http.Handler {

@@ -870,7 +870,7 @@ func renderMain(snap uiSnapshot) *htmlutil.Element {
 		// datastar.js). The actual transcript update comes from the live
 		// SSE push (pushMain, see ui.go), not from this response.
 		htmlutil.New("form", map[string]string{
-			"class":                    "send-form",
+			"class":                   "send-form",
 			"data-on:submit__prevent": "@post('/send', {contentType: 'form'}); evt.target.reset()",
 		},
 			htmlutil.New("input", map[string]string{"type": "hidden", "name": "conversation", "value": snap.ConversationID.String()}),

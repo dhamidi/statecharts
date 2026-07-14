@@ -8,10 +8,6 @@ import (
 	"github.com/dhamidi/statecharts"
 )
 
-// originTypeActors is the OriginType stamped on every event a System
-// delivers, identifying the routing mechanism that populated Origin.
-const originTypeActors statecharts.Identifier = "actors"
-
 func routingKey(actorID statecharts.Identifier, node string) statecharts.Identifier {
 	if node == "" {
 		return actorID
@@ -55,9 +51,9 @@ func actorRouteFrom(ctx context.Context) (actorRouteContext, bool) {
 // (self) and the System, and is the only mechanism through which a chart
 // running inside a System can address another actor by name.
 //
-// Send routes the SCXML and "actors" processor types by actor name. A
-// different processor type selects the configured fallback directly; for a
-// locally routed type, an unknown actor name also falls back before failing.
+// Send routes the SCXML processor type by actor name. Custom processor types
+// are selected directly by the interpreter and never reach this router; an
+// unknown SCXML location is offered to the configured SCXML peer.
 // Actually acquiring a local target -- paging it in if necessary, possibly
 // evicting another resident actor first to stay within the residency limit --
 // and delivering the event is handed off to the System's ordered dispatcher,
@@ -87,26 +83,24 @@ func (p *routingProcessor) Attach(d statecharts.Dispatcher) {
 // Send implements statecharts.IOProcessor. See routingProcessor's own doc
 // comment for the synchronous/asynchronous split this relies on.
 func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest) error {
-	localType := req.Type == statecharts.SCXMLEventProcessor || req.Type == originTypeActors
+	localType := req.Type == statecharts.SCXMLEventProcessor
 	_, target, ok := p.sys.resolveTarget(req.Target)
-	if !localType || !ok {
-		if p.sys.cfg.fallback != nil {
+	if !localType {
+		return unsupportedPeerTypeError{typ: req.Type}
+	}
+	if !ok {
+		if p.sys.cfg.scxmlPeer != nil {
 			// self rides along on ctx, not on req: SendRequest has no field for
 			// who is calling (an IOProcessor is shared machinery with no notion
 			// of "which actor" built into its own signature), and a fallback is
 			// one value shared by every actor in sys, so there is nowhere else
 			// to attach it without racing concurrent Send calls from different
 			// actors against each other. actorRouteFrom recovers it.
-			return p.sys.cfg.fallback.Send(withActorOrigin(ctx, actorRouteContext{
+			return p.sys.cfg.scxmlPeer.Send(withActorOrigin(ctx, actorRouteContext{
 				address: p.self, system: p.sys, dispatcher: p.disp, sendID: req.SendID,
 			}), req)
 		}
-		if !localType {
-			return unsupportedPeerTypeError{typ: req.Type}
-		}
-		if !ok {
-			return fmt.Errorf("actors: unknown actor %q", req.Target)
-		}
+		return fmt.Errorf("actors: unknown actor %q", req.Target)
 	}
 
 	ev := statecharts.Event{
@@ -115,13 +109,37 @@ func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest
 		Data:       req.Data,
 		SendID:     req.EventSendID,
 		Origin:     p.self,
-		OriginType: originTypeActors,
+		OriginType: statecharts.SCXMLEventProcessor,
+		DeliveryID: req.DeliveryID,
 	}
 
 	origin := p.disp
 	return p.sys.enqueueDispatch(func() {
 		p.sys.deliverAsync(context.Background(), target, ev, origin, req.SendID)
 	})
+}
+
+// SendWithAck acknowledges only after target ingress has reached its durable
+// WAL/dedup boundary (or ordinary acceptance for an ephemeral target).
+func (p *routingProcessor) SendWithAck(ctx context.Context, req statecharts.SendRequest, complete func(error)) error {
+	localType := req.Type == statecharts.SCXMLEventProcessor
+	_, target, ok := p.sys.resolveTarget(req.Target)
+	if localType && !ok && p.sys.cfg.scxmlPeer != nil {
+		ctx = withActorOrigin(ctx, actorRouteContext{address: p.self, system: p.sys, dispatcher: p.disp, sendID: req.SendID})
+		if ack, supportsAck := p.sys.cfg.scxmlPeer.(statecharts.AcknowledgingIOProcessor); supportsAck {
+			return ack.SendWithAck(ctx, req, complete)
+		}
+	}
+	if !localType || !ok {
+		err := p.Send(ctx, req)
+		if err != nil {
+			return err
+		}
+		complete(nil)
+		return nil
+	}
+	ev := statecharts.Event{Name: req.Event, Type: statecharts.EventExternal, Data: req.Data, SendID: req.EventSendID, Origin: p.self, OriginType: statecharts.SCXMLEventProcessor, DeliveryID: req.DeliveryID}
+	return p.sys.enqueueDispatch(func() { complete(p.sys.deliver(context.Background(), target, ev)) })
 }
 
 type unsupportedPeerTypeError struct{ typ statecharts.Identifier }
@@ -137,20 +155,15 @@ func (unsupportedPeerTypeError) SendExecutionError() {}
 // IOProcessor, so by the time Cancel could matter for a cross-actor send,
 // the sender's own pending-send record is already gone; there is nothing
 // left here for the routing processor itself to cancel.
-func (p *routingProcessor) Cancel(ctx context.Context, sendID statecharts.Identifier) error {
-	return nil
-}
-
 // IOProcessors implements statecharts.IOProcessorDescriber. self is the
 // actor's routable ID@node key when the System has a node name, or its local
 // actor ID otherwise. Any processors advertised by the fallback remain
 // visible through the System's routing composite.
 func (p *routingProcessor) IOProcessors() []statecharts.IOProcessorInfo {
 	infos := []statecharts.IOProcessorInfo{
-		{Type: originTypeActors, Location: statecharts.LocationFromIdentifier(p.self)},
 		{Type: statecharts.SCXMLEventProcessor, Location: statecharts.LocationFromIdentifier(p.self)},
 	}
-	if describer, ok := p.sys.cfg.fallback.(statecharts.IOProcessorDescriber); ok {
+	if describer, ok := p.sys.cfg.scxmlPeer.(statecharts.IOProcessorDescriber); ok {
 		infos = append(infos, describer.IOProcessors()...)
 	}
 	return infos

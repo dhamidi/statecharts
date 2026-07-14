@@ -11,18 +11,15 @@ import (
 )
 
 // NewSystem builds the actors.System every server-side actor lives in,
-// wiring LLMDispatchProcessor in as its WithFallback (see llmrequest.go's
-// own doc comment on why chart actions can't spawn actors directly). log
-// and snapshots are typically the same *sqllog.Log value, which implements
-// both.
-func NewSystem(log statecharts.Log, snapshots statecharts.SnapshotStore, clock statecharts.Clock, logger statecharts.Logger, provider llm.Provider) (*actors.System, *LLMDispatchProcessor) {
+// wiring LLMDispatchProcessor in as its explicit "llm" processor (see llmrequest.go's
+// own doc comment on why chart actions can't spawn actors directly).
+func NewSystem(storage actors.Storage, clock statecharts.Clock, logger statecharts.Logger, provider llm.Provider) (*actors.System, *LLMDispatchProcessor) {
 	dispatch := NewLLMDispatchProcessor(provider)
 	sys := actors.NewSystem(
-		actors.WithLog(log),
-		actors.WithSnapshotStore(snapshots),
+		actors.WithStorage(storage),
 		actors.WithClock(clock),
 		actors.WithLogger(logger),
-		actors.WithFallback(dispatch),
+		actors.WithIOProcessor("llm", func() statecharts.IOProcessor { return dispatch }),
 	)
 	dispatch.SetSystem(sys)
 	return sys, dispatch

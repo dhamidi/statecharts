@@ -39,7 +39,7 @@ func newConnectionActor(ctx context.Context, changed func(string)) (*connectionA
 			statecharts.Atomic("connecting", statecharts.OnEntry(set("connecting")), statecharts.On("success", statecharts.Target("connected")), statecharts.On("failure", statecharts.Target("reconnecting"))),
 			statecharts.Atomic("connected", statecharts.OnEntry(set("connected")), statecharts.On("failure", statecharts.Target("reconnecting"))),
 			statecharts.Atomic("reconnecting", statecharts.OnEntry(set("reconnecting")), statecharts.On("success", statecharts.Target("connected"))),
-		)), statecharts.WithNewDatamodel(func() any { return m }))
+		)), statecharts.WithNewDatamodel(func() any { return m }), statecharts.WithVersion("v1"))
 	if err != nil {
 		return nil, err
 	}

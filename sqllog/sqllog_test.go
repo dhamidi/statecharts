@@ -3,6 +3,9 @@ package sqllog_test
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +14,116 @@ import (
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/sqllog"
 )
+
+var (
+	_ statecharts.Log           = (*sqllog.Storage)(nil)
+	_ statecharts.SnapshotStore = (*sqllog.Storage)(nil)
+)
+
+func TestOpenSQLiteConfiguresEveryConnection(t *testing.T) {
+	store, err := sqllog.OpenSQLite(t.TempDir() + "/nested/system.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	c1, err := store.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := store.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	for i, conn := range []*sql.Conn{c1, c2} {
+		for pragma, want := range map[string]string{"journal_mode": "wal", "busy_timeout": "5000", "foreign_keys": "1", "synchronous": "1", "wal_autocheckpoint": "1000"} {
+			var got string
+			if err := conn.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil {
+				t.Fatalf("connection %d %s: %v", i, pragma, err)
+			}
+			if got != want {
+				t.Errorf("connection %d PRAGMA %s = %q, want %q", i, pragma, got, want)
+			}
+		}
+	}
+}
+
+func TestOpenSQLiteFilesAreIsolated(t *testing.T) {
+	dir := t.TempDir()
+	a, err := sqllog.OpenSQLite(dir + "/a.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := sqllog.OpenSQLite(dir + "/b.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	entry := statecharts.LogEntry{SessionID: "same", Kind: statecharts.KindExternalEvent, Timestamp: time.Now(), Event: statecharts.Event{Name: "x"}}
+	if _, err := a.Append(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.LastSeq(context.Background(), "same"); err != nil || got != 0 {
+		t.Fatalf("second database LastSeq = %d, %v", got, err)
+	}
+}
+
+func TestOpenSQLiteConcurrentAppendsAreGapless(t *testing.T) {
+	store, err := sqllog.OpenSQLite(t.TempDir() + "/log.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const n = 80
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := store.Append(context.Background(), statecharts.LogEntry{SessionID: "shared", Kind: statecharts.KindExternalEvent, Timestamp: time.Now(), Event: statecharts.Event{Name: statecharts.Identifier(fmt.Sprint(i))}})
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("Append: %v", err)
+		}
+	}
+	var want uint64 = 1
+	for entry, err := range store.Read(context.Background(), "shared", 1) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entry.Seq != want {
+			t.Fatalf("sequence = %d, want %d", entry.Seq, want)
+		}
+		want++
+	}
+	if want != n+1 {
+		t.Fatalf("read %d entries, want %d", want-1, n)
+	}
+}
+
+func TestLoadMalformedSnapshotIsInvalidSnapshot(t *testing.T) {
+	store, err := sqllog.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.DB().Exec(`INSERT INTO statechart_snapshot(session_id, seq, snapshot_json) VALUES ('bad', 1, '{')`); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.Load(context.Background(), "bad")
+	if !errors.Is(err, statecharts.ErrInvalidSnapshot) {
+		t.Fatalf("Load error = %v, want ErrInvalidSnapshot", err)
+	}
+}
 
 func openTestLog(t *testing.T) *sqllog.Log {
 	t.Helper()
@@ -207,6 +320,82 @@ func TestNewMigratesLegacyLogForTimerType(t *testing.T) {
 		if entry.Type != "custom-io" {
 			t.Fatalf("Type after migration = %q, want custom-io", entry.Type)
 		}
+	}
+}
+
+func TestStoreOutboundRejectsDeliveryIDCollision(t *testing.T) {
+	store := openTestLog(t)
+	ctx := context.Background()
+	first := statecharts.OutboundMessage{
+		SessionID:  "sender",
+		DeliveryID: "sender:v1:1",
+		Request: statecharts.SendRequest{
+			DeliveryID: "sender:v1:1",
+			SendID:     "send.1",
+			Target:     "worker-a",
+			Type:       statecharts.SCXMLEventProcessor,
+			Event:      "work",
+		},
+		Status: statecharts.OutboundPending,
+	}
+	if err := store.StoreOutbound(ctx, first); err != nil {
+		t.Fatalf("StoreOutbound first: %v", err)
+	}
+	if err := store.StoreOutbound(ctx, first); err != nil {
+		t.Fatalf("StoreOutbound exact retry: %v", err)
+	}
+
+	collision := first
+	collision.Request.Target = "worker-b"
+	if err := store.StoreOutbound(ctx, collision); !errors.Is(err, statecharts.ErrOutboundCollision) {
+		t.Fatalf("StoreOutbound collision error = %v, want ErrOutboundCollision", err)
+	}
+
+	messages, err := store.Outbounds(ctx, first.SessionID)
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(messages) != 1 || messages[0].Request.Target != "worker-a" {
+		t.Fatalf("stored outbounds = %#v, want only original worker-a request", messages)
+	}
+}
+
+func TestNewMigratesVersionThreeOutboxResults(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TABLE statechart_outbound (
+		session_id TEXT NOT NULL, delivery_id TEXT NOT NULL, send_id TEXT NOT NULL,
+		event_send_id TEXT NOT NULL, target TEXT NOT NULL, processor_type TEXT NOT NULL,
+		event_name TEXT NOT NULL, data_type TEXT NOT NULL DEFAULT '', data_payload BLOB,
+		status TEXT NOT NULL, PRIMARY KEY(session_id, delivery_id)
+	); PRAGMA user_version=3`); err != nil {
+		t.Fatalf("create version 3 schema: %v", err)
+	}
+	store, err := sqllog.New(db, sqllog.SQLite)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	message := statecharts.OutboundMessage{
+		SessionID: "sender", DeliveryID: "delivery-1", Status: statecharts.OutboundPending,
+		Request: statecharts.SendRequest{DeliveryID: "delivery-1", SendID: "send.1", Target: "worker", Type: statecharts.SCXMLEventProcessor, Event: "work"},
+	}
+	if err := store.StoreOutbound(context.Background(), message); err != nil {
+		t.Fatalf("StoreOutbound after migration: %v", err)
+	}
+	result := statecharts.OutboundResult{Error: "rejected", Execution: true, Synchronous: true}
+	if err := store.ResolveOutbound(context.Background(), message.SessionID, message.DeliveryID, result); err != nil {
+		t.Fatalf("ResolveOutbound after migration: %v", err)
+	}
+	messages, err := store.Outbounds(context.Background(), message.SessionID)
+	if err != nil {
+		t.Fatalf("Outbounds after migration: %v", err)
+	}
+	if len(messages) != 1 || messages[0].Result != result {
+		t.Fatalf("outbound result = %#v, want %#v", messages, result)
 	}
 }
 

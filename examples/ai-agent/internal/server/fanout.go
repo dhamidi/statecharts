@@ -65,7 +65,7 @@ var unsubscribeConnection = statecharts.Action(func(d *fanoutModel, ec statechar
 
 var forwardBroadcast = statecharts.Action(func(d *fanoutModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	bc, ok := statecharts.Payload[fanoutBroadcast](ev)
+	bc, ok := statecharts.Payload[*fanoutBroadcast](ev)
 	if !ok {
 		return nil
 	}
@@ -94,6 +94,5 @@ func BuildFanoutChart() (*statecharts.Chart, error) {
 		),
 		statecharts.WithNewDatamodel(func() any {
 			return &fanoutModel{Subscribers: map[protocol.ConversationID][]protocol.ConnectionID{}}
-		}),
-	)
+		}), statecharts.WithVersion("v1"))
 }

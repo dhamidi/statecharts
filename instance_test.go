@@ -371,8 +371,6 @@ func (p *describingIOProcessor) Attach(Dispatcher) {}
 
 func (p *describingIOProcessor) Send(context.Context, SendRequest) error { return nil }
 
-func (p *describingIOProcessor) Cancel(context.Context, Identifier) error { return nil }
-
 func (p *describingIOProcessor) IOProcessors() []IOProcessorInfo { return p.infos }
 
 // mustLocation parses s as a Location, failing the test immediately if s is
@@ -414,7 +412,7 @@ func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
 
 	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://door-1")}}}
 	d := &Door{}
-	in := New(chart, d, WithIOProcessor(io))
+	in := New(chart, d, WithIOProcessor(SCXMLEventProcessor, io))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -504,7 +502,7 @@ func TestExecContextIOProcessorLocationUnknownTypeReturnsNotOK(t *testing.T) {
 
 	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://door-1")}}}
 	d := &Door{}
-	in := New(chart, d, WithIOProcessor(io))
+	in := New(chart, d, WithIOProcessor(SCXMLEventProcessor, io))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -599,8 +597,6 @@ func (p *captureIOProcessor) Send(_ context.Context, req SendRequest) error {
 	return p.err
 }
 
-func (p *captureIOProcessor) Cancel(context.Context, Identifier) error { return nil }
-
 type invalidSendTestError struct{}
 
 func (invalidSendTestError) Error() string       { return "unsupported send target" }
@@ -675,8 +671,8 @@ func TestInstanceSelfSendPopulatesSCXMLOriginMetadata(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer in.Stop(ctx)
-	if got.Origin != "#_scxml_session-1" || got.OriginType != "scxml" {
-		t.Fatalf("self-send origin = %q/%q, want #_scxml_session-1/scxml", got.Origin, got.OriginType)
+	if got.Origin != "#_scxml_session-1" || got.OriginType != SCXMLEventProcessor {
+		t.Fatalf("self-send origin = %q/%q, want standard SCXML metadata", got.Origin, got.OriginType)
 	}
 }
 
@@ -723,7 +719,7 @@ func TestInstanceFailedSendErrorCarriesGeneratedSendID(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithIOProcessor(processor))
+	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, processor))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -741,7 +737,7 @@ func TestInstanceSendUsesDefaultSCXMLEventProcessorType(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithIOProcessor(processor))
+	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, processor))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -772,7 +768,7 @@ func TestInstanceUnsupportedSendProducesExecutionError(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithIOProcessor(processor))
+	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, processor))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)

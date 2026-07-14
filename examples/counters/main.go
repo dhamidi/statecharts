@@ -48,11 +48,10 @@ func runServe(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	store, db, err := openLog(*dbPath)
+	store, err := openLog(*dbPath)
 	if err != nil {
 		return err
 	}
-	defer db.Close()
 	runtime, err := setupCounters(ctx, store)
 	if err != nil {
 		return err

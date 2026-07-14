@@ -5,11 +5,11 @@
 // memory automatically as they go idle or as the system comes under
 // resident-actor pressure.
 //
-// NewSystem builds a System from functional options: WithLog and
-// WithSnapshotStore supply the durability backing every Durable actor,
+// NewSystem builds a System from functional options: WithStorage supplies
+// the durability boundary backing every Durable actor,
 // WithIdleTimeout and WithResidencyLimit control automatic paging, and
 // WithClock controls time. WithNodeName supplies the routing location without
-// changing stable actor IDs or their keys in the System's isolated Log.
+// changing stable actor IDs or their keys in the System's isolated Storage.
 //
 // Register every Chart a System will ever spawn, then Spawn actors by stable
 // ActorID under those charts' kinds (a chart's own ID, see
@@ -31,7 +31,7 @@
 // Send targeting ev.Origin.
 //
 // A System's own routing only ever resolves names it spawned itself.
-// WithFallback gives it an IOProcessor to try for anything else, which is
+// WithSCXMLPeer gives it an SCXML peer to try for unknown locations, which is
 // how two independent Systems address each other: Bridge is a ready-made
 // fallback that forwards "billing@warehouse-b" to another System's
 // "billing" actor ID and stamps replies with the source node so they route

@@ -26,16 +26,12 @@ func (g *replayGate) Attach(d Dispatcher) { g.io.Attach(d) }
 
 func (g *replayGate) Send(ctx context.Context, req SendRequest) error {
 	if !g.live.Load() {
+		if replay, ok := g.io.(ReplayAwareIOProcessor); ok {
+			return replay.ReplaySend(ctx, req)
+		}
 		return nil
 	}
 	return g.io.Send(ctx, req)
-}
-
-func (g *replayGate) Cancel(ctx context.Context, sendID Identifier) error {
-	if !g.live.Load() {
-		return nil
-	}
-	return g.io.Cancel(ctx, sendID)
 }
 
 // Log implements Logger, suppressing every call until goLive, the same way
@@ -72,6 +68,13 @@ func (g *replayGate) IOProcessors() []IOProcessorInfo {
 
 func (g *replayGate) goLive() { g.live.Store(true) }
 
+func (g *replayGate) recover(ctx context.Context) error {
+	if replay, ok := g.io.(ReplayAwareIOProcessor); ok {
+		return replay.Recover(ctx)
+	}
+	return nil
+}
+
 // Rehydrate reconstructs a running Instance for sessionID: it loads the
 // latest Checkpoint if one exists, then replays every subsequent Log entry.
 // Real I/O, Logger calls, invocation starts, and live timers are suppressed
@@ -92,16 +95,31 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 	}
 
 	from := uint64(1)
-	cp, hasCheckpoint, err := snapshots.Load(ctx, sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("statecharts: Rehydrate: load checkpoint: %w", err)
+	var cp Checkpoint
+	hasCheckpoint := false
+	cacheMiss := false
+	if chart.version != "" {
+		var err error
+		cp, hasCheckpoint, err = snapshots.Load(ctx, sessionID)
+		if errors.Is(err, ErrInvalidSnapshot) {
+			hasCheckpoint = false
+			cacheMiss = true
+		} else if err != nil {
+			return nil, fmt.Errorf("statecharts: Rehydrate: load checkpoint: %w", err)
+		}
+		cacheMiss = !hasCheckpoint
 	}
 	// Checkpoints are a disposable replay optimization. If their format is
 	// from another version, ignore them and rebuild from the authoritative
 	// log rather than either interpreting an incompatible snapshot or making
 	// an otherwise recoverable session unloadable.
-	if hasCheckpoint && cp.Snapshot.Version != snapshotVersion {
+	lastSeq, err := log.LastSeq(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("statecharts: Rehydrate: last sequence: %w", err)
+	}
+	if hasCheckpoint && (cp.Snapshot.Version != snapshotVersion || cp.Snapshot.ChartVersion != chart.version || cp.Seq > lastSeq) {
 		hasCheckpoint = false
+		cacheMiss = true
 	}
 	if hasCheckpoint {
 		from = cp.Seq + 1
@@ -123,21 +141,47 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 		logicalNow = first.Timestamp
 	}
 	replayTime := newReplayClock(logicalNow)
-	gate := &replayGate{io: realIO, logger: probe.logger, ingressHook: probe.ingressHook}
+	// The explicit realIO parameter remains authoritative for SCXML; custom
+	// registrations come from opts. Gate every type, not just SCXML.
+	probe.processors[0].io = realIO
+	var gates []*replayGate
+	var gateOpts []Option
+	for _, registered := range probe.processors {
+		gate := &replayGate{io: registered.io, logger: probe.logger, ingressHook: probe.ingressHook}
+		gates = append(gates, gate)
+		gateOpts = append(gateOpts, withIOProcessorReplacement(registered.typ, gate))
+	}
+	gate := gates[0]
 
 	// Appending these options last makes them authoritative during replay,
 	// even if opts contained conflicting values.
-	allOpts := append(append([]Option{}, opts...),
-		WithIOProcessor(gate), WithLogger(gate), WithClock(replayTime),
+	allOpts := append(append([]Option{}, opts...), gateOpts...)
+	allOpts = append(allOpts, WithLogger(gate), WithClock(replayTime),
 		WithIngressHook(gate.ingress), WithSessionID(sessionID))
 
 	var in *Instance
 	if hasCheckpoint {
 		in, err = Restore(chart, datamodel, cp.Snapshot, allOpts...)
 		if err != nil {
-			return nil, fmt.Errorf("statecharts: Rehydrate: restore checkpoint: %w", err)
+			if !errors.Is(err, ErrInvalidSnapshot) {
+				return nil, fmt.Errorf("statecharts: Rehydrate: restore checkpoint: %w", err)
+			}
+			hasCheckpoint = false
+			cacheMiss = true
+			stop()
+			from = 1
+			next, stop = iter.Pull2(log.Read(ctx, sessionID, from))
+			defer stop()
+			first, readErr, hasFirst = next()
+			if readErr != nil {
+				return nil, fmt.Errorf("statecharts: Rehydrate: read log: %w", readErr)
+			}
+			if hasFirst && !first.Timestamp.IsZero() {
+				replayTime.Set(first.Timestamp)
+			}
 		}
-	} else {
+	}
+	if !hasCheckpoint {
 		in = New(chart, datamodel, allOpts...)
 	}
 
@@ -191,8 +235,23 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 		}
 	}
 
+	// A cache is disposable: refresh a rejected or absent one best-effort at
+	// the exact final log boundary, while replay side effects remain gated.
+	if cacheMiss && chart.version != "" {
+		if snap, snapErr := in.Snapshot(ctx); snapErr == nil {
+			_ = snapshots.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: lastSeq})
+		}
+	}
+
 	in.suppressInvoke.Store(false)
-	gate.goLive()
+	for _, g := range gates {
+		g.goLive()
+	}
+	for _, g := range gates {
+		if err := g.recover(ctx); err != nil {
+			return nil, fmt.Errorf("statecharts: Rehydrate: recover outbox: %w", err)
+		}
+	}
 
 	// Timer activation and invocation reconciliation run together on the
 	// Instance's actor goroutine. An overdue timer may exit an invoking state

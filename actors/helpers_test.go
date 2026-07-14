@@ -88,8 +88,7 @@ func buildLadderChart(sink *[]*counterModel) *statecharts.Chart {
 			d := &counterModel{}
 			*sink = append(*sink, d)
 			return d
-		}),
-	)
+		}), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -105,11 +104,11 @@ type locationModel struct {
 }
 
 // buildLocationChart returns a chart that, on "check", records
-// ec.IOProcessorLocation(originTypeActors) into its datamodel and moves to
+// ec.IOProcessorLocation(statecharts.SCXMLEventProcessor) into its datamodel and moves to
 // "checked". Every datamodel value produced is appended to sink.
 func buildLocationChart(sink *[]*locationModel) *statecharts.Chart {
 	record := statecharts.Action(func(d *locationModel, ec statecharts.ExecContext) error {
-		loc, ok := ec.IOProcessorLocation(originTypeActors)
+		loc, ok := ec.IOProcessorLocation(statecharts.SCXMLEventProcessor)
 		d.Location, d.OK = loc.String(), ok
 		return nil
 	})
@@ -124,8 +123,7 @@ func buildLocationChart(sink *[]*locationModel) *statecharts.Chart {
 			d := &locationModel{}
 			*sink = append(*sink, d)
 			return d
-		}),
-	)
+		}), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -148,8 +146,7 @@ func buildResponderChart() *statecharts.Chart {
 	}
 	chart, err := statecharts.Build(
 		statecharts.Atomic("responder", statecharts.On("ping", statecharts.Then(reply))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -182,8 +179,7 @@ func buildCallerChart(sink *[]*callerModel, target statecharts.Identifier) *stat
 			d := &callerModel{}
 			*sink = append(*sink, d)
 			return d
-		}),
-	)
+		}), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -206,8 +202,7 @@ func buildInvokingChart() *statecharts.Chart {
 				return nil, nil
 			}),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -225,8 +220,7 @@ func buildFinishingChart() *statecharts.Chart {
 				statecharts.Final("done"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -249,8 +243,7 @@ func buildDelayedFinishingChart(delay time.Duration) *statecharts.Chart {
 				statecharts.Final("done"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -272,8 +265,7 @@ func buildInitAbortChart() *statecharts.Chart {
 				statecharts.Atomic("aborted"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -294,8 +286,7 @@ func buildCommTestChart(unknownTarget statecharts.Identifier) *statecharts.Chart
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -328,8 +319,7 @@ func buildAsyncFailureSender(sink *[]*asyncFailureModel, target statecharts.Iden
 			d := &asyncFailureModel{}
 			*sink = append(*sink, d)
 			return d
-		}),
-	)
+		}), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		panic(err)
 	}

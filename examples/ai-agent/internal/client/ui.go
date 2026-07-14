@@ -416,6 +416,5 @@ func BuildUIChart(sys *actors.System, serverAddr string) (*statecharts.Chart, er
 			statecharts.On("subscribe_browser", statecharts.Then(subscribeBrowser)),
 			statecharts.On("unsubscribe_browser", statecharts.Then(unsubscribeBrowser)),
 		),
-		statecharts.WithNewDatamodel(func() any { return newUIModel() }),
-	)
+		statecharts.WithNewDatamodel(func() any { return newUIModel() }), statecharts.WithVersion("v1"))
 }

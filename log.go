@@ -2,9 +2,18 @@ package statecharts
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"time"
 )
+
+// ErrInvalidSnapshot marks malformed or incompatible snapshot cache data.
+var ErrInvalidSnapshot = errors.New("statecharts: invalid snapshot")
+
+// ErrOutboundCollision marks two different durable send intents carrying
+// the same DeliveryID. A durable store must reject the second intent rather
+// than silently treating it as an idempotent retry of the first.
+var ErrOutboundCollision = errors.New("statecharts: outbound delivery ID collision")
 
 // EntryKind distinguishes durable inputs and the session-start boundary.
 // Everything else a chart does (<raise>, <cancel>, history recording, new
@@ -71,6 +80,42 @@ type Log interface {
 
 	// LastSeq returns the highest Seq recorded for sessionID, or 0 if none.
 	LastSeq(ctx context.Context, sessionID SessionID) (uint64, error)
+}
+
+// OutboundStatus is the durable lifecycle of an external send intent.
+type OutboundStatus string
+
+const (
+	OutboundPending  OutboundStatus = "pending"
+	OutboundResolved OutboundStatus = "resolved"
+)
+
+// OutboundResult is the recorded synchronous/asynchronous outcome.
+type OutboundResult struct {
+	Error     string
+	Execution bool
+	// Synchronous distinguishes an outcome returned by Send (and therefore
+	// reproduced during replay) from a callback/recovery failure, which is
+	// reported as a separate inbound platform event.
+	Synchronous bool
+}
+
+// OutboundMessage is one stable external send intent.
+type OutboundMessage struct {
+	SessionID  SessionID
+	DeliveryID DeliveryID
+	Request    SendRequest
+	Status     OutboundStatus
+	Result     OutboundResult
+}
+
+// DurableLog combines the WAL inbox/dedup and durable outbox boundary.
+type DurableLog interface {
+	Log
+	AppendIngress(ctx context.Context, entry LogEntry, deliveryID DeliveryID) (seq uint64, appended bool, err error)
+	StoreOutbound(ctx context.Context, message OutboundMessage) error
+	ResolveOutbound(ctx context.Context, sessionID SessionID, deliveryID DeliveryID, result OutboundResult) error
+	Outbounds(ctx context.Context, sessionID SessionID) ([]OutboundMessage, error)
 }
 
 // SnapshotStore persists Checkpoints, letting Rehydrate skip replaying a

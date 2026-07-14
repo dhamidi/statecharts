@@ -2,6 +2,11 @@ package statecharts
 
 import "fmt"
 
+// DeliveryID is an opaque, stable identity for one external delivery.
+// Applications must not interpret it; durable transports use it for inbox
+// deduplication and as an idempotency key.
+type DeliveryID string
+
 // EventType classifies where an Event originated, per SCXML 5.10.1.
 type EventType uint8
 
@@ -44,6 +49,7 @@ type Event struct {
 	Origin     Identifier
 	OriginType Identifier
 	InvokeID   Identifier
+	DeliveryID DeliveryID
 }
 
 // Payload type-asserts e.Data to T, the way callers are expected to recover

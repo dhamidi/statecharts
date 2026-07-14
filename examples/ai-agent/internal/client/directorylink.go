@@ -163,6 +163,5 @@ func BuildDirectoryLinkChart(serverAddr string) (*statecharts.Chart, error) {
 				),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &directoryLinkModel{ServerAddr: serverAddr} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &directoryLinkModel{ServerAddr: serverAddr} }), statecharts.WithVersion("v1"))
 }

@@ -153,7 +153,7 @@ decides on its own when to call a tool.
   restart for real on every replay after a restart (see `Instance.startInvoke`);
   spawning a dedicated, non-durable actor per turn sidesteps that entirely.
 - `LLMDispatchProcessor` (a `statecharts.IOProcessor`, installed via
-  `actors.WithFallback`) -- the only way a chart action (which only ever
+  `actors.WithIOProcessor("llm", factory)`) -- the only way a chart action (which only ever
   gets an `ExecContext`, never a `*actors.System`) can spawn a new actor and
   drive a real streaming provider call from a goroutine.
 - `ToolRegistryActor` (non-durable, singleton) -- the executor role for a

@@ -9,7 +9,7 @@ import (
 )
 
 // TestFallbackRoutesToOtherSystemAndReplyRoutesBack is the round-trip case
-// WithFallback and Bridge exist for: an actor in sysA addresses a
+// WithSCXMLPeer and Bridge exist for: an actor in sysA addresses a
 // node-qualified actor ID that belongs to sysB, sysA's own routing doesn't
 // recognize it, the fallback forwards it into sysB, and the reply -- sent
 // by the responding actor to ev.Origin, exactly like any other reply --
@@ -25,7 +25,7 @@ func TestFallbackRoutesToOtherSystemAndReplyRoutesBack(t *testing.T) {
 	// sysA -- built first here -- as its target, so sysA's Bridge starts
 	// with a nil target and is wired up with SetTarget once sysB exists.
 	bridgeToB := NewBridge("warehouse-b", nil, "warehouse-a")
-	sysA := NewSystem(WithFallback(bridgeToB))
+	sysA := NewSystem(WithSCXMLPeer(bridgeToB))
 	if err := sysA.Register(caller); err != nil {
 		t.Fatalf("Register(caller): %v", err)
 	}
@@ -33,7 +33,7 @@ func TestFallbackRoutesToOtherSystemAndReplyRoutesBack(t *testing.T) {
 		t.Fatalf("Spawn(caller-1): %v", err)
 	}
 
-	sysB := NewSystem(WithFallback(NewBridge("warehouse-a", sysA, "warehouse-b")))
+	sysB := NewSystem(WithSCXMLPeer(NewBridge("warehouse-a", sysA, "warehouse-b")))
 	if err := sysB.Register(responder); err != nil {
 		t.Fatalf("Register(responder): %v", err)
 	}
@@ -79,7 +79,7 @@ func TestFallbackRejectsNameOutsideItsNamespace(t *testing.T) {
 	chart := buildCommTestChart("nobody-home")
 
 	sysB := NewSystem()
-	sysA := NewSystem(WithFallback(NewBridge("warehouse-b", sysB, "warehouse-a")))
+	sysA := NewSystem(WithSCXMLPeer(NewBridge("warehouse-b", sysB, "warehouse-a")))
 	if err := sysA.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestFallbackRejectsNameNotSpawnedInTargetSystem(t *testing.T) {
 	chart := buildCommTestChart("billing@warehouse-b")
 
 	sysB := NewSystem() // "billing" never spawned here
-	sysA := NewSystem(WithFallback(NewBridge("warehouse-b", sysB, "warehouse-a")))
+	sysA := NewSystem(WithSCXMLPeer(NewBridge("warehouse-b", sysB, "warehouse-a")))
 	if err := sysA.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestFallbackRejectsNameNotSpawnedInTargetSystem(t *testing.T) {
 }
 
 // TestFallbackSendDoesNotBlockSender proves the non-blocking contract every
-// IOProcessor.Send must honor (see the package doc and WithFallback) holds
+// IOProcessor.Send must honor (see the package doc and WithSCXMLPeer) holds
 // for the fallback path too: the target actor's own action is wedged
 // indefinitely, so if Bridge.Send (or routingProcessor.Send's delegation to
 // it) blocked on delivery, sysA.Tell below would hang until the test's
@@ -155,8 +155,7 @@ func TestFallbackSendDoesNotBlockSender(t *testing.T) {
 	})
 	wedgedChart, err := statecharts.Build(
 		statecharts.Atomic("wedged", statecharts.On("ping", statecharts.Then(wedge))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build(wedgedChart): %v", err)
 	}
@@ -175,13 +174,12 @@ func TestFallbackSendDoesNotBlockSender(t *testing.T) {
 	})
 	callerChart, err := statecharts.Build(
 		statecharts.Atomic("idle", statecharts.On("go", statecharts.Then(sendPing))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build(callerChart): %v", err)
 	}
 
-	sysA := NewSystem(WithFallback(NewBridge("warehouse-b", sysB, "warehouse-a")))
+	sysA := NewSystem(WithSCXMLPeer(NewBridge("warehouse-b", sysB, "warehouse-a")))
 	if err := sysA.Register(callerChart); err != nil {
 		t.Fatalf("Register(callerChart): %v", err)
 	}
@@ -216,10 +214,10 @@ func TestBridgeUsesSystemNodeNamesForQualifiedRoundTrip(t *testing.T) {
 	caller := buildCallerChart(&dms, "responder-1@warehouse-b")
 
 	toB := NewBridge("warehouse-b", nil, "ignored-source-name")
-	sysA := NewSystem(WithNodeName("warehouse-a"), WithFallback(toB))
+	sysA := NewSystem(WithNodeName("warehouse-a"), WithSCXMLPeer(toB))
 	sysB := NewSystem(
 		WithNodeName("warehouse-b"),
-		WithFallback(NewBridge("warehouse-a", sysA, "ignored-target-name")),
+		WithSCXMLPeer(NewBridge("warehouse-a", sysA, "ignored-target-name")),
 	)
 	toB.SetTarget(sysB)
 	if err := sysA.Register(caller); err != nil {
@@ -261,8 +259,7 @@ func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 	})
 	targetChart, err := statecharts.Build(
 		statecharts.Atomic("bridge-target", statecharts.On("ping", statecharts.Then(targetAction))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build target: %v", err)
 	}
@@ -279,14 +276,13 @@ func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 	})
 	sourceChart, err := statecharts.Build(
 		statecharts.Atomic("bridge-source", statecharts.On("go", statecharts.Then(send))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build source: %v", err)
 	}
 	sysA := NewSystem(
 		WithNodeName("warehouse-a"),
-		WithFallback(NewBridge("warehouse-b", sysB, "warehouse-a")),
+		WithSCXMLPeer(NewBridge("warehouse-b", sysB, "warehouse-a")),
 	)
 	if err := sysA.Register(sourceChart); err != nil {
 		t.Fatalf("Register source: %v", err)
@@ -323,16 +319,15 @@ func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 func TestBridgeAsyncFailureReturnsToSendingActor(t *testing.T) {
 	ctx := context.Background()
 	log := openTestLog(t)
-	store := &toggleLoadSnapshotStore{SnapshotStore: log}
+	store := &toggleLoadSnapshotStore{Storage: log}
 	target, err := statecharts.Build(
 		statecharts.Atomic("bridge-failure-target"),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build target: %v", err)
 	}
 	sysB := NewSystem(
-		WithNodeName("warehouse-b"), WithLog(log), WithSnapshotStore(store), WithIdleTimeout(0),
+		WithNodeName("warehouse-b"), WithStorage(store), WithIdleTimeout(0),
 	)
 	if err := sysB.Register(target); err != nil {
 		t.Fatalf("Register target: %v", err)
@@ -353,7 +348,7 @@ func TestBridgeAsyncFailureReturnsToSendingActor(t *testing.T) {
 	sender := buildAsyncFailureSender(&dms, "target@warehouse-b")
 	sysA := NewSystem(
 		WithNodeName("warehouse-a"),
-		WithFallback(NewBridge("warehouse-b", sysB, "warehouse-a")),
+		WithSCXMLPeer(NewBridge("warehouse-b", sysB, "warehouse-a")),
 	)
 	if err := sysA.Register(sender); err != nil {
 		t.Fatalf("Register sender: %v", err)

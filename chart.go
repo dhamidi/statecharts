@@ -1,7 +1,9 @@
 package statecharts
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 )
 
@@ -12,6 +14,40 @@ type Chart struct {
 	byID         map[Identifier]*compiledState
 	order        []*compiledState // document order (pre-order traversal of the state tree)
 	newDatamodel func() any
+	version      string
+	codec        DatamodelCodec
+}
+
+// DatamodelCodec serializes the opaque chart datamodel. Decode must return a
+// fresh value shaped like prototype and must not mutate prototype.
+type DatamodelCodec interface {
+	Encode(any) ([]byte, error)
+	Decode([]byte, any) (any, error)
+}
+
+type jsonDatamodelCodec struct{}
+
+func (jsonDatamodelCodec) Encode(v any) ([]byte, error) { return json.Marshal(v) }
+func (jsonDatamodelCodec) Decode(b []byte, prototype any) (any, error) {
+	if prototype == nil {
+		var v any
+		err := json.Unmarshal(b, &v)
+		return v, err
+	}
+	t := reflect.TypeOf(prototype)
+	var v any
+	if t.Kind() == reflect.Pointer {
+		v = reflect.New(t.Elem()).Interface()
+	} else {
+		v = reflect.New(t).Interface()
+	}
+	if err := json.Unmarshal(b, v); err != nil {
+		return nil, err
+	}
+	if t.Kind() != reflect.Pointer {
+		v = reflect.ValueOf(v).Elem().Interface()
+	}
+	return v, nil
 }
 
 // BuildOption configures a Chart being built by Build.
@@ -25,6 +61,19 @@ type BuildOption func(*Chart)
 func WithNewDatamodel(fn func() any) BuildOption {
 	return func(c *Chart) { c.newDatamodel = fn }
 }
+
+// WithVersion assigns the opaque application version used to validate
+// snapshot caches. Change it whenever chart/reducer behavior or datamodel
+// compatibility changes; Rehydrate then ignores the old snapshot and
+// rebuilds state from the authoritative Log.
+func WithVersion(version string) BuildOption { return func(c *Chart) { c.version = version } }
+
+// WithDatamodelCodec overrides the default JSON datamodel codec used only
+// for transparent snapshot caches. The Log remains the source of truth.
+func WithDatamodelCodec(codec DatamodelCodec) BuildOption { return func(c *Chart) { c.codec = codec } }
+
+// Version returns the chart's opaque application version.
+func (c *Chart) Version() string { return c.version }
 
 // ID returns the chart's root state's ID, which identifies the chart itself
 // wherever a chart-level identity is needed. A Chart is otherwise
@@ -40,6 +89,20 @@ func (c *Chart) NewDatamodel() (v any, ok bool) {
 		return nil, false
 	}
 	return c.newDatamodel(), true
+}
+
+func (c *Chart) freshDatamodel(prototype any) any {
+	if v, ok := c.NewDatamodel(); ok {
+		return v
+	}
+	if prototype == nil {
+		return nil
+	}
+	t := reflect.TypeOf(prototype)
+	if t.Kind() == reflect.Pointer {
+		return reflect.New(t.Elem()).Interface()
+	}
+	return reflect.New(t).Elem().Interface()
 }
 
 type compiledState struct {
@@ -79,7 +142,7 @@ func (c *Chart) States() []Identifier {
 // validating every Initial/Target/history-default Identifier reference.
 // Errors are static, discovered here rather than at interpretation time.
 func Build(root StateSpec, opts ...BuildOption) (*Chart, error) {
-	c := &Chart{byID: make(map[Identifier]*compiledState)}
+	c := &Chart{byID: make(map[Identifier]*compiledState), codec: jsonDatamodelCodec{}}
 	docOrder := 0
 	compiled, err := compileState(c, root, nil, &docOrder)
 	if err != nil {

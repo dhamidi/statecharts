@@ -64,7 +64,10 @@ var updateConversationState = statecharts.Action(func(d *userModel, ec statechar
 func syncOne(ec statecharts.ExecContext, id protocol.ConversationID, summary conversationSummary) {
 	ec.Send("sync", statecharts.SendOptions{
 		Target: "directory",
-		Data:   protocol.ConversationSummary{ID: id, Title: summary.Title, State: summary.State},
+		Data: &directorySyncPayload{
+			TypeName: "aiagent.directory_sync",
+			Value:    protocol.ConversationSummary{ID: id, Title: summary.Title, State: summary.State},
+		},
 	})
 }
 
@@ -127,6 +130,5 @@ func BuildUserChart() (*statecharts.Chart, error) {
 		),
 		statecharts.WithNewDatamodel(func() any {
 			return &userModel{Conversations: map[protocol.ConversationID]conversationSummary{}}
-		}),
-	)
+		}), statecharts.WithVersion("v1"))
 }

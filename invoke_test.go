@@ -650,8 +650,8 @@ func TestInvokeChartRoundTripsThroughParentAndAutoForward(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if !strings.HasPrefix(string(childOrigin), "#_scxml_") || childOriginType != "scxml" {
-		t.Fatalf("child #_parent event origin = %q/%q, want #_scxml_<child-session>/scxml", childOrigin, childOriginType)
+	if !strings.HasPrefix(string(childOrigin), "#_scxml_") || childOriginType != SCXMLEventProcessor {
+		t.Fatalf("child #_parent event origin = %q/%q, want standard SCXML metadata", childOrigin, childOriginType)
 	}
 
 	// The parent has no transition of its own for "ping" -- it only

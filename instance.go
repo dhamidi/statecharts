@@ -66,32 +66,81 @@ type actorRequest struct {
 	event      Event
 	fn         func() // reqTimerFired only
 	checkpoint func(Snapshot) error
-	entry      LogEntry      // reqReplayTimerFired only
-	clock      Clock         // reqFinishReplay only
-	reply      chan error    // reqSend/reqStop/reqCheckpoint/reqReplayTimerFired/reqFinishReplay
-	snapOut    chan Snapshot // reqSnapshot only
-	invokesOut chan bool     // reqActiveInvokes only
+	entry      LogEntry            // reqReplayTimerFired only
+	clock      Clock               // reqFinishReplay only
+	reply      chan error          // reqSend/reqStop/reqCheckpoint/reqReplayTimerFired/reqFinishReplay
+	snapOut    chan snapshotResult // reqSnapshot only
+	invokesOut chan bool           // reqActiveInvokes only
+}
+
+type snapshotResult struct {
+	snapshot Snapshot
+	err      error
 }
 
 // Option configures an Instance built by New or Restore.
 type Option func(*instanceConfig)
 
 type instanceConfig struct {
-	io             IOProcessor
-	clock          Clock
-	logger         Logger
-	inboxSize      int
-	ingressHook    func(Event) error
-	timerFiredHook func(Identifier, Identifier, Identifier, Event) error
-	idGen          IDGenerator
-	sessionID      SessionID
+	processors               []processorRegistration
+	configuredProcessorTypes map[Identifier]bool
+	clock                    Clock
+	logger                   Logger
+	inboxSize                int
+	ingressHook              func(Event) error
+	timerFiredHook           func(Identifier, Identifier, Identifier, Event) error
+	idGen                    IDGenerator
+	sessionID                SessionID
+	deliveryNamespace        string
+}
+
+var incarnationSeq atomic.Uint64
+
+// WithDeliveryNamespace sets a stable external-delivery namespace. It is
+// primarily intended for durable runtimes; ordinary instances receive a
+// unique incarnation namespace automatically.
+func WithDeliveryNamespace(namespace string) Option {
+	return func(c *instanceConfig) { c.deliveryNamespace = namespace }
+}
+
+type processorRegistration struct {
+	typ Identifier
+	io  IOProcessor
 }
 
 // WithIOProcessor sets the IOProcessor used for genuinely external dispatch.
 // Defaults to LocalIOProcessor, which reports unreachable targets instead of
 // silently discarding them.
-func WithIOProcessor(p IOProcessor) Option {
-	return func(c *instanceConfig) { c.io = p }
+func WithIOProcessor(typ Identifier, p IOProcessor) Option {
+	return func(c *instanceConfig) {
+		if typ == "" || p == nil {
+			panic("statecharts: IOProcessor type and processor must be non-empty")
+		}
+		if c.configuredProcessorTypes[typ] {
+			panic(fmt.Sprintf("statecharts: duplicate IOProcessor type %q", typ))
+		}
+		c.configuredProcessorTypes[typ] = true
+		if typ == SCXMLEventProcessor {
+			c.processors[0].io = p
+			return
+		}
+		c.processors = append(c.processors, processorRegistration{typ, p})
+	}
+}
+
+// withIOProcessorReplacement is the replay bootstrap counterpart to
+// WithIOProcessor. It replaces a registration without treating the replay
+// gate as a duplicate user registration.
+func withIOProcessorReplacement(typ Identifier, p IOProcessor) Option {
+	return func(c *instanceConfig) {
+		for i := range c.processors {
+			if c.processors[i].typ == typ {
+				c.processors[i].io = p
+				return
+			}
+		}
+		c.processors = append(c.processors, processorRegistration{typ, p})
+	}
 }
 
 // WithClock sets the Clock used for delayed-send timers. Defaults to the
@@ -166,11 +215,12 @@ func WithSessionID(id SessionID) Option {
 
 func defaultInstanceConfig() instanceConfig {
 	return instanceConfig{
-		io:        NewLocalIOProcessor(),
-		clock:     NewRealClock(),
-		logger:    NoopLogger,
-		inboxSize: 1,
-		idGen:     IDGeneratorFunc(func() SessionID { return SessionID(rand.Text()) }),
+		processors:               []processorRegistration{{SCXMLEventProcessor, NewLocalIOProcessor()}},
+		configuredProcessorTypes: make(map[Identifier]bool),
+		clock:                    NewRealClock(),
+		logger:                   NoopLogger,
+		inboxSize:                1,
+		idGen:                    IDGeneratorFunc(func() SessionID { return SessionID(rand.Text()) }),
 	}
 }
 
@@ -188,7 +238,13 @@ func New(chart *Chart, datamodel any, opts ...Option) *Instance {
 	if id == "" {
 		id = cfg.idGen.NewID()
 	}
-	return newInstance(chart, newInterpretation(chart, datamodel), cfg, id)
+	ip := newInterpretation(chart, datamodel)
+	if cfg.deliveryNamespace != "" {
+		ip.deliveryNamespace = cfg.deliveryNamespace
+	} else {
+		ip.deliveryNamespace = fmt.Sprintf("incarnation-%d", incarnationSeq.Add(1))
+	}
+	return newInstance(chart, ip, cfg, id)
 }
 
 func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id SessionID) *Instance {
@@ -201,7 +257,12 @@ func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id Sessio
 		readyCh:     make(chan struct{}),
 	}
 
-	ip.io = cfg.io
+	ip.ioProcessorsByType = make(map[Identifier]IOProcessor, len(cfg.processors))
+	ip.ioProcessorOrder = ip.ioProcessorOrder[:0]
+	for _, registered := range cfg.processors {
+		ip.ioProcessorsByType[registered.typ] = registered.io
+		ip.ioProcessorOrder = append(ip.ioProcessorOrder, registered.typ)
+	}
 	ip.clock = &actorClock{real: cfg.clock, inbox: in.inbox, done: in.doneCh}
 	ip.logger = cfg.logger
 	ip.timerFiredHook = cfg.timerFiredHook
@@ -210,7 +271,9 @@ func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id Sessio
 	ip.name = chart.ID()
 	in.ip = ip
 
-	cfg.io.Attach(in)
+	for _, registered := range cfg.processors {
+		registered.io.Attach(in)
+	}
 	return in
 }
 
@@ -549,7 +612,7 @@ func (in *Instance) run() {
 			break
 		}
 
-		var snapOut chan Snapshot
+		var snapOut chan snapshotResult
 		var invokesOut chan bool
 		var reqErr error
 		switch req.kind {
@@ -572,7 +635,11 @@ func (in *Instance) run() {
 		case reqSnapshot:
 			snapOut = req.snapOut
 		case reqCheckpoint:
-			reqErr = req.checkpoint(in.buildSnapshot())
+			var snap Snapshot
+			snap, reqErr = in.buildSnapshot()
+			if reqErr == nil {
+				reqErr = req.checkpoint(snap)
+			}
 			if reqErr == nil {
 				in.ip.running = false
 			}
@@ -597,7 +664,8 @@ func (in *Instance) run() {
 		in.publishConfig()
 
 		if snapOut != nil {
-			snapOut <- in.buildSnapshot()
+			snap, err := in.buildSnapshot()
+			snapOut <- snapshotResult{snap, err}
 		}
 		if invokesOut != nil {
 			invokesOut <- len(in.ip.invokesByID) > 0

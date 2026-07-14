@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
@@ -13,11 +12,12 @@ import (
 	"github.com/dhamidi/statecharts/examples/ai-agent/internal/protocol"
 )
 
-// dispatchPayload is "generate"'s payload from ConversationActor to
-// LLMDispatchProcessor (via the WithFallback hop, never logged -- see
-// router.go's routingProcessor.Send) and, as "start", from
-// LLMDispatchProcessor to the llmrequest actor it just spawned. Not
-// JSON-wrapped: neither hop ever reaches system.deliver's write-ahead log.
+// dispatchPayload is "generate"'s durable outbound payload from
+// ConversationActor to LLMDispatchProcessor (registered as the explicit
+// "llm" processor) and, as "start", from
+// LLMDispatchProcessor to the llmrequest actor it just spawned. The first
+// hop is encoded in ConversationActor's durable outbox; the second target is
+// ephemeral and receives the same decoded concrete type.
 type dispatchPayload struct {
 	ConversationID protocol.ConversationID
 	Request        llm.GenerateRequest
@@ -37,7 +37,7 @@ type llmRequestModel struct {
 
 var recordRequestStart = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[dispatchPayload](ev)
+	payload, ok := statecharts.Payload[*dispatchPayload](ev)
 	if !ok {
 		return nil
 	}
@@ -69,7 +69,7 @@ var applyProviderChunk = statecharts.Action(func(d *llmRequestModel, ec statecha
 func broadcastDelta(ec statecharts.ExecContext, conversationID protocol.ConversationID, kind, text string) {
 	ec.Send("broadcast", statecharts.SendOptions{
 		Target: "fanout",
-		Data: fanoutBroadcast{
+		Data: &fanoutBroadcast{
 			ConversationID: conversationID,
 			Kind:           "delta",
 			Frame:          deltaFrame{Kind: kind, Text: text},
@@ -139,12 +139,11 @@ func BuildLLMRequestChart() (*statecharts.Chart, error) {
 				statecharts.Final("done"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &llmRequestModel{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &llmRequestModel{} }), statecharts.WithVersion("v1"))
 }
 
 // LLMDispatchProcessor is the statecharts.IOProcessor installed via
-// actors.WithFallback: the only way a chart action (which only ever gets
+// actors.WithIOProcessor: the way a chart action (which only ever gets
 // an ExecContext, never a *actors.System) can start a new actor and drive a
 // real streaming provider call from a goroutine. Its Send is reached only
 // when ConversationActor addresses a not-yet-spawned llmrequest actor's own
@@ -154,21 +153,18 @@ type LLMDispatchProcessor struct {
 	provider llm.Provider
 
 	// sys is filled in by SetSystem, once, before any traffic flows --
-	// actors.WithFallback needs a complete IOProcessor before NewSystem can
+	// actors.WithIOProcessor needs a complete IOProcessor before NewSystem can
 	// even return the *System this processor needs to Spawn/Tell against,
 	// the same chicken-and-egg actors.Bridge already solves via its own
 	// NewBridge(nil)+SetTarget.
 	sys *actors.System
-
-	mu      sync.Mutex
-	cancels map[statecharts.Identifier]context.CancelFunc
 }
 
 // NewLLMDispatchProcessor returns an LLMDispatchProcessor driving provider.
 // Call SetSystem before starting the System it will be installed on via
-// actors.WithFallback.
+// actors.WithIOProcessor.
 func NewLLMDispatchProcessor(provider llm.Provider) *LLMDispatchProcessor {
-	return &LLMDispatchProcessor{provider: provider, cancels: map[statecharts.Identifier]context.CancelFunc{}}
+	return &LLMDispatchProcessor{provider: provider}
 }
 
 // SetSystem supplies the *actors.System this processor spawns per-turn
@@ -187,7 +183,7 @@ func (p *LLMDispatchProcessor) Send(ctx context.Context, req statecharts.SendReq
 	if req.Type != "llm" {
 		return fmt.Errorf("examples/ai-agent: LLMDispatchProcessor: unsupported send (target %q, type %q)", req.Target, req.Type)
 	}
-	payload, ok := req.Data.(dispatchPayload)
+	payload, ok := req.Data.(*dispatchPayload)
 	if !ok {
 		return fmt.Errorf("examples/ai-agent: LLMDispatchProcessor: unexpected data type %T", req.Data)
 	}
@@ -201,22 +197,11 @@ func (p *LLMDispatchProcessor) Send(ctx context.Context, req statecharts.SendReq
 		return fmt.Errorf("examples/ai-agent: LLMDispatchProcessor: start %q: %w", req.Target, err)
 	}
 
-	reqCtx, cancel := context.WithCancel(context.Background())
-	p.mu.Lock()
-	p.cancels[req.SendID] = cancel
-	p.mu.Unlock()
-
 	target := req.Target
 	sys := p.sys
 	provider := p.provider
 	go func() {
-		defer func() {
-			p.mu.Lock()
-			delete(p.cancels, req.SendID)
-			p.mu.Unlock()
-		}()
-
-		err := provider.Generate(reqCtx, payload.Request, func(c llm.Chunk) {
+		err := provider.Generate(context.Background(), payload.Request, func(c llm.Chunk) {
 			_ = sys.Tell(context.Background(), target, statecharts.Event{
 				Name: "provider_chunk", Type: statecharts.EventExternal, Data: c,
 			})
@@ -232,17 +217,5 @@ func (p *LLMDispatchProcessor) Send(ctx context.Context, req statecharts.SendReq
 		})
 	}()
 
-	return nil
-}
-
-// Cancel implements statecharts.IOProcessor, best-effort cancelling the
-// goroutine driving sendID's provider call, if it's still running.
-func (p *LLMDispatchProcessor) Cancel(ctx context.Context, sendID statecharts.Identifier) error {
-	p.mu.Lock()
-	cancel, ok := p.cancels[sendID]
-	p.mu.Unlock()
-	if ok {
-		cancel()
-	}
 	return nil
 }

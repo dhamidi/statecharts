@@ -6,7 +6,7 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -14,11 +14,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
-
-	_ "modernc.org/sqlite"
 
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/sqllog"
@@ -81,27 +78,8 @@ func parseTools(raw string) []protocol.ToolName {
 	return tools
 }
 
-// openLog opens (creating if necessary) a sqllog.Log backed by a SQLite
-// database at dbPath, creating its parent directory if needed.
-func openLog(dbPath string) (*sqllog.Log, error) {
-	if dir := filepath.Dir(dbPath); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("mkdir %q: %w", dir, err)
-		}
-	}
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open %q: %w", dbPath, err)
-	}
-	// This example's actors.System checkpoints multiple durable actors
-	// concurrently (e.g. on Stop), each its own goroutine issuing its own
-	// query against this *sql.DB -- SQLite has no real concurrent-writer
-	// story, so more than one physical connection intermittently trips
-	// "database is locked". Pinning the pool to a single connection
-	// serializes them instead, at some throughput cost that's a complete
-	// non-issue for a localhost demo.
-	db.SetMaxOpenConns(1)
-	return sqllog.New(db, sqllog.SQLite)
+func openLog(dbPath string) (*sqllog.Storage, error) {
+	return sqllog.OpenSQLite(dbPath)
 }
 
 // startServer wires up and starts the workspace server's actors.System and
@@ -119,7 +97,7 @@ func startServer(ctx context.Context, addr, dbPath, llmChoice, llmModel string) 
 		return "", nil, err
 	}
 	clock := statecharts.NewRealClock()
-	sys, _ := server.NewSystem(logStore, logStore, clock, statecharts.NoopLogger, provider)
+	sys, _ := server.NewSystem(logStore, clock, statecharts.NoopLogger, provider)
 	if err := server.Setup(ctx, sys, clock); err != nil {
 		return "", nil, err
 	}
@@ -139,8 +117,10 @@ func startServer(ctx context.Context, addr, dbPath, llmChoice, llmModel string) 
 	fmt.Printf("ai-agent: serving on %s\n", base)
 
 	return base, func(shutdownCtx context.Context) error {
-		_ = httpSrv.Shutdown(shutdownCtx)
-		return sys.Stop(shutdownCtx)
+		httpErr := httpSrv.Shutdown(shutdownCtx)
+		systemErr := sys.Stop(shutdownCtx)
+		closeErr := logStore.Close()
+		return errors.Join(httpErr, systemErr, closeErr)
 	}, nil
 }
 

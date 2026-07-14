@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -41,7 +42,7 @@ func waitValue(t *testing.T, rt *counterRuntime, name string, want int) {
 func TestDurableIdempotenceAndRecovery(t *testing.T) {
 	path := t.TempDir() + "/counters.db"
 	ctx1, cancel1 := context.WithCancel(context.Background())
-	store1, db1, err := openLog(path)
+	store1, err := openLog(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,16 +60,29 @@ func TestDurableIdempotenceAndRecovery(t *testing.T) {
 	if err := sys1.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	cp, ok, err := store1.Load(context.Background(), "red")
+	if err != nil || !ok {
+		t.Fatalf("load red checkpoint: ok=%v err=%v", ok, err)
+	}
+	if cp.Seq == 0 {
+		t.Fatal("red checkpoint sequence = 0, want real log boundary")
+	}
+	var checkpointed counterModel
+	if err := json.Unmarshal(cp.Snapshot.Datamodel, &checkpointed); err != nil {
+		t.Fatalf("decode red checkpoint datamodel: %v", err)
+	}
+	if checkpointed.Value != 1 || !checkpointed.Processed["same-write"] {
+		t.Fatalf("red checkpoint datamodel = %#v, want value 1 with same-write processed", checkpointed)
+	}
 	cancel1()
-	db1.Close()
+	store1.Close()
 
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	store2, db2, err := openLog(path)
+	store2, err := openLog(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
 	rt2, err := setupCounters(ctx2, store2)
 	sys2 := rt2.counters
 	if err != nil {
@@ -85,11 +99,10 @@ func TestDurableIdempotenceAndRecovery(t *testing.T) {
 func TestFourthActivationUpdatesResidencyProjection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store, db, err := openLog(t.TempDir() + "/counters.db")
+	store, err := openLog(t.TempDir() + "/counters.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
 	rt, err := setupCounters(ctx, store)
 	if err != nil {
 		t.Fatal(err)
@@ -212,11 +225,10 @@ func TestServerPageStartsDatastarEventStreamAndCountersAreClickable(t *testing.T
 func TestServerUIIncrementEndpointUpdatesCounter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store, db, err := openLog(t.TempDir() + "/counters.db")
+	store, err := openLog(t.TempDir() + "/counters.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
 	rt, err := setupCounters(ctx, store)
 	if err != nil {
 		t.Fatal(err)
@@ -265,11 +277,10 @@ func TestEventStreamColorSelection(t *testing.T) {
 func TestEventStreamDoesNotRepeatUnchangedSelectedCounters(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store, db, err := openLog(t.TempDir() + "/counters.db")
+	store, err := openLog(t.TempDir() + "/counters.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
 	rt, err := setupCounters(ctx, store)
 	if err != nil {
 		t.Fatal(err)

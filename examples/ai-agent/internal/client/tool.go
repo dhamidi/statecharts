@@ -152,6 +152,5 @@ func BuildToolChart(serverAddr string) (*statecharts.Chart, error) {
 				),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &toolModel{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &toolModel{} }), statecharts.WithVersion("v1"))
 }

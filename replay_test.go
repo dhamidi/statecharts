@@ -277,10 +277,10 @@ func TestRestoreFromSnapshot(t *testing.T) {
 	if !hasState(in2.Configuration(), "open") {
 		t.Fatalf("restored configuration = %v, want 'open'", in2.Configuration())
 	}
-	// onentry/onexit must NOT re-run: OpenCount should still be 0 on the
-	// fresh datamodel (Restore skips executable content, unlike replay).
-	if d2.OpenCount != 0 {
-		t.Fatalf("d2.OpenCount = %d, want 0 (Restore must not re-run actions)", d2.OpenCount)
+	// Restore must populate the caller-provided datamodel from the snapshot,
+	// without re-running the action that originally produced this count.
+	if d2.OpenCount != 1 {
+		t.Fatalf("d2.OpenCount = %d, want restored value 1", d2.OpenCount)
 	}
 
 	// the restored instance must still work going forward.
@@ -302,6 +302,7 @@ func TestRestoreUsesConfiguredClockForPendingSendDeadline(t *testing.T) {
 	d := &delayedAbortModel{}
 	snap := Snapshot{
 		Version:       snapshotVersion,
+		Datamodel:     []byte(`{}`),
 		Configuration: []Identifier{"running"},
 		Running:       true,
 		PendingSends: []PendingSend{
@@ -499,6 +500,53 @@ func TestRehydrateIgnoresUnsupportedCheckpointAndReplaysLog(t *testing.T) {
 	}
 }
 
+func TestRehydrateRejectedSnapshotLeavesProvidedDatamodelUntouchedBeforeReplay(t *testing.T) {
+	ctx := context.Background()
+	log := newMemLog()
+	store := newMemSnapshotStore()
+	sessionID := SessionID("rejected-snapshot-datamodel")
+	type model struct{ Applied int }
+	apply := Action(func(d *model, _ ExecContext) error {
+		d.Applied++
+		return nil
+	})
+	chart, err := Build(
+		Compound("root", "ready", Children(Atomic("ready", On("apply", Then(apply))))),
+		WithVersion("rejected-snapshot-v1"),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	seq, err := log.Append(ctx, LogEntry{
+		SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(),
+		Event: Event{Name: "apply", Type: EventExternal},
+	})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	badModel, err := chart.codec.Encode(&model{Applied: 500})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	bad := Snapshot{
+		Version: snapshotVersion, ChartVersion: chart.Version(), Datamodel: badModel,
+		Configuration: []Identifier{"missing"}, Running: true,
+	}
+	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: bad, Seq: seq}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	d := &model{Applied: 99}
+	in, err := Rehydrate(ctx, chart, d, log, store, sessionID, NoopIOProcessor)
+	if err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	defer in.Stop(ctx)
+	if d.Applied != 100 {
+		t.Fatalf("provided datamodel Applied = %d, want 100 (99 untouched by rejected cache, then one full-replay event)", d.Applied)
+	}
+}
+
 func TestRehydrateReplaysExplicitSends(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
@@ -509,7 +557,7 @@ func TestRehydrateReplaysExplicitSends(t *testing.T) {
 	// the log is always written ahead of the event being applied.
 	chart := doorChart(t)
 	d := &Door{}
-	in := New(chart, d, WithIOProcessor(NoopIOProcessor))
+	in := New(chart, d, WithIOProcessor(SCXMLEventProcessor, NoopIOProcessor))
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -605,10 +653,9 @@ func TestRehydrateUsesCheckpointToSkipReplay(t *testing.T) {
 	if !hasState(in2.Configuration(), "closed") {
 		t.Fatalf("configuration = %v, want 'closed' (checkpoint + post-checkpoint replay)", in2.Configuration())
 	}
-	// OpenCount must be 0: the checkpoint already reflects the one
-	// open.request (its action ran once, live); replay must not re-run it.
-	if d2.OpenCount != 0 {
-		t.Fatalf("d2.OpenCount = %d, want 0 (checkpointed action must not replay)", d2.OpenCount)
+	// Cache or full replay must produce the same caller-observable model.
+	if d2.OpenCount != 1 {
+		t.Fatalf("d2.OpenCount = %d, want historical value 1", d2.OpenCount)
 	}
 	if err := in2.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -718,7 +765,7 @@ func TestRehydrateSuppressesRealDispatchDuringReplayThenGoesLive(t *testing.T) {
 	}
 
 	spy := &spyIOProcessor{}
-	in := New(chart, nil, WithIOProcessor(spy))
+	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, spy))
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -787,7 +834,7 @@ func TestRehydrateIOProcessorsReportedDuringAndAfterReplay(t *testing.T) {
 	}
 
 	liveIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://live")}}}
-	in := New(chart, nil, WithIOProcessor(liveIO))
+	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, liveIO))
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -1600,6 +1647,7 @@ func TestInvokeResumeParamsEventIsUnbound(t *testing.T) {
 					),
 				),
 			),
+			WithVersion("resume-event-unbound-v1"),
 		)
 		if err != nil {
 			t.Fatalf("Build: %v", err)
@@ -1794,15 +1842,13 @@ func (s *spyIOProcessor) Send(ctx context.Context, req SendRequest) error {
 	s.sendCount++
 	return nil
 }
-func (s *spyIOProcessor) Cancel(ctx context.Context, sendID Identifier) error { return nil }
 
 type capturingIOProcessor struct {
 	dispatcher Dispatcher
 }
 
-func (c *capturingIOProcessor) Attach(d Dispatcher)                      { c.dispatcher = d }
-func (c *capturingIOProcessor) Send(context.Context, SendRequest) error  { return nil }
-func (c *capturingIOProcessor) Cancel(context.Context, Identifier) error { return nil }
+func (c *capturingIOProcessor) Attach(d Dispatcher)                     { c.dispatcher = d }
+func (c *capturingIOProcessor) Send(context.Context, SendRequest) error { return nil }
 
 func TestRehydrateStopsStartedInstanceWhenReplayFails(t *testing.T) {
 	ctx := context.Background()

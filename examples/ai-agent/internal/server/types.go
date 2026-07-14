@@ -6,17 +6,19 @@
 package server
 
 import (
+	"encoding/json"
+	"fmt"
+
 	"github.com/dhamidi/statecharts"
 
 	"github.com/dhamidi/statecharts/examples/ai-agent/internal/protocol"
 )
 
-// Every Event.Data that can reach a *durable* target (a "conversation" or
-// "user" actor) must be RegisterDataType-registered, since a durable
-// actor's Log.Append (system.deliver) requires DataMarshaler. Non-durable
-// targets (fanout, toolregistry, directory, llmrequest, connections) and
-// the LLMDispatchProcessor fallback hop are never logged, so their payloads
-// are plain Go structs with no such requirement.
+// Every Event.Data that crosses a durable boundary must be registered: both
+// inbound events logged by a durable target and outbound intents emitted by
+// a durable sender. The latter remains true when the recipient itself is an
+// ephemeral actor, because the sender's outbox must be able to retry the
+// original typed request after a crash.
 
 // UserMessageData is "user_message"'s payload -> conversation.
 type UserMessageData struct {
@@ -74,10 +76,78 @@ type CatchupRequestData struct {
 
 type catchupRequestPayload = statecharts.JSONData[CatchupRequestData]
 
+type directorySyncPayload = statecharts.JSONData[protocol.ConversationSummary]
+
+func marshalActorData(typeName string, value any) (string, []byte, error) {
+	payload, err := json.Marshal(value)
+	return typeName, payload, err
+}
+
+func (p *dispatchPayload) MarshalData() (string, []byte, error) {
+	return marshalActorData("aiagent.dispatch", p)
+}
+
+func (p *dispatchPayload) UnmarshalData(payload []byte) error { return json.Unmarshal(payload, p) }
+
+func (p *toolOffer) MarshalData() (string, []byte, error) {
+	return marshalActorData("aiagent.tool_offer", p)
+}
+
+func (p *toolOffer) UnmarshalData(payload []byte) error { return json.Unmarshal(payload, p) }
+
+func (p *catchupMessage) MarshalData() (string, []byte, error) {
+	return marshalActorData("aiagent.catchup_message", p)
+}
+
+func (p *catchupMessage) UnmarshalData(payload []byte) error { return json.Unmarshal(payload, p) }
+
+type fanoutBroadcastWire struct {
+	ConversationID protocol.ConversationID
+	Kind           string
+	Seq            int
+	Frame          json.RawMessage
+}
+
+func (p *fanoutBroadcast) MarshalData() (string, []byte, error) {
+	frame, err := json.Marshal(p.Frame)
+	if err != nil {
+		return "", nil, err
+	}
+	return marshalActorData("aiagent.fanout_broadcast", fanoutBroadcastWire{
+		ConversationID: p.ConversationID,
+		Kind:           p.Kind,
+		Seq:            p.Seq,
+		Frame:          frame,
+	})
+}
+
+func (p *fanoutBroadcast) UnmarshalData(payload []byte) error {
+	var wire fanoutBroadcastWire
+	if err := json.Unmarshal(payload, &wire); err != nil {
+		return err
+	}
+	p.ConversationID, p.Kind, p.Seq = wire.ConversationID, wire.Kind, wire.Seq
+	switch wire.Kind {
+	case "message":
+		var frame protocol.MessageFrame
+		if err := json.Unmarshal(wire.Frame, &frame); err != nil {
+			return err
+		}
+		p.Frame = frame
+	case "delta":
+		var frame deltaFrame
+		if err := json.Unmarshal(wire.Frame, &frame); err != nil {
+			return err
+		}
+		p.Frame = frame
+	default:
+		return fmt.Errorf("unknown fanout frame kind %q", wire.Kind)
+	}
+	return nil
+}
+
 // registerDataTypes must run once at startup, before any durable actor can
-// receive traffic (see the six call sites' own comments below, matching
-// issue #4's acceptance criteria: every Event.Data reaching a durable actor
-// is registered).
+// receive traffic or emit an outbound intent.
 func registerDataTypes() {
 	statecharts.RegisterDataType("aiagent.user_message", func() statecharts.DataUnmarshaler {
 		return &userMessagePayload{TypeName: "aiagent.user_message"}
@@ -97,4 +167,11 @@ func registerDataTypes() {
 	statecharts.RegisterDataType("aiagent.catchup_request", func() statecharts.DataUnmarshaler {
 		return &catchupRequestPayload{TypeName: "aiagent.catchup_request"}
 	})
+	statecharts.RegisterDataType("aiagent.directory_sync", func() statecharts.DataUnmarshaler {
+		return &directorySyncPayload{TypeName: "aiagent.directory_sync"}
+	})
+	statecharts.RegisterDataType("aiagent.dispatch", func() statecharts.DataUnmarshaler { return &dispatchPayload{} })
+	statecharts.RegisterDataType("aiagent.tool_offer", func() statecharts.DataUnmarshaler { return &toolOffer{} })
+	statecharts.RegisterDataType("aiagent.catchup_message", func() statecharts.DataUnmarshaler { return &catchupMessage{} })
+	statecharts.RegisterDataType("aiagent.fanout_broadcast", func() statecharts.DataUnmarshaler { return &fanoutBroadcast{} })
 }

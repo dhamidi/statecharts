@@ -111,7 +111,7 @@ var renewLeases = statecharts.Action(func(d *connectionModel, ec statecharts.Exe
 
 var forwardFanoutFrame = statecharts.Action(func(d *connectionModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	bc, ok := statecharts.Payload[fanoutBroadcast](ev)
+	bc, ok := statecharts.Payload[*fanoutBroadcast](ev)
 	if !ok {
 		return nil
 	}
@@ -126,7 +126,7 @@ var forwardFanoutFrame = statecharts.Action(func(d *connectionModel, ec statecha
 
 var forwardCatchupMessage = statecharts.Action(func(d *connectionModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	m, ok := statecharts.Payload[catchupMessage](ev)
+	m, ok := statecharts.Payload[*catchupMessage](ev)
 	if !ok {
 		return nil
 	}
@@ -184,6 +184,5 @@ func BuildConnectionChart() (*statecharts.Chart, error) {
 				statecharts.Final("closed", statecharts.OnEntry(teardownConnection)),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &connectionModel{Frames: make(chan sseFrame, 256)} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &connectionModel{Frames: make(chan sseFrame, 256)} }), statecharts.WithVersion("v1"))
 }

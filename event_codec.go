@@ -46,6 +46,7 @@ type EncodedEvent struct {
 	Origin      Identifier `json:"origin,omitempty"`
 	OriginType  Identifier `json:"origin_type,omitempty"`
 	InvokeID    Identifier `json:"invoke_id,omitempty"`
+	DeliveryID  DeliveryID `json:"delivery_id,omitempty"`
 	DataType    string     `json:"data_type,omitempty"`
 	DataPayload []byte     `json:"data_payload,omitempty"`
 }
@@ -57,7 +58,7 @@ type EncodedEvent struct {
 func EncodeEvent(ev Event) (EncodedEvent, error) {
 	enc := EncodedEvent{
 		Name: ev.Name, Type: ev.Type,
-		SendID: ev.SendID, Origin: ev.Origin, OriginType: ev.OriginType, InvokeID: ev.InvokeID,
+		SendID: ev.SendID, Origin: ev.Origin, OriginType: ev.OriginType, InvokeID: ev.InvokeID, DeliveryID: ev.DeliveryID,
 	}
 	if ev.Data == nil {
 		return enc, nil
@@ -84,7 +85,7 @@ func EncodeEvent(ev Event) (EncodedEvent, error) {
 func DecodeEvent(enc EncodedEvent) (Event, error) {
 	ev := Event{
 		Name: enc.Name, Type: enc.Type,
-		SendID: enc.SendID, Origin: enc.Origin, OriginType: enc.OriginType, InvokeID: enc.InvokeID,
+		SendID: enc.SendID, Origin: enc.Origin, OriginType: enc.OriginType, InvokeID: enc.InvokeID, DeliveryID: enc.DeliveryID,
 	}
 	if enc.DataType == "" {
 		return ev, nil

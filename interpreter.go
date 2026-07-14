@@ -33,12 +33,15 @@ type interpretation struct {
 	lastEvent     Event
 	hasLastEvent  bool
 
-	io         IOProcessor
-	clock      Clock
-	logger     Logger
-	pending    map[*pendingSendRecord]bool
-	sendSeq    int
-	pendingSeq int
+	ioProcessorsByType map[Identifier]IOProcessor
+	ioProcessorOrder   []Identifier
+	clock              Clock
+	logger             Logger
+	pending            map[*pendingSendRecord]bool
+	sendSeq            int
+	dispatchSeq        uint64
+	deliveryNamespace  string
+	pendingSeq         int
 
 	// statesToInvoke, activeInvokes, invokesByID, and invokeSeq are the
 	// <invoke> bookkeeping (SCXML 6.4): statesToInvoke accumulates states
@@ -88,18 +91,19 @@ type pendingSendRecord struct {
 
 func newInterpretation(chart *Chart, datamodel any) *interpretation {
 	return &interpretation{
-		chart:          chart,
-		datamodel:      datamodel,
-		configuration:  map[*compiledState]bool{},
-		historyValue:   map[*compiledState][]*compiledState{},
-		pending:        map[*pendingSendRecord]bool{},
-		io:             NoopIOProcessor,
-		clock:          NewRealClock(),
-		logger:         NoopLogger,
-		statesToInvoke: map[*compiledState]bool{},
-		activeInvokes:  map[*compiledState][]*runningInvoke{},
-		invokesByID:    map[Identifier]*runningInvoke{},
-		startInvoke:    noopInvokeRunner,
+		chart:              chart,
+		datamodel:          datamodel,
+		configuration:      map[*compiledState]bool{},
+		historyValue:       map[*compiledState][]*compiledState{},
+		pending:            map[*pendingSendRecord]bool{},
+		ioProcessorsByType: map[Identifier]IOProcessor{SCXMLEventProcessor: NoopIOProcessor},
+		ioProcessorOrder:   []Identifier{SCXMLEventProcessor},
+		clock:              NewRealClock(),
+		logger:             NoopLogger,
+		statesToInvoke:     map[*compiledState]bool{},
+		activeInvokes:      map[*compiledState][]*runningInvoke{},
+		invokesByID:        map[Identifier]*runningInvoke{},
+		startInvoke:        noopInvokeRunner,
 	}
 }
 
@@ -248,7 +252,7 @@ func (ip *interpretation) doSend(name Identifier, opts SendOptions) {
 func (ip *interpretation) stampExternalEvent(ev Event) Event {
 	ev.Type = EventExternal
 	ev.Origin = Identifier("#_scxml_" + string(ip.sessionID))
-	ev.OriginType = "scxml"
+	ev.OriginType = SCXMLEventProcessor
 	return ev
 }
 
@@ -285,12 +289,14 @@ func (ip *interpretation) dispatchNow(sendID, target, typ Identifier, ev Event) 
 		}
 		fallthrough
 	default:
-		if ip.io == nil {
-			ip.reportSendError(sendID, fmt.Errorf("statecharts: no IOProcessor configured for send target %q", target))
+		processor := ip.ioProcessorsByType[typ]
+		if processor == nil {
+			ip.reportSendError(sendID, unknownIOProcessorError{typ})
 			return
 		}
-		req := SendRequest{SendID: sendID, EventSendID: ev.SendID, Target: target, Type: typ, Event: ev.Name, Data: ev.Data}
-		if err := ip.io.Send(context.Background(), req); err != nil {
+		ip.dispatchSeq++
+		req := SendRequest{DeliveryID: DeliveryID(fmt.Sprintf("%s:%d", ip.deliveryNamespace, ip.dispatchSeq)), SendID: sendID, EventSendID: ev.SendID, Target: target, Type: typ, Event: ev.Name, Data: ev.Data}
+		if err := processor.Send(context.Background(), req); err != nil {
 			ip.reportSendError(sendID, err)
 		}
 	}
@@ -369,21 +375,23 @@ func (ip *interpretation) doCancel(sendID Identifier) {
 	if sendID == "" {
 		return
 	}
-	found := false
 	for rec := range ip.pending {
 		if rec.event.SendID != sendID {
 			continue
 		}
-		found = true
 		delete(ip.pending, rec)
 		if rec.stop != nil {
 			rec.stop()
 		}
 	}
-	if found && ip.io != nil {
-		_ = ip.io.Cancel(context.Background(), sendID)
-	}
 }
+
+type unknownIOProcessorError struct{ typ Identifier }
+
+func (e unknownIOProcessorError) Error() string {
+	return fmt.Sprintf("statecharts: no IOProcessor registered for type %q", e.typ)
+}
+func (unknownIOProcessorError) SendExecutionError() {}
 
 // --- ExecContext plumbing ----------------------------------------------
 
@@ -402,11 +410,22 @@ func (ip *interpretation) doLog(label string, data any) {
 // otherwise (e.g. NoopIOProcessor/LocalIOProcessor, neither of which has a
 // transport to advertise an address for).
 func (ip *interpretation) ioProcessors() []IOProcessorInfo {
-	d, ok := ip.io.(IOProcessorDescriber)
-	if !ok {
-		return nil
+	var result []IOProcessorInfo
+	seen := make(map[string]bool)
+	for _, typ := range ip.ioProcessorOrder {
+		d, ok := ip.ioProcessorsByType[typ].(IOProcessorDescriber)
+		if !ok {
+			continue
+		}
+		for _, info := range d.IOProcessors() {
+			key := string(info.Type) + "\x00" + info.Location.String()
+			if !seen[key] {
+				seen[key] = true
+				result = append(result, info)
+			}
+		}
 	}
-	return d.IOProcessors()
+	return append([]IOProcessorInfo(nil), result...)
 }
 
 func (ip *interpretation) execContext() ExecContext {

@@ -8,7 +8,7 @@ import (
 	"github.com/dhamidi/statecharts"
 )
 
-// Bridge is a fallback IOProcessor (see WithFallback) that connects two
+// Bridge is an in-process SCXML peer (see WithSCXMLPeer) that connects two
 // Systems. Send accepts only targets qualified by the target System's node
 // name, parses the actor ID before "@", and delivers it to target via Tell.
 // For a target System without a node name, Bridge uses its configured target
@@ -16,7 +16,7 @@ import (
 // An actor in system A reaches an actor named "billing" in system B by
 // addressing "billing@warehouse-b", once A is built with:
 //
-//	sysA := actors.NewSystem(actors.WithFallback(
+//	sysA := actors.NewSystem(actors.WithSCXMLPeer(
 //		actors.NewBridge("warehouse-b", sysB, "warehouse-a"),
 //	))
 //
@@ -28,7 +28,7 @@ import (
 //
 // Wiring two Systems together this way is inherently circular -- each
 // Bridge's target is the other System, but neither System can finish being
-// built (WithFallback wants a complete IOProcessor) before the other one
+// built (WithSCXMLPeer wants a complete IOProcessor) before the other one
 // already exists. NewBridge accepts a nil target to break the cycle: build
 // both Systems with a Bridge apiece, target nil, then SetTarget each Bridge
 // once both Systems exist, before either receives any traffic.
@@ -69,7 +69,7 @@ func (b *Bridge) targetSystem() *System {
 // Attach implements statecharts.IOProcessor. A Bridge is never itself the
 // IOProcessor an Instance is constructed with -- it only ever receives a
 // Send handed to it by a System's own routing IOProcessor (see
-// WithFallback) -- so there is no Dispatcher for it to capture here.
+// WithSCXMLPeer) -- so there is no Dispatcher for it to capture here.
 func (b *Bridge) Attach(statecharts.Dispatcher) {}
 
 // Send implements statecharts.IOProcessor. It synchronously validates the
@@ -79,6 +79,20 @@ func (b *Bridge) Attach(statecharts.Dispatcher) {}
 // return to the sending actor. A direct call without source routing context
 // instead uses the target System's dispatcher and cannot report late errors.
 func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
+	return b.send(ctx, req, nil)
+}
+
+// SendWithAck acknowledges after the target System has accepted the event
+// through its ingress WAL/dedup boundary. The work uses the same source FIFO
+// as Send, preserving ordering between acknowledged and ordinary traffic.
+func (b *Bridge) SendWithAck(ctx context.Context, req statecharts.SendRequest, complete func(error)) error {
+	return b.send(ctx, req, complete)
+}
+
+func (b *Bridge) send(ctx context.Context, req statecharts.SendRequest, complete func(error)) error {
+	if req.Type != statecharts.SCXMLEventProcessor {
+		return unsupportedPeerTypeError{typ: req.Type}
+	}
 	target := b.targetSystem()
 	if target == nil {
 		return fmt.Errorf("actors: Bridge: unknown actor %q (no target system configured)", req.Target)
@@ -109,11 +123,15 @@ func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
 		Data:       req.Data,
 		SendID:     req.EventSendID,
 		Origin:     origin,
-		OriginType: originTypeActors,
+		OriginType: statecharts.SCXMLEventProcessor,
+		DeliveryID: req.DeliveryID,
 	}
 
 	job := func() {
-		if err := target.Tell(context.Background(), name, ev); err != nil && routed && route.system != nil {
+		err := target.deliver(context.Background(), name, ev)
+		if complete != nil {
+			complete(err)
+		} else if err != nil && routed && route.system != nil {
 			route.system.reportDeliveryFailure(context.Background(), route.dispatcher, route.sendID, req.Target, err)
 		}
 	}
@@ -126,6 +144,3 @@ func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
 // Cancel implements statecharts.IOProcessor. A Bridge keeps no bookkeeping
 // of its own about a Send once it has handed the event's delivery off to
 // target (see Send), so there is nothing here for it to cancel.
-func (b *Bridge) Cancel(context.Context, statecharts.Identifier) error {
-	return nil
-}

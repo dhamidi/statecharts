@@ -15,7 +15,7 @@ import (
 )
 
 func TestRegisterRejectsChartWithoutDatamodelFactory(t *testing.T) {
-	chart, err := statecharts.Build(statecharts.Atomic("solo"))
+	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestRegisterRejectsChartWithoutDatamodelFactory(t *testing.T) {
 
 func TestRegisterRejectsDuplicateChartID(t *testing.T) {
 	build := func() *statecharts.Chart {
-		c, err := statecharts.Build(statecharts.Atomic("dup"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }))
+		c, err := statecharts.Build(statecharts.Atomic("dup"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
@@ -50,8 +50,8 @@ func TestSpawnRejectsUnregisteredKind(t *testing.T) {
 	}
 }
 
-func TestSpawnDurableRejectsMissingLogOrSnapshotStore(t *testing.T) {
-	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }))
+func TestSpawnDurableRequiresStorageWhileEphemeralDoesNotTouchIt(t *testing.T) {
+	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -59,9 +59,22 @@ func TestSpawnDurableRejectsMissingLogOrSnapshotStore(t *testing.T) {
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
+	if err := sys.Spawn(context.Background(), "ephemeral", chart.ID()); err != nil {
+		t.Fatalf("ephemeral Spawn without storage: %v", err)
+	}
 	spawnErr := sys.Spawn(context.Background(), "d-1", chart.ID(), Durable())
 	if !errors.Is(spawnErr, ErrDurabilityUnsupported) {
 		t.Fatalf("Spawn(Durable()): err = %v, want ErrDurabilityUnsupported", spawnErr)
+	}
+	durableSys := NewSystem(WithStorage(openTestLog(t)))
+	if err := durableSys.Register(chart); err != nil {
+		t.Fatalf("Register durable system: %v", err)
+	}
+	if err := durableSys.Spawn(context.Background(), "d-1", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn(Durable()) with storage: %v", err)
+	}
+	if err := durableSys.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop durable system: %v", err)
 	}
 }
 
@@ -144,7 +157,7 @@ func TestPeerMessagingSetsOriginAndAllowsReply(t *testing.T) {
 
 func TestSpawnNonDurableInstanceIDMatchesName(t *testing.T) {
 	ctx := context.Background()
-	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }))
+	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -177,7 +190,7 @@ func TestSpawnDurableInstanceIDMatchesName(t *testing.T) {
 	var dms []*counterModel
 	chart := buildLadderChart(&dms)
 
-	sys := NewSystem(WithLog(log), WithSnapshotStore(log))
+	sys := NewSystem(WithStorage(log))
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -200,7 +213,7 @@ func TestSpawnDurableInstanceIDMatchesName(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	sys2 := NewSystem(WithLog(log), WithSnapshotStore(log))
+	sys2 := NewSystem(WithStorage(log))
 	if err := sys2.Register(buildLadderChart(&dms)); err != nil {
 		t.Fatalf("Register (sys2): %v", err)
 	}
@@ -221,7 +234,7 @@ func TestSpawnDurableInstanceIDMatchesName(t *testing.T) {
 
 // TestSpawnNonDurableActionSeesOwnIOProcessorLocation confirms
 // routingProcessor.IOProcessors surfaces the actor's own spawned name as its
-// _ioprocessors "actors" Location -- the same name any other actor in sys
+// _ioprocessors SCXML Location -- the same name any other actor in sys
 // already reaches it by (see routingProcessor.Send).
 func TestSpawnNonDurableActionSeesOwnIOProcessorLocation(t *testing.T) {
 	ctx := context.Background()
@@ -248,7 +261,7 @@ func TestSpawnNonDurableActionSeesOwnIOProcessorLocation(t *testing.T) {
 
 	live := dms[len(dms)-1]
 	if !live.OK || live.Location != "locator-1" {
-		t.Fatalf("ec.IOProcessorLocation(%q) = (%q, %v), want (%q, true)", originTypeActors, live.Location, live.OK, "locator-1")
+		t.Fatalf("SCXML processor location = (%q, %v), want (%q, true)", live.Location, live.OK, "locator-1")
 	}
 
 	if err := sys.Stop(ctx); err != nil {
@@ -267,7 +280,7 @@ func TestSpawnDurableActionSeesOwnIOProcessorLocation(t *testing.T) {
 	var dms []*locationModel
 	chart := buildLocationChart(&dms)
 
-	sys := NewSystem(WithLog(log), WithSnapshotStore(log))
+	sys := NewSystem(WithStorage(log))
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -287,7 +300,7 @@ func TestSpawnDurableActionSeesOwnIOProcessorLocation(t *testing.T) {
 
 	live := dms[len(dms)-1]
 	if !live.OK || live.Location != "durable-locator" {
-		t.Fatalf("ec.IOProcessorLocation(%q) = (%q, %v), want (%q, true)", originTypeActors, live.Location, live.OK, "durable-locator")
+		t.Fatalf("SCXML processor location = (%q, %v), want (%q, true)", live.Location, live.OK, "durable-locator")
 	}
 
 	if err := sys.Stop(ctx); err != nil {
@@ -372,8 +385,7 @@ func TestSpawnStopRaceLeavesNoOrphanedInstance(t *testing.T) {
 	// under test.
 	chart, err := statecharts.Build(
 		statecharts.Atomic("solo"),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -468,8 +480,7 @@ func TestStopHonorsContextDeadline(t *testing.T) {
 	})
 	wedged, err := statecharts.Build(
 		statecharts.Atomic("wedged", statecharts.On("go", statecharts.Then(wedge))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -521,8 +532,7 @@ func TestStopCanRetryCleanupAfterDeadline(t *testing.T) {
 	})
 	chart, err := statecharts.Build(
 		statecharts.Atomic("wedged-retry", statecharts.On("go", statecharts.Then(wedge))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -579,12 +589,12 @@ func TestWithOnSweepErrorObservesEvictionFailures(t *testing.T) {
 	var dms []*counterModel
 	chart := buildLadderChart(&dms)
 
-	failingStore := &alwaysFailingSnapshotStore{SnapshotStore: log}
+	failingStore := &alwaysFailingSnapshotStore{Storage: log}
 
 	var mu sync.Mutex
 	var failures []statecharts.Identifier
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(failingStore),
+		WithStorage(failingStore),
 		WithIdleTimeout(time.Minute),
 		WithClock(clock),
 		WithOnSweepError(func(name statecharts.Identifier, err error) {
@@ -623,7 +633,7 @@ func TestWithOnSweepErrorObservesEvictionFailures(t *testing.T) {
 // Save fail, for exercising WithOnSweepError without needing a real
 // storage failure.
 type alwaysFailingSnapshotStore struct {
-	statecharts.SnapshotStore
+	Storage
 }
 
 func (a *alwaysFailingSnapshotStore) Save(ctx context.Context, sessionID statecharts.SessionID, cp statecharts.Checkpoint) error {
@@ -631,7 +641,7 @@ func (a *alwaysFailingSnapshotStore) Save(ctx context.Context, sessionID statech
 }
 
 type toggleLoadSnapshotStore struct {
-	statecharts.SnapshotStore
+	Storage
 
 	mu   sync.Mutex
 	fail bool
@@ -650,7 +660,7 @@ func (s *toggleLoadSnapshotStore) Load(ctx context.Context, sessionID statechart
 	if fail {
 		return statecharts.Checkpoint{}, false, fmt.Errorf("forced load failure for %q", sessionID)
 	}
-	return s.SnapshotStore.Load(ctx, sessionID)
+	return s.Storage.Load(ctx, sessionID)
 }
 
 // TestStopAggregatesAllTeardownErrors is the regression test for Stop's
@@ -663,12 +673,12 @@ func (s *toggleLoadSnapshotStore) Load(ctx context.Context, sessionID statechart
 func TestStopAggregatesAllTeardownErrors(t *testing.T) {
 	ctx := context.Background()
 	log := openTestLog(t)
-	failingStore := &alwaysFailingSnapshotStore{SnapshotStore: log}
+	failingStore := &alwaysFailingSnapshotStore{Storage: log}
 
 	var dms []*counterModel
 	chart := buildLadderChart(&dms)
 
-	sys := NewSystem(WithLog(log), WithSnapshotStore(failingStore))
+	sys := NewSystem(WithStorage(failingStore))
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -745,8 +755,7 @@ func TestSpawnRejectsRoutingKeyAsActorID(t *testing.T) {
 	ctx := context.Background()
 	chart, err := statecharts.Build(
 		statecharts.Atomic("worker"),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -767,12 +776,12 @@ func TestSpawnRejectsRoutingKeyAsActorID(t *testing.T) {
 
 func TestIsResidentAcceptsLocalIDAndRoutingKeyWithoutPagingIn(t *testing.T) {
 	ctx := context.Background()
-	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }))
+	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	log := openTestLog(t)
-	sys := NewSystem(WithNodeName("host-a"), WithLog(log), WithSnapshotStore(log), WithMaxResident(1))
+	sys := NewSystem(WithNodeName("host-a"), WithStorage(log), WithMaxResident(1))
 	if err := sys.Register(chart); err != nil {
 		t.Fatal(err)
 	}
@@ -805,7 +814,7 @@ func TestIsResidentAcceptsLocalIDAndRoutingKeyWithoutPagingIn(t *testing.T) {
 
 func TestResidencyObserverReportsHydrationAndEviction(t *testing.T) {
 	ctx := context.Background()
-	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }))
+	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,7 +822,7 @@ func TestResidencyObserverReportsHydrationAndEviction(t *testing.T) {
 	var mu sync.Mutex
 	var changes []ResidencyChange
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log), WithMaxResident(1),
+		WithStorage(log), WithMaxResident(1),
 		WithResidencyObserver(func(change ResidencyChange) {
 			mu.Lock()
 			changes = append(changes, change)
@@ -918,8 +927,7 @@ func TestConcurrentActivationCannotExceedMaxResident(t *testing.T) {
 	})
 	chart, err := statecharts.Build(
 		statecharts.Atomic("blocked", statecharts.OnEntry(blockStart)),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -972,8 +980,7 @@ func TestPeerDispatchDoesNotCreateOneBlockedGoroutinePerMessage(t *testing.T) {
 	ctx := context.Background()
 	receiver, err := statecharts.Build(
 		statecharts.Atomic("slow-receiver", statecharts.On("message")),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
@@ -986,8 +993,7 @@ func TestPeerDispatchDoesNotCreateOneBlockedGoroutinePerMessage(t *testing.T) {
 	})
 	sender, err := statecharts.Build(
 		statecharts.Atomic("burst-sender", statecharts.On("go", statecharts.Then(sendBurst))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1027,8 +1033,7 @@ func TestPeerDispatchQueueOverflowRaisesCommunicationError(t *testing.T) {
 	ctx := context.Background()
 	receiver, err := statecharts.Build(
 		statecharts.Atomic("overflow-receiver", statecharts.On("message")),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
@@ -1049,8 +1054,7 @@ func TestPeerDispatchQueueOverflowRaisesCommunicationError(t *testing.T) {
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1104,8 +1108,6 @@ func (p *registeredIOProcessor) Send(_ context.Context, req statecharts.SendRequ
 	return nil
 }
 
-func (*registeredIOProcessor) Cancel(context.Context, statecharts.Identifier) error { return nil }
-
 func (p *registeredIOProcessor) IOProcessors() []statecharts.IOProcessorInfo {
 	return append([]statecharts.IOProcessorInfo(nil), p.infos...)
 }
@@ -1120,8 +1122,7 @@ func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T
 				return nil
 			}),
 		))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
@@ -1129,14 +1130,13 @@ func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T
 		statecharts.Atomic("typed-sender", statecharts.On("go", statecharts.Then(
 			statecharts.SendEvent("frame", statecharts.SendOptions{Target: "output", Type: "browser", Data: "hello"}),
 		))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
 
 	processor := &registeredIOProcessor{}
-	sys := NewSystem(WithFallback(processor))
+	sys := NewSystem(WithIOProcessor("browser", func() statecharts.IOProcessor { return processor }))
 	if err := sys.Register(receiver); err != nil {
 		t.Fatalf("Register receiver: %v", err)
 	}
@@ -1183,13 +1183,12 @@ func TestFallbackAdvertisesRegisteredIOProcessor(t *testing.T) {
 				return nil
 			}),
 		))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	sys := NewSystem(WithFallback(processor))
+	sys := NewSystem(WithIOProcessor("browser", func() statecharts.IOProcessor { return processor }))
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -1218,8 +1217,7 @@ func TestUnsupportedPeerIOProcessorTypeRaisesExecutionError(t *testing.T) {
 				return nil
 			}),
 		))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
@@ -1235,8 +1233,7 @@ func TestUnsupportedPeerIOProcessorTypeRaisesExecutionError(t *testing.T) {
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1272,17 +1269,16 @@ func TestUnsupportedPeerIOProcessorTypeRaisesExecutionError(t *testing.T) {
 func TestAsyncDeliveryFailurePreservesPlatformMetadataAndDurability(t *testing.T) {
 	ctx := context.Background()
 	log := openTestLog(t)
-	store := &toggleLoadSnapshotStore{SnapshotStore: log}
+	store := &toggleLoadSnapshotStore{Storage: log}
 	target, err := statecharts.Build(
 		statecharts.Atomic("async-failure-target"),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build target: %v", err)
 	}
 	var dms []*asyncFailureModel
 	sender := buildAsyncFailureSender(&dms, "target")
-	sys := NewSystem(WithLog(log), WithSnapshotStore(store), WithIdleTimeout(0))
+	sys := NewSystem(WithStorage(store), WithIdleTimeout(0))
 	if err := sys.Register(target); err != nil {
 		t.Fatalf("Register target: %v", err)
 	}
@@ -1353,8 +1349,7 @@ func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
 			d := &orderModel{}
 			receiverModels = append(receiverModels, d)
 			return d
-		}),
-	)
+		}), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
@@ -1366,8 +1361,7 @@ func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
 	})
 	sender, err := statecharts.Build(
 		statecharts.Atomic("fifo-sender", statecharts.On("go", statecharts.Then(send))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}

@@ -10,8 +10,8 @@ import (
 	"github.com/dhamidi/statecharts/examples/ai-agent/internal/protocol"
 )
 
-// NewSystem builds the client's own actors.System: no WithLog/
-// WithSnapshotStore/WithFallback -- Durable() is never used client-side
+// NewSystem builds the client's own actors.System: no WithStorage --
+// Durable() is never used client-side
 // (link.go, tool.go, ui.go doc comments explain why each actor is what it
 // is).
 func NewSystem(clock statecharts.Clock) *actors.System {

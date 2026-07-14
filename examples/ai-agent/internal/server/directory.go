@@ -49,10 +49,11 @@ func broadcastUpsert(d *directoryModel, cs protocol.ConversationSummary) {
 
 var applySync = statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	cs, ok := statecharts.Payload[protocol.ConversationSummary](ev)
+	payload, ok := statecharts.Payload[*directorySyncPayload](ev)
 	if !ok {
 		return nil
 	}
+	cs := payload.Value
 	d.Items[cs.ID] = cs
 	broadcastUpsert(d, cs)
 	return nil
@@ -132,6 +133,5 @@ func BuildDirectoryChart() (*statecharts.Chart, error) {
 		),
 		statecharts.WithNewDatamodel(func() any {
 			return &directoryModel{Items: map[protocol.ConversationID]protocol.ConversationSummary{}}
-		}),
-	)
+		}), statecharts.WithVersion("v1"))
 }

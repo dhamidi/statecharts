@@ -340,6 +340,5 @@ func BuildLinkChart(serverAddr string, tools []protocol.ToolName) (*statecharts.
 			),
 			statecharts.On("switch", statecharts.Target("online"), statecharts.Then(handleSwitch)),
 		),
-		statecharts.WithNewDatamodel(func() any { return &linkModel{ServerAddr: serverAddr, Tools: tools} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &linkModel{ServerAddr: serverAddr, Tools: tools} }), statecharts.WithVersion("v1"))
 }

@@ -48,7 +48,10 @@ type counterModel struct {
 	Processed map[statecharts.Identifier]bool
 }
 
-const incrementDataType = "counters.increment.v1"
+const (
+	incrementDataType  = "counters.increment.v1"
+	projectionDataType = "counters.projection.v1"
+)
 
 type incrementData struct {
 	WriteID statecharts.Identifier `json:"write_id"`
@@ -57,6 +60,7 @@ type incrementPayload = statecharts.JSONData[incrementData]
 
 func registerCounterDataTypes() {
 	statecharts.RegisterDataType(incrementDataType, func() statecharts.DataUnmarshaler { return &incrementPayload{} })
+	statecharts.RegisterDataType(projectionDataType, func() statecharts.DataUnmarshaler { return &projection{} })
 }
 
 func incrementEvent(writeID statecharts.Identifier) statecharts.Event {
@@ -71,6 +75,13 @@ type projection struct {
 	ActorState string `json:"actor_state"`
 }
 
+func (p projection) MarshalData() (string, []byte, error) {
+	b, err := json.Marshal(p)
+	return projectionDataType, b, err
+}
+
+func (p *projection) UnmarshalData(b []byte) error { return json.Unmarshal(b, p) }
+
 const (
 	actorStateResident  = string(actors.ResidencyResident)
 	actorStatePagedOut  = string(actors.ResidencyPagedOut)
@@ -79,7 +90,7 @@ const (
 
 func buildCounterChart() (*statecharts.Chart, error) {
 	publish := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
-		ec.Send("projection", statecharts.SendOptions{Target: "hub@ui", Data: projection{Name: ec.SessionID(), Color: ec.SessionID(), Value: d.Value}})
+		ec.Send("projection", statecharts.SendOptions{Target: "hub@ui", Data: &projection{Name: ec.SessionID(), Color: ec.SessionID(), Value: d.Value}})
 		return nil
 	})
 	increment := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
@@ -105,7 +116,7 @@ func buildCounterChart() (*statecharts.Chart, error) {
 	return statecharts.Build(statecharts.Atomic(counterKind,
 		statecharts.On("increment", statecharts.Then(increment, publish)),
 		statecharts.On("publish", statecharts.Then(publish))),
-		statecharts.WithNewDatamodel(func() any { return &counterModel{Processed: make(map[statecharts.Identifier]bool)} }))
+		statecharts.WithNewDatamodel(func() any { return &counterModel{Processed: make(map[statecharts.Identifier]bool)} }), statecharts.WithVersion("v1"))
 }
 
 const hubKind statecharts.Identifier = "projection-hub"
@@ -150,10 +161,11 @@ func buildHubChart() (*statecharts.Chart, error) {
 	return statecharts.Build(statecharts.Atomic(hubKind,
 		statecharts.On("projection", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
 			ev, _ := ec.Event()
-			p, ok := ev.Data.(projection)
+			payload, ok := ev.Data.(*projection)
 			if !ok {
 				return fmt.Errorf("projection payload %T", ev.Data)
 			}
+			p := *payload
 			d.Values[p.Name] = p
 			notify(d, ec)
 			return nil
@@ -188,7 +200,7 @@ func buildHubChart() (*statecharts.Chart, error) {
 		}))),
 	), statecharts.WithNewDatamodel(func() any {
 		return &hubModel{Values: map[string]projection{}, Residencies: map[string]string{}, Subscribers: map[statecharts.Identifier][]string{}}
-	}))
+	}), statecharts.WithVersion("v1"))
 }
 
 type streamStart struct {
@@ -242,5 +254,5 @@ func buildStreamChart() (*statecharts.Chart, error) {
 		statecharts.Atomic("open", statecharts.On("start", statecharts.Then(start)), statecharts.On("snapshot", statecharts.Then(emit)), statecharts.On("keepalive", statecharts.Then(keepalive)), statecharts.On("close", statecharts.Target("closed"), statecharts.Then(closeStream))),
 		statecharts.Final("closed"),
 	),
-	), statecharts.WithNewDatamodel(func() any { return &streamModel{} }))
+	), statecharts.WithNewDatamodel(func() any { return &streamModel{} }), statecharts.WithVersion("v1"))
 }

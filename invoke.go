@@ -210,7 +210,7 @@ func (p *parentIOProcessor) Send(ctx context.Context, req SendRequest) error {
 				break
 			}
 		}
-		p.deliver(Event{Name: req.Event, Data: req.Data, SendID: req.EventSendID, Origin: origin, OriginType: "scxml"})
+		p.deliver(Event{Name: req.Event, Data: req.Data, SendID: req.EventSendID, Origin: origin, OriginType: SCXMLEventProcessor})
 		return nil
 	}
 	if p.next == nil {
@@ -220,13 +220,6 @@ func (p *parentIOProcessor) Send(ctx context.Context, req SendRequest) error {
 		return fmt.Errorf("statecharts: no IOProcessor configured for send target %q", req.Target)
 	}
 	return p.next.Send(ctx, req)
-}
-
-func (p *parentIOProcessor) Cancel(ctx context.Context, sendID Identifier) error {
-	if p.next == nil {
-		return nil
-	}
-	return p.next.Cancel(ctx, sendID)
 }
 
 // IOProcessors includes the child's mandatory SCXML session address and any
@@ -278,7 +271,7 @@ func (p *parentIOProcessor) IOProcessors() []IOProcessorInfo {
 func InvokeChart(chart *Chart, newDatamodel func(params any) any, baseIO IOProcessor) InvokeFunc {
 	return func(ctx context.Context, params any, io InvokeIO) (any, error) {
 		datamodel := newDatamodel(params)
-		child := New(chart, datamodel, WithIOProcessor(&parentIOProcessor{deliver: io.Deliver, next: baseIO}))
+		child := New(chart, datamodel, WithIOProcessor(SCXMLEventProcessor, &parentIOProcessor{deliver: io.Deliver, next: baseIO}))
 
 		// Start's own actor goroutine runs regardless of whether Start
 		// itself returns early because ctx raced its way to already

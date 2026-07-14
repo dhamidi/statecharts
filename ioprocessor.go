@@ -12,12 +12,31 @@ import (
 // <send delay="..."> has already elapsed: delay-timer bookkeeping belongs
 // to the interpreter core, so Send is always an immediate dispatch request.
 type SendRequest struct {
+	DeliveryID  DeliveryID
 	SendID      Identifier // execution ID, including an implementation-generated ID
 	EventSendID Identifier // author-specified ID exposed as _event.sendid; empty if none
 	Target      Identifier
 	Type        Identifier
 	Event       Identifier
 	Data        any
+}
+
+// AcknowledgingIOProcessor reports stable asynchronous acceptance. complete
+// must be called exactly once after the destination has accepted (or rejected)
+// the request; returning an error reports a synchronous failure.
+type AcknowledgingIOProcessor interface {
+	IOProcessor
+	SendWithAck(ctx context.Context, req SendRequest, complete func(error)) error
+}
+
+// ReplayAwareIOProcessor lets a durable processor reproduce the recorded
+// synchronous result of a send while deterministic replay is in progress,
+// and hand persisted work back to its transport once replay has caught up.
+// Implementations must not perform external I/O from ReplaySend.
+type ReplayAwareIOProcessor interface {
+	IOProcessor
+	ReplaySend(ctx context.Context, req SendRequest) error
+	Recover(ctx context.Context) error
 }
 
 // SCXMLEventProcessor is the mandatory SCXML Event I/O Processor type and
@@ -48,10 +67,6 @@ type IOProcessor interface {
 	// return quickly (hand off to their own goroutine and return) rather
 	// than blocking on real delivery.
 	Send(ctx context.Context, req SendRequest) error
-
-	// Cancel best-effort cancels an in-flight dispatch already handed to
-	// Send. A miss (unknown, or already delivered) is not an error.
-	Cancel(ctx context.Context, sendID Identifier) error
 }
 
 // SendExecutionError marks an IOProcessor.Send failure as an invalid or
@@ -89,8 +104,6 @@ func (noopIOProcessor) Attach(Dispatcher) {}
 
 func (noopIOProcessor) Send(context.Context, SendRequest) error { return nil }
 
-func (noopIOProcessor) Cancel(context.Context, Identifier) error { return nil }
-
 // NoopIOProcessor suppresses all outbound dispatch while reporting success.
 // Replaying Instances use it so real-world effects are never repeated when
 // reconstructing state from a Log (see replay.go).
@@ -124,10 +137,6 @@ func (e localUnsupportedSendError) Error() string {
 }
 
 func (localUnsupportedSendError) SendExecutionError() {}
-
-func (p *LocalIOProcessor) Cancel(ctx context.Context, sendID Identifier) error {
-	return nil
-}
 
 // IOProcessors advertises this session's mandatory SCXML processor address.
 func (p *LocalIOProcessor) IOProcessors() []IOProcessorInfo {

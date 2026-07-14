@@ -521,10 +521,10 @@ statecharts.On("job.start",
 ```
 
 `CancelSend` best-effort cancels a still-pending delayed send by ID. A
-default `Instance` uses `NoopIOProcessor`, which suppresses all outbound
-dispatch; `LocalIOProcessor` is a starting point for a single-process
-`IOProcessor` implementation, and any type satisfying the `IOProcessor`
-interface can be supplied with `WithIOProcessor`.
+default `Instance` uses `LocalIOProcessor`, which reports unreachable
+external targets. `NoopIOProcessor` explicitly suppresses dispatch, and any
+type satisfying `IOProcessor` can be registered under an exact processor
+type with `WithIOProcessor`.
 
 Updating a database record and sending a notification once a job finishes is
 an ordinary `IOProcessor`: the chart never touches a database or a mail
@@ -545,10 +545,6 @@ func (p *notifyProcessor) Send(ctx context.Context, req statecharts.SendRequest)
 	// mailer.Send(ctx, ownerEmail(jobID), "your thumbnails are ready")
 	return nil
 }
-
-func (p *notifyProcessor) Cancel(ctx context.Context, sendID statecharts.Identifier) error {
-	return nil
-}
 ```
 
 ```go
@@ -561,7 +557,7 @@ statecharts.On("job.done",
 )
 ```
 
-`in := statecharts.New(chart, myJob, statecharts.WithIOProcessor(&notifyProcessor{}))` is
+`in := statecharts.New(chart, myJob, statecharts.WithIOProcessor(statecharts.SCXMLEventProcessor, &notifyProcessor{}))` is
 what wires the two together -- `notifyProcessor.Send` runs whenever `notify`
 reaches the `IOProcessor` seam, whether that's from this transition's
 `SendEvent` or from an `ec.Send` call inside any other action.
@@ -576,7 +572,7 @@ by `Type` directly:
 
 ```go
 notify := func(ec statecharts.ExecContext) error {
-	replyTo, _ := ec.IOProcessorLocation("actors")
+	replyTo, _ := ec.IOProcessorLocation(statecharts.SCXMLEventProcessor)
 	ec.Send("job.notify", statecharts.SendOptions{Target: "notifier", Data: replyTo})
 	return nil
 }
@@ -777,12 +773,11 @@ already is.
 <details>
 <summary>Show Persistence Examples</summary>
 
-An `Instance`'s state — its active configuration, recorded history, queued
-events, any outstanding delayed sends, and which invocations were active —
-can be captured at any point with `Instance.Snapshot` and later restored
-with `Restore`. A checkpoint taken mid-invoke restores that invocation's
-bookkeeping along with everything else, so it's still recognized as active
-afterward even with nothing left in a `Log` to replay it back into place:
+An `Instance`'s state — including its datamodel, active configuration,
+recorded history, queued events, outstanding delayed sends, and active
+invocation bookkeeping — can be captured with `Instance.Snapshot` and later
+restored with `Restore`. Snapshot datamodels use JSON by default, or the
+chart's `WithDatamodelCodec` implementation:
 
 ```go
 snap, err := in.Snapshot(ctx)
@@ -811,6 +806,12 @@ resumes it for real if its `<invoke>` was configured with
 rather than leaving it looking alive with nothing actually running (see
 [Invoke](#invoke)).
 
+Snapshots are disposable caches, never a second source of truth. Give a
+durable chart an application version with `WithVersion("v1")`; when chart
+logic or its datamodel changes, bump that version. `Rehydrate` rejects the
+old cache and transparently rebuilds state by replaying the reducer from the
+Log. Applications do not migrate snapshot formats or snapshot datamodels.
+
 </details>
 
 ## Extras
@@ -830,18 +831,19 @@ clock.Advance(30 * time.Second) // fires any delayed sends now due
 
 ### The sqllog subpackage
 
-`sqllog` implements `Log` and `SnapshotStore` against a `*sql.DB` from the
-standard library's `database/sql` package:
+`sqllog` implements `DurableLog` and `SnapshotStore` in one SQLite storage
+value:
 
 ```go
 import "github.com/dhamidi/statecharts/sqllog"
 
-db, err := sql.Open("sqlite", "statecharts.db")
-log, err := sqllog.New(db, sqllog.SQLite)
+storage, err := sqllog.OpenSQLite("statecharts.db")
+defer storage.Close()
 ```
 
-The returned `*sqllog.Log` satisfies both interfaces, so it can be passed
-as both the `log` and `snapshots` arguments to `Rehydrate`.
+The returned `*sqllog.Storage` satisfies both interfaces, enables WAL mode
+for file-backed databases, and is the complete durable boundary for one
+`actors.System`. Give each System its own SQLite file.
 
 ## Running actor systems
 
@@ -891,6 +893,7 @@ func run(ctx context.Context) error {
 	connChart, err := statecharts.Build(
 		statecharts.Atomic("conn", statecharts.On("open", statecharts.Then(onOpen))),
 		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+		statecharts.WithVersion("v1"),
 	)
 	if err != nil {
 		return err
@@ -903,6 +906,7 @@ func run(ctx context.Context) error {
 	gatewayChart, err := statecharts.Build(
 		statecharts.Atomic("gateway", statecharts.On("accept", statecharts.Then(notifyConn))),
 		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+		statecharts.WithVersion("v1"),
 	)
 	if err != nil {
 		return err
@@ -951,8 +955,7 @@ constructor arguments to get the order of wrong:
 ```go
 sys := actors.NewSystem(
 	actors.WithNodeName("main"),
-	actors.WithLog(log),
-	actors.WithSnapshotStore(log),
+	actors.WithStorage(storage),
 	actors.WithIdleTimeout(5*time.Minute),
 )
 ```
@@ -961,13 +964,20 @@ sys := actors.NewSystem(
 stable `Identifier` values, while routable keys append the node with `@`:
 actor `accounts.invoice-42` on node `main` is addressed as
 `accounts.invoice-42@main`. The node is not part of the actor's session ID
-or its key in this system's isolated log, so changing hosts does not strand
-durable history. `WithLog` and `WithSnapshotStore` supply the durability
-backing every `Durable` actor; `*sqllog.Log` satisfies both, so the same
-value is commonly passed to each. A `System` with neither configured still
-works -- `Spawn` without `Durable()` never touches them -- but
-`Spawn(..., Durable())` fails if either is missing. `WithIdleTimeout` and
+or its key in this system's isolated storage, so changing hosts does not strand
+durable history. `WithStorage` supplies the single durability boundary backing
+every `Durable` actor. A `System` without storage still works -- `Spawn`
+without `Durable()` never touches storage -- but `Spawn(..., Durable())`
+fails. Each System must use its own SQLite database file (for example,
+`main.db` and `billing.db`), even when their node names differ. `WithIdleTimeout` and
 `WithResidencyLimit` (below) control automatic paging.
+
+```go
+mainStorage, _ := sqllog.OpenSQLite("data/main.db")
+billingStorage, _ := sqllog.OpenSQLite("data/billing.db")
+main := actors.NewSystem(actors.WithStorage(mainStorage))
+billing := actors.NewSystem(actors.WithStorage(billingStorage))
+```
 
 ### Registering and spawning actors
 
@@ -994,8 +1004,13 @@ the actor begins in its chart's initial configuration and keeps no record
 of what it does. If the process restarts, it's gone.
 
 `Durable()` changes that. A durable actor's messages are appended to the
-system's `Log` before they're applied, and its actor ID doubles as its
-session ID. One call handles both "start fresh" and "resume": if
+system's `Log` before they're applied, outbound sends are recorded before
+dispatch, and its actor ID doubles as its session ID. Recipients deduplicate
+retries by `DeliveryID`; an external `IOProcessor` can implement
+`AcknowledgingIOProcessor` to keep an intent pending until transport
+acceptance. Responses remain ordinary inbound actor events — the runtime
+does not turn a send into a durable request/response promise. One call
+handles both "start fresh" and "resume": if
 `"job-482"` has no prior log entries, `Spawn` starts it fresh; if it
 already has history -- because the process restarted, or because it was
 previously paged out -- `Spawn` loads its latest checkpoint and replays
@@ -1005,6 +1020,11 @@ before, ahead of the first new message being let through. This is what
 practice: creating an actor and resuming one are the same call. A name's
 durability is fixed at its first `Spawn` -- a name spawned without
 `Durable()` cannot later be spawned durable, and vice versa.
+
+Durable charts must set `WithVersion`. Bump it when chart logic or the
+datamodel changes; snapshots are then discarded and rebuilt transparently
+from the Log. Any event payload crossing a durable ingress or outbox boundary
+must implement `DataMarshaler` and have a registered `DataUnmarshaler`.
 
 ### Addressing actors by ID
 
@@ -1054,7 +1074,7 @@ cannot tell whether a message came from `Tell` or from another actor in
 the system.
 
 This routing is scoped to one `System`: a name it never spawned is unknown
-to it, full stop, unless it was built with `WithFallback` -- see
+to it, full stop, unless it was built with `WithSCXMLPeer` -- see
 [Connecting two systems](#connecting-two-systems) for addressing an actor
 that lives in a different `System` entirely.
 
@@ -1087,8 +1107,7 @@ current resident count:
 
 ```go
 sys := actors.NewSystem(
-	actors.WithLog(log),
-	actors.WithSnapshotStore(log),
+	actors.WithStorage(storage),
 	actors.WithResidencyLimit(func(resident int) bool {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
@@ -1136,13 +1155,10 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
@@ -1156,13 +1172,9 @@ type JobData struct {
 	Status string
 }
 
-// sourcePayload is the DataMarshaler wrapper "job.start" carries its source
-// path in. A durable actor's incoming events are appended to the Log before
-// they're applied, so any Event.Data reaching one must implement
-// statecharts.DataMarshaler; JSONData is a ready-made implementation.
-// "job.done" and the "notified" reply below target actors that are either
-// non-durable (notifier) or carry no Data at all, so they need no such
-// wrapper.
+// sourcePayload crosses a durable boundary in both directions: job.start is
+// logged as durable ingress, and job.done is first recorded in the durable
+// job actor's outbox. JSONData supplies both persistence methods.
 type sourcePayload = statecharts.JSONData[string]
 
 func init() {
@@ -1174,14 +1186,15 @@ func init() {
 func buildNotifierChart() (*statecharts.Chart, error) {
 	notify := statecharts.Action(func(n *Notifier, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		source, _ := statecharts.Payload[string](ev)
-		ec.Log("notifying owner of", source) // stand-in for actually sending a notification
+		source, _ := statecharts.Payload[*sourcePayload](ev)
+		ec.Log("notifying owner of", source.Value) // stand-in for actually sending a notification
 		ec.Send("notified", statecharts.SendOptions{Target: ev.Origin})
 		return nil
 	})
 	return statecharts.Build(
 		statecharts.Atomic("notifier", statecharts.On("job.done", statecharts.Then(notify))),
 		statecharts.WithNewDatamodel(func() any { return &Notifier{} }),
+		statecharts.WithVersion("v1"),
 	)
 }
 
@@ -1204,7 +1217,10 @@ func buildJobChart() (*statecharts.Chart, error) {
 		return nil
 	})
 	sendNotify := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
-		ec.Send("job.done", statecharts.SendOptions{Target: "notifier", Data: j.Source})
+		ec.Send("job.done", statecharts.SendOptions{
+			Target: "notifier",
+			Data:   &sourcePayload{TypeName: "source", Value: j.Source},
+		})
 		return nil
 	})
 	recordDone := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
@@ -1241,14 +1257,14 @@ func buildJobChart() (*statecharts.Chart, error) {
 			),
 		),
 		statecharts.WithNewDatamodel(func() any { return &JobData{} }),
+		statecharts.WithVersion("v1"),
 	)
 }
 
-func buildSystem(log *sqllog.Log) (*actors.System, error) {
+func buildSystem(storage *sqllog.Storage) (*actors.System, error) {
 	sys := actors.NewSystem(
 		actors.WithNodeName("main"),
-		actors.WithLog(log),
-		actors.WithSnapshotStore(log),
+		actors.WithStorage(storage),
 		actors.WithIdleTimeout(5*time.Minute),
 		actors.WithMaxResident(10_000),
 		actors.WithLogger(statecharts.NewWriterLogger(os.Stdout)),
@@ -1271,16 +1287,13 @@ func buildSystem(log *sqllog.Log) (*actors.System, error) {
 }
 
 func run(ctx context.Context) error {
-	db, err := sql.Open("sqlite", "actors.db")
+	storage, err := sqllog.OpenSQLite("actors.db")
 	if err != nil {
 		return err
 	}
-	log, err := sqllog.New(db, sqllog.SQLite)
-	if err != nil {
-		return err
-	}
+	defer storage.Close()
 
-	sys, err := buildSystem(log)
+	sys, err := buildSystem(storage)
 	if err != nil {
 		return err
 	}
@@ -1307,7 +1320,7 @@ func run(ctx context.Context) error {
 	}
 
 	// Later, possibly in a different process entirely, against the same Log:
-	sys2, err := buildSystem(log)
+	sys2, err := buildSystem(storage)
 	if err != nil {
 		return err
 	}
@@ -1337,22 +1350,19 @@ func main() {
 Every actor a `System` addresses by name lives inside that one `System`. A
 name it never spawned is unknown to it, full stop -- there is no way for an
 actor in one `System` to reach a name that belongs to a different `System`,
-unless that `System` is built with `WithFallback`.
+unless that `System` is built with `WithSCXMLPeer`.
 
-`WithFallback` adds an `IOProcessor` behind the actor router. For the
-default SCXML and `"actors"` processor types, a name the `System` already
-knows -- spawned there, resident or not -- is resolved locally first; the
-fallback only sees a `Send` when that lookup misses. A custom
-`SendOptions.Type` selects the fallback directly instead, even if its target
-happens to match a local actor ID. If the fallback implements
-`IOProcessorDescriber`, its entries are also included in the actor's
-`ExecContext.IOProcessors()` list.
+`WithSCXMLPeer` adds the next SCXML `IOProcessor` hop behind the local actor
+router. A name the `System` already knows — resident or paged out — resolves
+locally first; the peer only sees an SCXML send when that lookup misses.
+Custom processor types are registered separately with
+`actors.WithIOProcessor(type, factory)` and never fall through to SCXML.
 
 It's the same seam every actor already sends through, `IOProcessor`, doing
 the same job one level up: routing between Systems or reaching another
 application transport instead of routing between actors inside one.
 
-`Bridge` is a ready-made fallback `IOProcessor` for connecting two
+`Bridge` is a ready-made SCXML peer `IOProcessor` for connecting two
 `System`s. It separates the actor ID from its node at `@` and delivers the
 ID to the target via `Tell`. An actor in `gatewaySystem` reaches actor
 `"job-482"` in `jobsSystem` with `"job-482@jobs-system"`, once
@@ -1364,17 +1374,17 @@ like a same-`System` reply -- carries a routing key the reverse `Bridge`
 recognizes. Connecting two `System`s both ways takes one `Bridge` each.
 
 Wiring them together is circular: each `Bridge`'s target is the other
-`System`, but neither `System` can finish being built -- `WithFallback`
+`System`, but neither `System` can finish being built -- `WithSCXMLPeer`
 wants a complete `IOProcessor` -- before the other one exists.
 `NewBridge` accepts a `nil` target to break the cycle; `Bridge.SetTarget`
 fills it in once both `System`s exist, before either receives any traffic:
 
 ```go
 toJobs := actors.NewBridge("jobs-system", nil, "gateway-system")
-gatewaySystem := actors.NewSystem(actors.WithFallback(toJobs))
+gatewaySystem := actors.NewSystem(actors.WithSCXMLPeer(toJobs))
 // ... register charts and spawn actors on gatewaySystem ...
 
-jobsSystem := actors.NewSystem(actors.WithFallback(
+jobsSystem := actors.NewSystem(actors.WithSCXMLPeer(
 	actors.NewBridge("gateway-system", gatewaySystem, "jobs-system"),
 ))
 // ... register charts and spawn actors on jobsSystem ...
@@ -1390,9 +1400,10 @@ goroutine.
 
 A complete example: `gateway-system` holds a connection actor,
 `jobs-system` holds a job actor. Connections churn fast and are numerous
-but cheap to lose; jobs are heavier and durable -- different lifecycles and
-different scaling characteristics are exactly the reason to run them as two
-`System`s instead of one. The connection actor forwards an upload to the
+but cheap to lose; jobs are heavier and would often use their own durable
+storage boundary — different lifecycles and scaling characteristics are
+exactly the reason to run them as two `System`s instead of one. This example
+focuses only on routing. The connection actor forwards an upload to the
 job actor across the bridge; the job actor, once it finishes, sends the
 result back to the connection actor that started it, by name, across the
 same bridge in reverse:
@@ -1481,7 +1492,7 @@ func run(ctx context.Context) error {
 	// NewBridge accepts a nil target to break the cycle; toJobs is wired up
 	// with SetTarget once jobsSystem exists.
 	toJobs := actors.NewBridge("jobs-system", nil, "gateway-system")
-	gatewaySystem := actors.NewSystem(actors.WithFallback(toJobs))
+	gatewaySystem := actors.NewSystem(actors.WithSCXMLPeer(toJobs))
 	connChart, err := buildConnChart()
 	if err != nil {
 		return err
@@ -1493,7 +1504,7 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	jobsSystem := actors.NewSystem(actors.WithFallback(
+	jobsSystem := actors.NewSystem(actors.WithSCXMLPeer(
 		actors.NewBridge("gateway-system", gatewaySystem, "jobs-system"),
 	))
 	jobChart, err := buildJobChart()

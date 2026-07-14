@@ -46,7 +46,7 @@ func TestDurableSpawnPersistsAndResumesViaLogWithoutDoubleApplying(t *testing.T)
 	var dms1 []*counterModel
 	chart1 := buildLadderChart(&dms1)
 
-	sys1 := NewSystem(WithLog(log), WithSnapshotStore(log))
+	sys1 := NewSystem(WithStorage(log))
 	if err := sys1.Register(chart1); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestDurableSpawnPersistsAndResumesViaLogWithoutDoubleApplying(t *testing.T)
 	var dms2 []*counterModel
 	chart2 := buildLadderChart(&dms2)
 
-	sys2 := NewSystem(WithLog(log), WithSnapshotStore(log))
+	sys2 := NewSystem(WithStorage(log))
 	if err := sys2.Register(chart2); err != nil {
 		t.Fatalf("Register (sys2): %v", err)
 	}
@@ -100,23 +100,20 @@ func TestDurableSpawnPersistsAndResumesViaLogWithoutDoubleApplying(t *testing.T)
 	if !hasStateID(inst2.Configuration(), "s3") {
 		t.Fatalf("resumed configuration = %v, want 's3'", inst2.Configuration())
 	}
-	// The checkpoint taken by sys1.Stop already reflects all 3 "inc"
-	// events; replaying them again from the log (rather than skipping to
-	// the checkpoint) would double-apply their actions, driving Applied to
-	// 3 immediately. Applied==0 here proves the resumed actor's actions
-	// were not re-run. As above, the live datamodel is the last one
-	// produced (Register's own ok-check consumes the first).
+	// The checkpoint includes the datamodel after all 3 "inc" events. As
+	// above, the live datamodel is the last one produced (Register's own
+	// ok-check consumes the first).
 	resumed := dms2[len(dms2)-1]
-	if resumed.Applied != 0 {
-		t.Fatalf("resumed Applied = %d, want 0 (no double-apply)", resumed.Applied)
+	if resumed.Applied != 3 {
+		t.Fatalf("resumed Applied = %d, want 3", resumed.Applied)
 	}
 
 	// The resumed actor keeps working going forward.
 	if err := sys2.Tell(ctx, "counter-1", statecharts.Event{Name: "inc", Type: statecharts.EventExternal}); err != nil {
 		t.Fatalf("Tell (sys2): %v", err)
 	}
-	if resumed.Applied != 1 {
-		t.Fatalf("Applied after one more Tell = %d, want 1", resumed.Applied)
+	if resumed.Applied != 4 {
+		t.Fatalf("Applied after one more Tell = %d, want 4", resumed.Applied)
 	}
 
 	if err := sys2.Stop(ctx); err != nil {
@@ -139,7 +136,7 @@ func TestDurableActorSurvivesCrashWithoutGracefulStop(t *testing.T) {
 	var dms1 []*counterModel
 	chart1 := buildLadderChart(&dms1)
 
-	sys1 := NewSystem(WithLog(log), WithSnapshotStore(log))
+	sys1 := NewSystem(WithStorage(log))
 	if err := sys1.Register(chart1); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -170,7 +167,7 @@ func TestDurableActorSurvivesCrashWithoutGracefulStop(t *testing.T) {
 	var dms2 []*counterModel
 	chart2 := buildLadderChart(&dms2)
 
-	sys2 := NewSystem(WithLog(log), WithSnapshotStore(log))
+	sys2 := NewSystem(WithStorage(log))
 	if err := sys2.Register(chart2); err != nil {
 		t.Fatalf("Register (sys2): %v", err)
 	}
@@ -200,6 +197,36 @@ func TestDurableActorSurvivesCrashWithoutGracefulStop(t *testing.T) {
 	}
 }
 
+func TestDurableActorDeduplicatesRepeatedDeliveryID(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	var models []*counterModel
+	chart := buildLadderChart(&models)
+	sys := NewSystem(WithStorage(storage))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "deduplicated", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	event := statecharts.Event{Name: "inc", Type: statecharts.EventExternal, DeliveryID: "peer:delivery-1"}
+	if err := sys.Tell(ctx, "deduplicated", event); err != nil {
+		t.Fatalf("Tell first: %v", err)
+	}
+	if err := sys.Tell(ctx, "deduplicated", event); err != nil {
+		t.Fatalf("Tell duplicate: %v", err)
+	}
+	if got := models[len(models)-1].Applied; got != 1 {
+		t.Fatalf("applied events = %d, want 1", got)
+	}
+	if seq, err := storage.LastSeq(ctx, "deduplicated"); err != nil || seq != 2 {
+		t.Fatalf("LastSeq = %d, %v, want 2 (session start plus one accepted delivery)", seq, err)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 // TestConcurrentTellsSurviveRacingIdleSweep hammers concurrent Tells
 // against a single durable name while a real idle-timeout sweep keeps
 // firing in the background, trying to page the actor out mid-flight
@@ -218,7 +245,7 @@ func TestConcurrentTellsSurviveRacingIdleSweep(t *testing.T) {
 	chart := buildLadderChart(&dms)
 
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithIdleTimeout(200*time.Microsecond), // fires continuously, racing every Tell
 	)
 	if err := sys.Register(chart); err != nil {
@@ -291,13 +318,9 @@ func TestConcurrentTellsSurviveRacingIdleSweep(t *testing.T) {
 
 	// The live actor must actually have processed at least 3 of them to
 	// reach 's3' (a self-loop for every further "inc") -- proving delivery
-	// itself, not just logging, kept up. Applied (the in-memory action
-	// counter) is deliberately not checked against n here: Snapshot
-	// excludes the datamodel by design (snapshot.go), so every
-	// checkpoint/page-in cycle this hammering triggers starts the next
-	// live datamodel back at Applied==0, counting only increments since
-	// the *last* checkpoint, not the grand total -- the Log itself (above)
-	// is the only reliable total-count witness across eviction cycles.
+	// itself, not just logging, kept up. The Log checks above remain the
+	// exact concurrency witness; observing a datamodel here may itself need
+	// to page the actor back in and append one extra event.
 	inst := testInstanceFor(sys, "hammer-1")
 	if inst == nil {
 		if err := sys.Tell(ctx, "hammer-1", statecharts.Event{Name: "inc", Type: statecharts.EventExternal}); err != nil {
@@ -334,7 +357,7 @@ func TestIdleTimeoutPagesOutAndTransparentlyPagesBackIn(t *testing.T) {
 	chart := buildLadderChart(&dms)
 
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithIdleTimeout(time.Minute),
 		WithClock(clock),
 	)
@@ -385,7 +408,7 @@ func TestOverdueDelayedSendFiresDuringPageIn(t *testing.T) {
 	otherChart := buildFinishingChart()
 
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithClock(clock),
 		WithIdleTimeout(0),
 		WithMaxResident(1),
@@ -493,7 +516,7 @@ func TestCheckpointCannotClaimTimerFireMissingFromSnapshot(t *testing.T) {
 	otherChart := buildFinishingChart()
 
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithClock(clock), WithIdleTimeout(0), WithMaxResident(1),
 	)
 	if err := sys.Register(abortChart); err != nil {
@@ -545,7 +568,7 @@ func TestLogOnlyRecoveryUsesSystemClockTimestamps(t *testing.T) {
 	chart := buildInitAbortChart()
 
 	sys1 := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithClock(liveClock), WithIdleTimeout(0),
 	)
 	if err := sys1.Register(chart); err != nil {
@@ -567,7 +590,7 @@ func TestLogOnlyRecoveryUsesSystemClockTimestamps(t *testing.T) {
 
 	recoveryClock := statecharts.NewManualClock(time.Unix(5, 0))
 	sys2 := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithClock(recoveryClock), WithIdleTimeout(0),
 	)
 	if err := sys2.Register(chart); err != nil {
@@ -599,13 +622,12 @@ func TestTimerFireLogPreservesDispatchMetadata(t *testing.T) {
 			statecharts.Children(
 				statecharts.Atomic("idle", statecharts.On("go", statecharts.Then(
 					statecharts.SendEvent("work.abort", statecharts.SendOptions{
-						SendID: "abort-work", Target: "metadata-receiver", Type: "actors", Delay: 2 * time.Second,
+						SendID: "abort-work", Target: "metadata-receiver", Delay: 2 * time.Second,
 					}),
 				))),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -616,13 +638,12 @@ func TestTimerFireLogPreservesDispatchMetadata(t *testing.T) {
 				statecharts.Atomic("aborted"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
 
-	sys := NewSystem(WithLog(log), WithSnapshotStore(log), WithClock(clock), WithIdleTimeout(0))
+	sys := NewSystem(WithStorage(log), WithClock(clock), WithIdleTimeout(0))
 	if err := sys.Register(sender); err != nil {
 		t.Fatalf("Register sender: %v", err)
 	}
@@ -659,11 +680,386 @@ func TestTimerFireLogPreservesDispatchMetadata(t *testing.T) {
 	if timerEntry.Target != "metadata-receiver" {
 		t.Fatalf("timer_fired Target = %q, want metadata-receiver", timerEntry.Target)
 	}
-	if timerEntry.Type != "actors" {
-		t.Fatalf("timer_fired Type = %q, want actors", timerEntry.Type)
+	if timerEntry.Type != statecharts.SCXMLEventProcessor {
+		t.Fatalf("timer_fired Type = %q, want normalized SCXML", timerEntry.Type)
 	}
 	if want := startedAt.Add(2 * time.Second); !timerEntry.Timestamp.Equal(want) {
 		t.Fatalf("timer_fired Timestamp = %s, want configured-clock time %s", timerEntry.Timestamp, want)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+type holdingAckProcessor struct {
+	mu       sync.Mutex
+	requests []statecharts.SendRequest
+}
+
+func (*holdingAckProcessor) Attach(statecharts.Dispatcher) {}
+
+func (p *holdingAckProcessor) Send(ctx context.Context, req statecharts.SendRequest) error {
+	return p.SendWithAck(ctx, req, func(error) {})
+}
+
+func (p *holdingAckProcessor) SendWithAck(_ context.Context, req statecharts.SendRequest, _ func(error)) error {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *holdingAckProcessor) requestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.requests)
+}
+
+// Every registered processor gets its own durable wrapper. Recovery must
+// hand an unresolved intent only to the processor type selected by that
+// intent; otherwise the SCXML wrapper can consume a custom-processor send
+// first and incorrectly resolve it as an unsupported SCXML route.
+func TestDurableOutboxRecoversOnlyThroughSelectedProcessor(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	chart, err := statecharts.Build(
+		statecharts.Atomic("outbox-sender",
+			statecharts.OnEntry(statecharts.SendEvent("work", statecharts.SendOptions{
+				Target: "external-worker",
+				Type:   "custom",
+			})),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+		statecharts.WithVersion("test-v1"),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	firstProcessor := &holdingAckProcessor{}
+	first := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor { return firstProcessor }))
+	if err := first.Register(chart); err != nil {
+		t.Fatalf("Register first: %v", err)
+	}
+	if err := first.Spawn(ctx, "sender", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn first: %v", err)
+	}
+	if got := firstProcessor.requestCount(); got != 1 {
+		t.Fatalf("initial custom dispatches = %d, want 1", got)
+	}
+
+	// Simulate a crash after the custom processor accepted the request but
+	// before it acknowledged it. Do not checkpoint or resolve the outbox.
+	entry, _ := first.resolve("sender")
+	if err := entry.instance.Load().Stop(ctx); err != nil {
+		t.Fatalf("stop crashed instance: %v", err)
+	}
+	entry.instance.Store(nil)
+
+	recoveredProcessor := &holdingAckProcessor{}
+	recovered := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor { return recoveredProcessor }))
+	if err := recovered.Register(chart); err != nil {
+		t.Fatalf("Register recovered: %v", err)
+	}
+	if err := recovered.Spawn(ctx, "sender", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn recovered: %v", err)
+	}
+	if got := recoveredProcessor.requestCount(); got != 1 {
+		t.Fatalf("recovered custom dispatches = %d, want 1", got)
+	}
+
+	if err := first.Stop(ctx); err != nil {
+		t.Fatalf("Stop first: %v", err)
+	}
+	if err := recovered.Stop(ctx); err != nil {
+		t.Fatalf("Stop recovered: %v", err)
+	}
+}
+
+// A durable intent cannot be recovered if its exact processor type is no
+// longer registered. Activation must fail visibly instead of leaving the
+// row pending forever while the actor appears healthy.
+func TestDurableOutboxRejectsMissingProcessorDuringRecovery(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	chart, err := statecharts.Build(
+		statecharts.Atomic("missing-processor-sender",
+			statecharts.OnEntry(statecharts.SendEvent("work", statecharts.SendOptions{Target: "external-worker", Type: "custom"})),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+		statecharts.WithVersion("test-v1"),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	processor := &holdingAckProcessor{}
+	first := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor { return processor }))
+	if err := first.Register(chart); err != nil {
+		t.Fatalf("Register first: %v", err)
+	}
+	if err := first.Spawn(ctx, "sender-missing-processor", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn first: %v", err)
+	}
+	entry, _ := first.resolve("sender-missing-processor")
+	if err := entry.instance.Load().Stop(ctx); err != nil {
+		t.Fatalf("stop crashed instance: %v", err)
+	}
+	entry.instance.Store(nil)
+
+	recovered := NewSystem(WithStorage(storage))
+	if err := recovered.Register(chart); err != nil {
+		t.Fatalf("Register recovered: %v", err)
+	}
+	if err := recovered.Spawn(ctx, "sender-missing-processor", chart.ID(), Durable()); !errors.Is(err, ErrDurableIOProcessorUnavailable) {
+		t.Fatalf("Spawn recovered error = %v, want ErrDurableIOProcessorUnavailable", err)
+	}
+
+	if err := first.Stop(ctx); err != nil {
+		t.Fatalf("Stop first: %v", err)
+	}
+	if err := recovered.Stop(ctx); err != nil {
+		t.Fatalf("Stop recovered: %v", err)
+	}
+}
+
+type failingProcessor struct{ err error }
+
+func (*failingProcessor) Attach(statecharts.Dispatcher) {}
+
+func (p *failingProcessor) Send(context.Context, statecharts.SendRequest) error { return p.err }
+
+func buildVersionedSenderChart(version string) *statecharts.Chart {
+	chart, err := statecharts.Build(
+		statecharts.Compound("versioned-sender", "ready",
+			statecharts.Children(
+				statecharts.Atomic("ready",
+					statecharts.OnEntry(statecharts.SendEvent("work", statecharts.SendOptions{Target: "external-worker", Type: "custom"})),
+					statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("failed")),
+				),
+				statecharts.Atomic("failed"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+		statecharts.WithVersion(version),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
+// Outbound result identities are scoped to the chart version. Otherwise a
+// full replay after a version bump can apply an old synchronous processor
+// failure to a different send that merely reused the same dispatch ordinal
+// in the new chart definition.
+func TestChartVersionScopesDurableOutboundReplay(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	v1 := buildVersionedSenderChart("v1")
+	first := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor {
+		return &failingProcessor{err: errors.New("v1 transport failure")}
+	}))
+	if err := first.Register(v1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+	if err := first.Spawn(ctx, "versioned", v1.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn v1: %v", err)
+	}
+	if inst := testInstanceFor(first, "versioned"); inst == nil || !hasStateID(inst.Configuration(), "failed") {
+		t.Fatalf("v1 configuration = %v, want failed", inst.Configuration())
+	}
+	entry, _ := first.resolve("versioned")
+	if err := entry.instance.Load().Stop(ctx); err != nil {
+		t.Fatalf("stop crashed v1 instance: %v", err)
+	}
+	entry.instance.Store(nil)
+
+	v2 := buildVersionedSenderChart("v2")
+	recovered := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor {
+		return &registeredIOProcessor{}
+	}))
+	if err := recovered.Register(v2); err != nil {
+		t.Fatalf("Register v2: %v", err)
+	}
+	if err := recovered.Spawn(ctx, "versioned", v2.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn v2: %v", err)
+	}
+	if inst := testInstanceFor(recovered, "versioned"); inst == nil || !hasStateID(inst.Configuration(), "ready") {
+		var configuration []statecharts.Identifier
+		if inst != nil {
+			configuration = inst.Configuration()
+		}
+		t.Fatalf("v2 configuration = %v, want ready; v1's send failure leaked across chart versions", configuration)
+	}
+
+	if err := first.Stop(ctx); err != nil {
+		t.Fatalf("Stop first: %v", err)
+	}
+	if err := recovered.Stop(ctx); err != nil {
+		t.Fatalf("Stop recovered: %v", err)
+	}
+}
+
+type orderedHoldingProcessor struct {
+	label string
+	mu    *sync.Mutex
+	order *[]string
+}
+
+func (*orderedHoldingProcessor) Attach(statecharts.Dispatcher) {}
+
+func (p *orderedHoldingProcessor) Send(ctx context.Context, req statecharts.SendRequest) error {
+	return p.SendWithAck(ctx, req, func(error) {})
+}
+
+func (p *orderedHoldingProcessor) SendWithAck(_ context.Context, _ statecharts.SendRequest, _ func(error)) error {
+	p.mu.Lock()
+	*p.order = append(*p.order, p.label)
+	p.mu.Unlock()
+	return nil
+}
+
+func buildOrderedOutboxChart() *statecharts.Chart {
+	chart, err := statecharts.Build(
+		statecharts.Atomic("ordered-outbox",
+			statecharts.OnEntry(
+				statecharts.SendEvent("custom-work", statecharts.SendOptions{Target: "custom-target", Type: "custom"}),
+				statecharts.SendEvent("scxml-work", statecharts.SendOptions{Target: "remote@peer"}),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+		statecharts.WithVersion("test-v1"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
+// Recovery preserves the original global send order even when adjacent
+// intents selected different processors. Per-processor recovery loops must
+// not regroup them by registration order.
+func TestDurableOutboxRecoveryPreservesOrderAcrossProcessors(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	chart := buildOrderedOutboxChart()
+	var firstMu sync.Mutex
+	var firstOrder []string
+	first := NewSystem(
+		WithStorage(storage),
+		WithSCXMLPeer(&orderedHoldingProcessor{label: "scxml", mu: &firstMu, order: &firstOrder}),
+		WithIOProcessor("custom", func() statecharts.IOProcessor {
+			return &orderedHoldingProcessor{label: "custom", mu: &firstMu, order: &firstOrder}
+		}),
+	)
+	if err := first.Register(chart); err != nil {
+		t.Fatalf("Register first: %v", err)
+	}
+	if err := first.Spawn(ctx, "ordered-sender", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn first: %v", err)
+	}
+	entry, _ := first.resolve("ordered-sender")
+	if err := entry.instance.Load().Stop(ctx); err != nil {
+		t.Fatalf("stop crashed instance: %v", err)
+	}
+	entry.instance.Store(nil)
+
+	var recoveredMu sync.Mutex
+	var recoveredOrder []string
+	recovered := NewSystem(
+		WithStorage(storage),
+		WithSCXMLPeer(&orderedHoldingProcessor{label: "scxml", mu: &recoveredMu, order: &recoveredOrder}),
+		WithIOProcessor("custom", func() statecharts.IOProcessor {
+			return &orderedHoldingProcessor{label: "custom", mu: &recoveredMu, order: &recoveredOrder}
+		}),
+	)
+	if err := recovered.Register(chart); err != nil {
+		t.Fatalf("Register recovered: %v", err)
+	}
+	if err := recovered.Spawn(ctx, "ordered-sender", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn recovered: %v", err)
+	}
+	recoveredMu.Lock()
+	got := append([]string(nil), recoveredOrder...)
+	recoveredMu.Unlock()
+	if len(got) != 2 || got[0] != "custom" || got[1] != "scxml" {
+		t.Fatalf("recovery order = %v, want [custom scxml]", got)
+	}
+
+	if err := first.Stop(ctx); err != nil {
+		t.Fatalf("Stop first: %v", err)
+	}
+	if err := recovered.Stop(ctx); err != nil {
+		t.Fatalf("Stop recovered: %v", err)
+	}
+}
+
+type attachedReplyProcessor struct {
+	dispatcher statecharts.Dispatcher
+}
+
+func (p *attachedReplyProcessor) Attach(dispatcher statecharts.Dispatcher) {
+	p.dispatcher = dispatcher
+}
+
+func (p *attachedReplyProcessor) Send(_ context.Context, _ statecharts.SendRequest) error {
+	dispatcher := p.dispatcher
+	go func() {
+		_ = dispatcher.Deliver(context.Background(), statecharts.Event{Name: "reply", Type: statecharts.EventExternal})
+	}()
+	return nil
+}
+
+// IOProcessor.Attach binds a processor to one actor's Dispatcher. A System
+// must therefore create a processor per actor rather than reusing one
+// attached value and letting the most recently spawned actor steal replies
+// from every actor spawned before it.
+func TestCustomIOProcessorAttachmentIsIsolatedPerActor(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	replies := map[statecharts.SessionID]int{}
+	recordReply := func(ec statecharts.ExecContext) error {
+		mu.Lock()
+		replies[statecharts.SessionID(ec.SessionID())]++
+		mu.Unlock()
+		return nil
+	}
+	chart, err := statecharts.Build(
+		statecharts.Atomic("processor-client",
+			statecharts.On("go", statecharts.Then(statecharts.SendEvent("request", statecharts.SendOptions{Target: "service", Type: "custom"}))),
+			statecharts.On("reply", statecharts.Then(recordReply)),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+		statecharts.WithVersion("test-v1"),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	sys := NewSystem(WithIOProcessor("custom", func() statecharts.IOProcessor { return &attachedReplyProcessor{} }))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "first", chart.ID()); err != nil {
+		t.Fatalf("Spawn first: %v", err)
+	}
+	if err := sys.Spawn(ctx, "second", chart.ID()); err != nil {
+		t.Fatalf("Spawn second: %v", err)
+	}
+	if err := sys.Tell(ctx, "first", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell first: %v", err)
+	}
+
+	var firstReplies, secondReplies int
+	waitFor(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		firstReplies, secondReplies = replies["first"], replies["second"]
+		return firstReplies+secondReplies == 1
+	})
+	if firstReplies != 1 || secondReplies != 0 {
+		t.Fatalf("replies = {first:%d second:%d}, want {first:1 second:0}", firstReplies, secondReplies)
 	}
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -679,7 +1075,7 @@ func TestResidencyLimitEvictsLeastRecentlyActive(t *testing.T) {
 	chart := buildLadderChart(&dms)
 
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithMaxResident(1),
 		WithClock(clock),
 	)
@@ -741,7 +1137,7 @@ func TestResidencyLimitNeverEvictsActorWithActiveInvoke(t *testing.T) {
 	ladderChart := buildLadderChart(&dms)
 
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithMaxResident(1),
 		WithClock(clock),
 	)
@@ -789,7 +1185,7 @@ func TestIdleTimeoutNeverEvictsActorWithActiveInvoke(t *testing.T) {
 	invokingChart := buildInvokingChart()
 
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithIdleTimeout(time.Minute),
 		WithClock(clock),
 	)
@@ -825,7 +1221,7 @@ func TestDurableActorReachingFinalStateIsEvictedImmediately(t *testing.T) {
 	log := openTestLog(t)
 
 	chart := buildFinishingChart()
-	sys := NewSystem(WithLog(log), WithSnapshotStore(log))
+	sys := NewSystem(WithStorage(log))
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -891,7 +1287,7 @@ func TestSweepReapsActorThatFinishedViaInternalTimerWithNoFurtherTell(t *testing
 
 	chart := buildDelayedFinishingChart(30 * time.Second)
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithIdleTimeout(time.Minute),
 		WithClock(clock),
 	)
@@ -952,7 +1348,7 @@ func TestStopDoesNotErrorForActorThatAlreadyFinished(t *testing.T) {
 
 	chart := buildDelayedFinishingChart(time.Second)
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log),
+		WithStorage(log),
 		WithIdleTimeout(0), // disables sweeping entirely
 		WithClock(clock),
 	)
@@ -999,12 +1395,11 @@ func TestDurableInvokeCompletionIsWriteAheadLogged(t *testing.T) {
 				statecharts.Atomic("completed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-	)
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	sys := NewSystem(WithLog(log), WithSnapshotStore(log), WithIdleTimeout(0))
+	sys := NewSystem(WithStorage(log), WithIdleTimeout(0))
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -1032,7 +1427,7 @@ func TestFinishedDurableActorDoesNotAppendUndeliverableMessage(t *testing.T) {
 	clock := statecharts.NewManualClock(time.Unix(0, 0))
 	chart := buildDelayedFinishingChart(time.Second)
 	sys := NewSystem(
-		WithLog(log), WithSnapshotStore(log), WithClock(clock), WithIdleTimeout(0),
+		WithStorage(log), WithClock(clock), WithIdleTimeout(0),
 	)
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -1073,7 +1468,7 @@ func TestNodeNameDoesNotChangeDurableActorIdentity(t *testing.T) {
 	chart := buildLadderChart(&dms)
 	actorID := statecharts.Identifier("accounts.counter-1")
 	sysA := NewSystem(
-		WithNodeName("warehouse-a"), WithLog(log), WithSnapshotStore(log),
+		WithNodeName("warehouse-a"), WithStorage(log),
 	)
 	if err := sysA.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -1098,7 +1493,7 @@ func TestNodeNameDoesNotChangeDurableActorIdentity(t *testing.T) {
 	// isolated Log. Its actor IDs and durable histories do not move with the
 	// routing address.
 	sysB := NewSystem(
-		WithNodeName("warehouse-b"), WithLog(log), WithSnapshotStore(log),
+		WithNodeName("warehouse-b"), WithStorage(log),
 	)
 	if err := sysB.Register(chart); err != nil {
 		t.Fatalf("Register B: %v", err)
@@ -1149,15 +1544,14 @@ func TestDurableActorDoesNotRestartInitialInvokeAfterCrashBeforeFirstMessage(t *
 					statecharts.Atomic("recovered"),
 				),
 			),
-			statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-		)
+			statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
 		return chart
 	}
 
-	sys1 := NewSystem(WithLog(log), WithSnapshotStore(log), WithIdleTimeout(0))
+	sys1 := NewSystem(WithStorage(log), WithIdleTimeout(0))
 	chart1 := buildChart()
 	if err := sys1.Register(chart1); err != nil {
 		t.Fatalf("Register sys1: %v", err)
@@ -1180,7 +1574,7 @@ func TestDurableActorDoesNotRestartInitialInvokeAfterCrashBeforeFirstMessage(t *
 		t.Fatalf("stop crashed instance: %v", err)
 	}
 
-	sys2 := NewSystem(WithLog(log), WithSnapshotStore(log), WithIdleTimeout(0))
+	sys2 := NewSystem(WithStorage(log), WithIdleTimeout(0))
 	chart2 := buildChart()
 	if err := sys2.Register(chart2); err != nil {
 		t.Fatalf("Register sys2: %v", err)
