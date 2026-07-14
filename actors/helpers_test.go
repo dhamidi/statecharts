@@ -301,3 +301,37 @@ func buildCommTestChart(unknownTarget statecharts.Identifier) *statecharts.Chart
 	}
 	return chart
 }
+
+type asyncFailureModel struct {
+	Event statecharts.Event
+	Seen  bool
+}
+
+func buildAsyncFailureSender(sink *[]*asyncFailureModel, target statecharts.Identifier) *statecharts.Chart {
+	send := statecharts.Action(func(_ *asyncFailureModel, ec statecharts.ExecContext) error {
+		ec.Send("ping", statecharts.SendOptions{SendID: "request-7", Target: target})
+		return nil
+	})
+	record := statecharts.Action(func(d *asyncFailureModel, ec statecharts.ExecContext) error {
+		d.Event, d.Seen = ec.Event()
+		return nil
+	})
+	chart, err := statecharts.Build(
+		statecharts.Compound("async-failure-sender", "idle",
+			statecharts.Children(
+				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(send))),
+				statecharts.Atomic("waiting", statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("failed"), statecharts.Then(record))),
+				statecharts.Atomic("failed"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any {
+			d := &asyncFailureModel{}
+			*sink = append(*sink, d)
+			return d
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}

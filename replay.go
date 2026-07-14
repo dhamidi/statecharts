@@ -16,9 +16,10 @@ import (
 // external dispatch or a diagnostic Logger write. Delayed-send timers use a
 // separate non-firing replayClock until the gate goes live.
 type replayGate struct {
-	io     IOProcessor
-	logger Logger
-	live   atomic.Bool
+	io          IOProcessor
+	logger      Logger
+	ingressHook func(Event) error
+	live        atomic.Bool
 }
 
 func (g *replayGate) Attach(d Dispatcher) { g.io.Attach(d) }
@@ -47,6 +48,13 @@ func (g *replayGate) Log(label string, data any) {
 		return
 	}
 	g.logger.Log(label, data)
+}
+
+func (g *replayGate) ingress(ev Event) error {
+	if g.ingressHook == nil || !g.live.Load() {
+		return nil
+	}
+	return g.ingressHook(ev)
 }
 
 // IOProcessors implements IOProcessorDescriber by forwarding straight
@@ -109,17 +117,19 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 	if readErr != nil {
 		return nil, fmt.Errorf("statecharts: Rehydrate: read log: %w", readErr)
 	}
+
 	logicalNow := probe.clock.Now()
 	if hasFirst && !first.Timestamp.IsZero() {
 		logicalNow = first.Timestamp
 	}
 	replayTime := newReplayClock(logicalNow)
-	gate := &replayGate{io: realIO, logger: probe.logger}
+	gate := &replayGate{io: realIO, logger: probe.logger, ingressHook: probe.ingressHook}
 
 	// Appending these options last makes them authoritative during replay,
 	// even if opts contained conflicting values.
 	allOpts := append(append([]Option{}, opts...),
-		WithIOProcessor(gate), WithLogger(gate), WithClock(replayTime), WithSessionID(sessionID))
+		WithIOProcessor(gate), WithLogger(gate), WithClock(replayTime),
+		WithIngressHook(gate.ingress), WithSessionID(sessionID))
 
 	var in *Instance
 	if hasCheckpoint {
@@ -135,6 +145,12 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 	// start neither invocations nor timers that could repeat real-world work.
 	in.suppressInvoke.Store(true)
 	in.deferTimerActivation.Store(true)
+	keepInstance := false
+	defer func() {
+		if !keepInstance {
+			_ = in.Stop(ctx)
+		}
+	}()
 	if err := in.Start(ctx); err != nil {
 		return nil, fmt.Errorf("statecharts: Rehydrate: start: %w", err)
 	}
@@ -142,6 +158,8 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 	replayEntry := func(entry LogEntry) error {
 		replayTime.Set(entry.Timestamp)
 		switch entry.Kind {
+		case KindSessionStarted:
+			return nil
 		case KindExternalEvent:
 			return in.Send(ctx, entry.Event)
 		case KindTimerFired:
@@ -183,17 +201,20 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 	finishReq := actorRequest{kind: reqFinishReplay, clock: probe.clock, reply: make(chan error, 1)}
 	if err := in.submit(ctx, finishReq); err != nil {
 		if errors.Is(err, ErrInstanceStopped) && in.Err() == nil {
+			keepInstance = true
 			return in, nil
 		}
 		return nil, fmt.Errorf("statecharts: Rehydrate: finish replay: %w", err)
 	}
 	if err := in.awaitReply(ctx, finishReq.reply); err != nil {
 		if errors.Is(err, ErrInstanceStopped) && in.Err() == nil {
+			keepInstance = true
 			return in, nil
 		}
 		return nil, fmt.Errorf("statecharts: Rehydrate: finish replay: %w", err)
 	}
 
+	keepInstance = true
 	return in, nil
 }
 

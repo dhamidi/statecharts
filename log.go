@@ -6,15 +6,21 @@ import (
 	"time"
 )
 
-// EntryKind distinguishes the two -- and only two -- kinds of message that
-// ever cross an Instance's boundary from outside. Everything else a chart
-// does (<raise>, <cancel>, history recording, new transitions) is pure,
-// deterministic recomputation given the current configuration and the
-// inbound event, so logging only these two kinds is sufficient for exact
-// replay (see Rehydrate in replay.go).
+// EntryKind distinguishes durable inputs and the session-start boundary.
+// Everything else a chart does (<raise>, <cancel>, history recording, new
+// transitions) is pure, deterministic recomputation given the initial
+// configuration and these entries (see Rehydrate in replay.go).
 type EntryKind string
 
 const (
+	// KindSessionStarted is written before a durable actor is started for the
+	// first time. It is a no-op during replay, but proves initial executable
+	// content may already have run -- particularly an initial <invoke> -- even
+	// when the process crashed before the actor received its first message.
+	// Its Timestamp also anchors initial delayed sends to the original start
+	// time instead of the recovery time.
+	KindSessionStarted EntryKind = "session_started"
+
 	// KindExternalEvent records an explicit application call, Instance.Send.
 	KindExternalEvent EntryKind = "external_event"
 

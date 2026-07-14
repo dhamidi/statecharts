@@ -19,6 +19,11 @@ type Instance struct {
 	chart *Chart
 	ip    *interpretation
 	clock Clock
+	// ingressHook runs on the actor goroutine immediately before an event
+	// delivered through Send/Deliver is applied. Durable runtimes use it for
+	// write-ahead logging so invocation results and IOProcessor callbacks pass
+	// through the same persistence boundary as direct application messages.
+	ingressHook func(Event) error
 
 	inbox   chan actorRequest
 	doneCh  chan struct{}
@@ -76,6 +81,7 @@ type instanceConfig struct {
 	clock          Clock
 	logger         Logger
 	inboxSize      int
+	ingressHook    func(Event) error
 	timerFiredHook func(Identifier, Identifier, Identifier, Event) error
 	idGen          IDGenerator
 	sessionID      SessionID
@@ -105,6 +111,16 @@ func WithLogger(l Logger) Option {
 // experiencing backpressure. Defaults to 1.
 func WithInboxSize(n int) Option {
 	return func(c *instanceConfig) { c.inboxSize = n }
+}
+
+// WithIngressHook registers a callback run on the Instance's goroutine
+// immediately before every event accepted through Send or Deliver is
+// applied. Returning an error rejects the event and terminates the Instance:
+// a durable runtime cannot safely continue after its write-ahead record
+// failed. Rehydrate suppresses this hook while replaying entries already in
+// the Log, then enables it for new live arrivals.
+func WithIngressHook(fn func(Event) error) Option {
+	return func(c *instanceConfig) { c.ingressHook = fn }
 }
 
 // WithTimerFiredHook registers a callback invoked synchronously, on the
@@ -177,11 +193,12 @@ func New(chart *Chart, datamodel any, opts ...Option) *Instance {
 
 func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id SessionID) *Instance {
 	in := &Instance{
-		chart:   chart,
-		clock:   cfg.clock,
-		inbox:   make(chan actorRequest, cfg.inboxSize),
-		doneCh:  make(chan struct{}),
-		readyCh: make(chan struct{}),
+		chart:       chart,
+		clock:       cfg.clock,
+		ingressHook: cfg.ingressHook,
+		inbox:       make(chan actorRequest, cfg.inboxSize),
+		doneCh:      make(chan struct{}),
+		readyCh:     make(chan struct{}),
 	}
 
 	ip.io = cfg.io
@@ -539,7 +556,16 @@ func (in *Instance) run() {
 		case reqStop:
 			in.ip.running = false
 		case reqSend:
-			in.ip.enqueue(req.event)
+			if in.ingressHook != nil {
+				reqErr = in.ingressHook(req.event)
+			}
+			if reqErr == nil {
+				in.ip.enqueue(req.event)
+			} else {
+				reqErr = fmt.Errorf("statecharts: ingress hook: %w", reqErr)
+				in.setTerminalErr(reqErr)
+				in.ip.running = false
+			}
 		case reqTimerFired:
 			req.fn()
 			reqErr = in.takeTimerHookError()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -481,15 +482,14 @@ func TestStopHonorsContextDeadline(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 
-	// Send "go" through the routing IOProcessor's own asynchronous path
-	// (not Tell) so it is asyncWG-tracked exactly like a peer Send would
-	// be, and hangs inside the wedged action until release is closed --
-	// simulating an in-flight delivery Stop must not wait on forever.
-	sys.asyncWG.Add(1)
-	go func() {
-		defer sys.asyncWG.Done()
-		sys.deliverAsync(context.Background(), "wedged-1", statecharts.Event{Name: "go", Type: statecharts.EventExternal}, nil)
-	}()
+	// Send "go" through the routing dispatcher (not Tell), where it hangs
+	// inside the wedged action until release is closed -- simulating accepted
+	// peer work that Stop must wait for, but not beyond its context deadline.
+	if err := sys.enqueueDispatch(func() {
+		sys.deliverAsync(context.Background(), "wedged-1", statecharts.Event{Name: "go", Type: statecharts.EventExternal}, nil, "")
+	}); err != nil {
+		t.Fatalf("enqueue dispatch: %v", err)
+	}
 
 	// Give the goroutine above a moment to actually enter the wedged
 	// action before racing Stop against it.
@@ -629,6 +629,29 @@ func (a *alwaysFailingSnapshotStore) Save(ctx context.Context, sessionID statech
 	return fmt.Errorf("alwaysFailingSnapshotStore: Save always fails")
 }
 
+type toggleLoadSnapshotStore struct {
+	statecharts.SnapshotStore
+
+	mu   sync.Mutex
+	fail bool
+}
+
+func (s *toggleLoadSnapshotStore) setFail(fail bool) {
+	s.mu.Lock()
+	s.fail = fail
+	s.mu.Unlock()
+}
+
+func (s *toggleLoadSnapshotStore) Load(ctx context.Context, sessionID statecharts.SessionID) (statecharts.Checkpoint, bool, error) {
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
+	if fail {
+		return statecharts.Checkpoint{}, false, fmt.Errorf("forced load failure for %q", sessionID)
+	}
+	return s.SnapshotStore.Load(ctx, sessionID)
+}
+
 // TestStopAggregatesAllTeardownErrors is the regression test for Stop's
 // error handling: with two resident durable actors that both fail their
 // checkpoint during teardown, Stop must report both failures instead of
@@ -677,5 +700,484 @@ func TestStopAggregatesAllTeardownErrors(t *testing.T) {
 		if !strings.Contains(err.Error(), string(name)) {
 			t.Fatalf("Stop error %v does not mention failed actor %q -- lost under first-error-wins", err, name)
 		}
+	}
+}
+
+func TestNodeNameQualifiesActorAddressAndLocalRouting(t *testing.T) {
+	ctx := context.Background()
+	var dms []*callerModel
+	responder := buildResponderChart()
+	caller := buildCallerChart(&dms, "warehouse-a.responder-1")
+
+	sys := NewSystem(WithNodeName("warehouse-a"))
+	if err := sys.Register(responder); err != nil {
+		t.Fatalf("Register responder: %v", err)
+	}
+	if err := sys.Register(caller); err != nil {
+		t.Fatalf("Register caller: %v", err)
+	}
+	if err := sys.Spawn(ctx, "responder-1", responder.ID()); err != nil {
+		t.Fatalf("Spawn responder: %v", err)
+	}
+	if err := sys.Spawn(ctx, "caller-1", caller.ID()); err != nil {
+		t.Fatalf("Spawn caller: %v", err)
+	}
+
+	callerInstance := testInstanceFor(sys, "caller-1")
+	if callerInstance.ID() != "warehouse-a.caller-1" {
+		t.Fatalf("caller Instance.ID() = %q, want node-qualified address %q", callerInstance.ID(), "warehouse-a.caller-1")
+	}
+	if err := sys.Tell(ctx, "warehouse-a.caller-1", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell by qualified address: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return hasStateID(callerInstance.Configuration(), "done") })
+	if got := dms[len(dms)-1].ReceivedFrom; got != "warehouse-a.responder-1" {
+		t.Fatalf("reply Origin = %q, want node-qualified address %q", got, "warehouse-a.responder-1")
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestNodeNameQualifiesAdvertisedIOProcessorLocation(t *testing.T) {
+	ctx := context.Background()
+	var dms []*locationModel
+	chart := buildLocationChart(&dms)
+	sys := NewSystem(WithNodeName("warehouse-a"))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "locator-1", chart.ID()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := sys.Tell(ctx, "locator-1", statecharts.Event{Name: "check", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+	if got := dms[len(dms)-1].Location; got != "warehouse-a.locator-1" {
+		t.Fatalf("IOProcessor location = %q, want %q", got, "warehouse-a.locator-1")
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestMultiSegmentNodeNameRoundTripsThroughActorAddress(t *testing.T) {
+	ctx := context.Background()
+	var dms []*callerModel
+	responder := buildResponderChart()
+	caller := buildCallerChart(&dms, "eu.warehouse-a.responder-1")
+
+	sys := NewSystem(WithNodeName("eu.warehouse-a"))
+	if err := sys.Register(responder); err != nil {
+		t.Fatalf("Register responder: %v", err)
+	}
+	if err := sys.Register(caller); err != nil {
+		t.Fatalf("Register caller: %v", err)
+	}
+	if err := sys.Spawn(ctx, "responder-1", responder.ID()); err != nil {
+		t.Fatalf("Spawn responder: %v", err)
+	}
+	if err := sys.Spawn(ctx, "caller-1", caller.ID()); err != nil {
+		t.Fatalf("Spawn caller: %v", err)
+	}
+	if err := sys.Tell(ctx, "eu.warehouse-a.caller-1", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell by multi-segment qualified address: %v", err)
+	}
+	callerInstance := testInstanceFor(sys, "caller-1")
+	waitFor(t, 2*time.Second, func() bool { return hasStateID(callerInstance.Configuration(), "done") })
+	if got := dms[len(dms)-1].ReceivedFrom; got != "eu.warehouse-a.responder-1" {
+		t.Fatalf("reply Origin = %q, want %q", got, "eu.warehouse-a.responder-1")
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestConcurrentActivationCannotExceedMaxResident(t *testing.T) {
+	ctx := context.Background()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	blockStart := statecharts.Action(func(_ *struct{}, _ statecharts.ExecContext) error {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return nil
+	})
+	chart, err := statecharts.Build(
+		statecharts.Atomic("blocked", statecharts.OnEntry(blockStart)),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	sys := NewSystem(WithMaxResident(1))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	const count = 32
+	errs := make(chan error, count)
+	go func() { errs <- sys.Spawn(ctx, "blocked-0", chart.ID()) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("first activation did not enter its chart")
+	}
+	for i := 1; i < count; i++ {
+		go func(i int) {
+			errs <- sys.Spawn(ctx, statecharts.Identifier(fmt.Sprintf("blocked-%d", i)), chart.ID())
+		}(i)
+	}
+	// Give the competing activations time to reach admission while the first
+	// activation has not yet published its Instance as resident.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	succeeded := 0
+	for i := 0; i < count; i++ {
+		err := <-errs
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrResidencyExhausted):
+		default:
+			t.Fatalf("Spawn error = %v, want nil or ErrResidencyExhausted", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("successful concurrent activations = %d, want exactly 1 under WithMaxResident(1)", succeeded)
+	}
+	if got := sys.residentCount(); got != 1 {
+		t.Fatalf("resident count = %d, want 1", got)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestPeerDispatchDoesNotCreateOneBlockedGoroutinePerMessage(t *testing.T) {
+	ctx := context.Background()
+	receiver, err := statecharts.Build(
+		statecharts.Atomic("slow-receiver", statecharts.On("message")),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build receiver: %v", err)
+	}
+	const messages = 200
+	sendBurst := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+		for i := 0; i < messages; i++ {
+			ec.Send("message", statecharts.SendOptions{Target: "slow"})
+		}
+		return nil
+	})
+	sender, err := statecharts.Build(
+		statecharts.Atomic("burst-sender", statecharts.On("go", statecharts.Then(sendBurst))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build sender: %v", err)
+	}
+	sys := NewSystem()
+	if err := sys.Register(receiver); err != nil {
+		t.Fatalf("Register receiver: %v", err)
+	}
+	if err := sys.Register(sender); err != nil {
+		t.Fatalf("Register sender: %v", err)
+	}
+	if err := sys.Spawn(ctx, "slow", receiver.ID()); err != nil {
+		t.Fatalf("Spawn receiver: %v", err)
+	}
+	if err := sys.Spawn(ctx, "burst", sender.ID()); err != nil {
+		t.Fatalf("Spawn sender: %v", err)
+	}
+
+	entry, _ := sys.resolve("slow")
+	entry.mu.Lock()
+	baseline := runtime.NumGoroutine()
+	if err := sys.Tell(ctx, "burst", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		entry.mu.Unlock()
+		t.Fatalf("Tell: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	delta := runtime.NumGoroutine() - baseline
+	entry.mu.Unlock()
+	if delta > 16 {
+		t.Fatalf("blocked peer burst created %d additional goroutines, want a bounded dispatcher", delta)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestPeerDispatchQueueOverflowRaisesCommunicationError(t *testing.T) {
+	ctx := context.Background()
+	receiver, err := statecharts.Build(
+		statecharts.Atomic("overflow-receiver", statecharts.On("message")),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build receiver: %v", err)
+	}
+	sendBurst := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+		ec.Send("message", statecharts.SendOptions{Target: "receiver"})
+		ec.Send("message", statecharts.SendOptions{Target: "receiver", SendID: "overflowed"})
+		return nil
+	})
+	sender, err := statecharts.Build(
+		statecharts.Compound("overflow-sender", "idle",
+			statecharts.Children(
+				statecharts.Atomic("idle",
+					statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(sendBurst)),
+				),
+				statecharts.Atomic("waiting",
+					statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("failed")),
+				),
+				statecharts.Atomic("failed"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build sender: %v", err)
+	}
+	sys := NewSystem(WithDispatchLimit(1))
+	if err := sys.Register(receiver); err != nil {
+		t.Fatalf("Register receiver: %v", err)
+	}
+	if err := sys.Register(sender); err != nil {
+		t.Fatalf("Register sender: %v", err)
+	}
+	if err := sys.Spawn(ctx, "receiver", receiver.ID()); err != nil {
+		t.Fatalf("Spawn receiver: %v", err)
+	}
+	if err := sys.Spawn(ctx, "sender", sender.ID()); err != nil {
+		t.Fatalf("Spawn sender: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	if err := sys.enqueueDispatch(func() {
+		close(entered)
+		<-release
+	}); err != nil {
+		t.Fatalf("enqueue blocking dispatch: %v", err)
+	}
+	<-entered
+	if err := sys.Tell(ctx, "sender", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		close(release)
+		t.Fatalf("Tell: %v", err)
+	}
+	inst := testInstanceFor(sys, "sender")
+	if !hasStateID(inst.Configuration(), "failed") {
+		close(release)
+		t.Fatalf("sender configuration = %v, want failed after dispatch queue overflow", inst.Configuration())
+	}
+	close(release)
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestUnsupportedPeerIOProcessorTypeRaisesExecutionError(t *testing.T) {
+	ctx := context.Background()
+	var deliveries int
+	receiver, err := statecharts.Build(
+		statecharts.Atomic("typed-receiver", statecharts.On("ping", statecharts.Then(
+			statecharts.Action(func(_ *struct{}, _ statecharts.ExecContext) error {
+				deliveries++
+				return nil
+			}),
+		))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build receiver: %v", err)
+	}
+	send := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+		ec.Send("ping", statecharts.SendOptions{Target: "typed-target", Type: "unsupported"})
+		return nil
+	})
+	sender, err := statecharts.Build(
+		statecharts.Compound("typed-sender", "idle",
+			statecharts.Children(
+				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(send))),
+				statecharts.Atomic("waiting", statecharts.On(string(statecharts.ErrEventExecution), statecharts.Target("failed"))),
+				statecharts.Atomic("failed"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build sender: %v", err)
+	}
+	sys := NewSystem()
+	if err := sys.Register(receiver); err != nil {
+		t.Fatalf("Register receiver: %v", err)
+	}
+	if err := sys.Register(sender); err != nil {
+		t.Fatalf("Register sender: %v", err)
+	}
+	if err := sys.Spawn(ctx, "typed-target", receiver.ID()); err != nil {
+		t.Fatalf("Spawn receiver: %v", err)
+	}
+	if err := sys.Spawn(ctx, "typed-source", sender.ID()); err != nil {
+		t.Fatalf("Spawn sender: %v", err)
+	}
+	if err := sys.Tell(ctx, "typed-source", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+	senderInstance := testInstanceFor(sys, "typed-source")
+	if !hasStateID(senderInstance.Configuration(), "failed") {
+		t.Fatalf("sender configuration = %v, want failed after unsupported I/O processor type", senderInstance.Configuration())
+	}
+	time.Sleep(20 * time.Millisecond)
+	if deliveries != 0 {
+		t.Fatalf("unsupported typed send reached target %d time(s), want 0", deliveries)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestAsyncDeliveryFailurePreservesPlatformMetadataAndDurability(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	store := &toggleLoadSnapshotStore{SnapshotStore: log}
+	target, err := statecharts.Build(
+		statecharts.Atomic("async-failure-target"),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build target: %v", err)
+	}
+	var dms []*asyncFailureModel
+	sender := buildAsyncFailureSender(&dms, "target")
+	sys := NewSystem(WithLog(log), WithSnapshotStore(store), WithIdleTimeout(0))
+	if err := sys.Register(target); err != nil {
+		t.Fatalf("Register target: %v", err)
+	}
+	if err := sys.Register(sender); err != nil {
+		t.Fatalf("Register sender: %v", err)
+	}
+	if err := sys.Spawn(ctx, "target", target.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn target: %v", err)
+	}
+	if err := sys.Spawn(ctx, "sender", sender.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn sender: %v", err)
+	}
+	targetEntry, _ := sys.resolve("target")
+	targetEntry.mu.Lock()
+	if err := sys.evictLocked(ctx, targetEntry); err != nil {
+		targetEntry.mu.Unlock()
+		t.Fatalf("evict target: %v", err)
+	}
+	targetEntry.mu.Unlock()
+	store.setFail(true)
+
+	if err := sys.Tell(ctx, "sender", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell sender: %v", err)
+	}
+	senderInstance := testInstanceFor(sys, "sender")
+	waitFor(t, 2*time.Second, func() bool { return hasStateID(senderInstance.Configuration(), "failed") })
+	live := dms[len(dms)-1]
+	if !live.Seen {
+		t.Fatalf("sender did not observe error.communication")
+	}
+	if live.Event.Type != statecharts.EventPlatform {
+		t.Fatalf("failure event Type = %s, want platform", live.Event.Type)
+	}
+	if live.Event.SendID != "request-7" {
+		t.Fatalf("failure event SendID = %q, want request-7", live.Event.SendID)
+	}
+	if live.Event.Origin != "" {
+		t.Fatalf("failure event Origin = %q, want empty platform origin", live.Event.Origin)
+	}
+	if seq, err := log.LastSeq(ctx, "sender"); err != nil || seq != 3 {
+		t.Fatalf("sender LastSeq = %d, %v, want 3, nil (start, go, async failure)", seq, err)
+	}
+	store.setFail(false)
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
+	ctx := context.Background()
+	const messages = 128
+	type orderModel struct {
+		mu    sync.Mutex
+		order []int
+	}
+	var receiverModels []*orderModel
+	record := statecharts.Action(func(d *orderModel, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		n, _ := ev.Data.(int)
+		d.mu.Lock()
+		d.order = append(d.order, n)
+		d.mu.Unlock()
+		return nil
+	})
+	receiver, err := statecharts.Build(
+		statecharts.Atomic("fifo-receiver", statecharts.On("item", statecharts.Then(record))),
+		statecharts.WithNewDatamodel(func() any {
+			d := &orderModel{}
+			receiverModels = append(receiverModels, d)
+			return d
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Build receiver: %v", err)
+	}
+	send := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+		for i := 0; i < messages; i++ {
+			ec.Send("item", statecharts.SendOptions{Target: "receiver", Data: i})
+		}
+		return nil
+	})
+	sender, err := statecharts.Build(
+		statecharts.Atomic("fifo-sender", statecharts.On("go", statecharts.Then(send))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build sender: %v", err)
+	}
+	sys := NewSystem()
+	if err := sys.Register(receiver); err != nil {
+		t.Fatalf("Register receiver: %v", err)
+	}
+	if err := sys.Register(sender); err != nil {
+		t.Fatalf("Register sender: %v", err)
+	}
+	if err := sys.Spawn(ctx, "receiver", receiver.ID()); err != nil {
+		t.Fatalf("Spawn receiver: %v", err)
+	}
+	if err := sys.Spawn(ctx, "sender", sender.ID()); err != nil {
+		t.Fatalf("Spawn sender: %v", err)
+	}
+	receiverEntry, _ := sys.resolve("receiver")
+	receiverEntry.mu.Lock()
+	if err := sys.Tell(ctx, "sender", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		receiverEntry.mu.Unlock()
+		t.Fatalf("Tell: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	receiverEntry.mu.Unlock()
+	live := receiverModels[len(receiverModels)-1]
+	waitFor(t, 2*time.Second, func() bool {
+		live.mu.Lock()
+		defer live.mu.Unlock()
+		return len(live.order) == messages
+	})
+	live.mu.Lock()
+	defer live.mu.Unlock()
+	for i, got := range live.order {
+		if got != i {
+			t.Fatalf("delivery order[%d] = %d, want %d; full order = %v", i, got, i, live.order)
+		}
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }

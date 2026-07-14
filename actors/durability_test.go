@@ -157,10 +157,10 @@ func TestDurableActorSurvivesCrashWithoutGracefulStop(t *testing.T) {
 	// checkpoint is ever taken), and sys1 is simply abandoned -- the
 	// closest a single-process test can get to "the process died between
 	// messages". If Tell properly write-ahead-logs before applying, the
-	// Log alone, untouched by any checkpoint, must already hold all 3
-	// events.
-	if seq, err := log.LastSeq(ctx, "crash-1"); err != nil || seq != 3 {
-		t.Fatalf("LastSeq = %d, %v, want 3, nil -- messages were not write-ahead-logged before being applied", seq, err)
+	// Log alone, untouched by any checkpoint, must already hold the session
+	// start marker followed by all 3 events.
+	if seq, err := log.LastSeq(ctx, "crash-1"); err != nil || seq != 4 {
+		t.Fatalf("LastSeq = %d, %v, want 4, nil -- start/messages were not write-ahead-logged before being applied", seq, err)
 	}
 
 	// A second, independent System against the same Log, standing in for
@@ -250,19 +250,18 @@ func TestConcurrentTellsSurviveRacingIdleSweep(t *testing.T) {
 	// regardless of how many times idle-timeout eviction raced a Tell to
 	// page the actor back in mid-flight: no message lost, none logged
 	// twice. sqllog.Log.Append assigns Seq as MAX(seq)+1 inside one
-	// transaction per call, so LastSeq landing on exactly n already proves
-	// exactly n successful, distinct Append calls happened -- not n-1 (a
-	// lost message) and not n+1 or more (a duplicate).
+	// transaction per call, so LastSeq landing on exactly n+1 (the start
+	// marker plus n events) proves exactly n event Appends happened.
 	seq, err := log.LastSeq(ctx, "hammer-1")
 	if err != nil {
 		t.Fatalf("LastSeq: %v", err)
 	}
-	if seq != n {
-		t.Fatalf("LastSeq = %d, want %d (every Tell must be logged exactly once)", seq, n)
+	if seq != n+1 {
+		t.Fatalf("LastSeq = %d, want %d (start marker plus every Tell exactly once)", seq, n+1)
 	}
 
 	// Read every entry back and confirm Seq is exactly the gapless run
-	// 1..n with no duplicates, each one the "inc" event Tell sent -- a
+	// 1..n+1 with no duplicates: one start marker, then only "inc" events -- a
 	// stronger check than LastSeq alone, which could in principle land on
 	// n by coincidence (e.g. one lost + one duplicated).
 	seen := map[uint64]bool{}
@@ -270,6 +269,12 @@ func TestConcurrentTellsSurviveRacingIdleSweep(t *testing.T) {
 	for entry, err := range log.Read(ctx, "hammer-1", 1) {
 		if err != nil {
 			t.Fatalf("Read: %v", err)
+		}
+		if entry.Kind == statecharts.KindSessionStarted {
+			if entry.Seq != 1 {
+				t.Fatalf("session-start marker Seq = %d, want 1", entry.Seq)
+			}
+			continue
 		}
 		if entry.Event.Name != "inc" {
 			t.Fatalf("entry %d event = %q, want %q", entry.Seq, entry.Event.Name, "inc")
@@ -302,8 +307,8 @@ func TestConcurrentTellsSurviveRacingIdleSweep(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LastSeq (after repage): %v", err)
 		}
-		if seq != n+1 {
-			t.Fatalf("LastSeq after repage = %d, want %d", seq, n+1)
+		if seq != n+2 {
+			t.Fatalf("LastSeq after repage = %d, want %d", seq, n+2)
 		}
 		inst = testInstanceFor(sys, "hammer-1")
 	}
@@ -433,8 +438,8 @@ func TestOverdueDelayedSendFiresDuringPageIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LastSeq after overdue timer fired: %v", err)
 	}
-	if seq != 2 {
-		t.Fatalf("LastSeq after overdue timer fired = %d, want 2 (init plus timer_fired)", seq)
+	if seq != 3 {
+		t.Fatalf("LastSeq after overdue timer fired = %d, want 3 (start, init, timer_fired)", seq)
 	}
 
 	if err := sys.Stop(ctx); err != nil {
@@ -525,8 +530,8 @@ func TestCheckpointCannotClaimTimerFireMissingFromSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LastSeq: %v", err)
 	}
-	if seq != 2 {
-		t.Fatalf("LastSeq after page-in = %d, want 2; a third entry means the checkpoint skipped and re-fired timer_fired", seq)
+	if seq != 3 {
+		t.Fatalf("LastSeq after page-in = %d, want 3; a fourth entry means the checkpoint skipped and re-fired timer_fired", seq)
 	}
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -974,5 +979,202 @@ func TestStopDoesNotErrorForActorThatAlreadyFinished(t *testing.T) {
 
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v, want nil (an already-finished durable actor must not error Stop)", err)
+	}
+}
+
+func TestDurableInvokeCompletionIsWriteAheadLogged(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	complete := make(chan struct{})
+	chart, err := statecharts.Build(
+		statecharts.Compound("durable-invoke", "working",
+			statecharts.Children(
+				statecharts.Atomic("working",
+					statecharts.Invoke(func(context.Context, any, statecharts.InvokeIO) (any, error) {
+						<-complete
+						return nil, nil
+					}, statecharts.WithInvokeID("job")),
+					statecharts.On("done.invoke.job", statecharts.Target("completed")),
+				),
+				statecharts.Atomic("completed"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	sys := NewSystem(WithLog(log), WithSnapshotStore(log), WithIdleTimeout(0))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "job-1", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	close(complete)
+	inst := testInstanceFor(sys, "job-1")
+	waitFor(t, 2*time.Second, func() bool { return hasStateID(inst.Configuration(), "completed") })
+	seq, err := log.LastSeq(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("LastSeq: %v", err)
+	}
+	if seq != 2 {
+		t.Fatalf("LastSeq after invoke completion = %d, want 2 (start plus completion)", seq)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestFinishedDurableActorDoesNotAppendUndeliverableMessage(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	clock := statecharts.NewManualClock(time.Unix(0, 0))
+	chart := buildDelayedFinishingChart(time.Second)
+	sys := NewSystem(
+		WithLog(log), WithSnapshotStore(log), WithClock(clock), WithIdleTimeout(0),
+	)
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "finished", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	clock.Advance(2 * time.Second)
+	inst := testInstanceFor(sys, "finished")
+	select {
+	case <-inst.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatalf("actor did not finish from its internal timer")
+	}
+
+	if err := sys.Tell(ctx, "finished", statecharts.Event{Name: "too-late", Type: statecharts.EventExternal}); !errors.Is(err, statecharts.ErrInstanceStopped) {
+		t.Fatalf("Tell after final state = %v, want ErrInstanceStopped", err)
+	}
+	seq, err := log.LastSeq(ctx, "finished")
+	if err != nil {
+		t.Fatalf("LastSeq: %v", err)
+	}
+	if seq != 2 {
+		t.Fatalf("LastSeq after rejected post-final Tell = %d, want 2 (start plus timer only)", seq)
+	}
+	if err := sys.Spawn(ctx, "finished", chart.ID(), Durable()); err != nil {
+		t.Fatalf("re-Spawn after rejected message poisoned replay: %v", err)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestNodeQualifiedAddressIsDurableSessionID(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	var dms []*counterModel
+	chart := buildLadderChart(&dms)
+	sys := NewSystem(
+		WithNodeName("warehouse-a"), WithLog(log), WithSnapshotStore(log),
+	)
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "counter-1", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := sys.Tell(ctx, "warehouse-a.counter-1", statecharts.Event{Name: "inc", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+	if seq, err := log.LastSeq(ctx, "warehouse-a.counter-1"); err != nil || seq != 2 {
+		t.Fatalf("qualified LastSeq = %d, %v, want 2, nil", seq, err)
+	}
+	if seq, err := log.LastSeq(ctx, "counter-1"); err != nil || seq != 0 {
+		t.Fatalf("unqualified LastSeq = %d, %v, want 0, nil", seq, err)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestDurableActorDoesNotRestartInitialInvokeAfterCrashBeforeFirstMessage(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	var mu sync.Mutex
+	starts := 0
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	buildChart := func() *statecharts.Chart {
+		chart, err := statecharts.Build(
+			statecharts.Compound("initial-invoke", "invoking",
+				statecharts.Children(
+					statecharts.Atomic("invoking",
+						statecharts.Invoke(func(ctx context.Context, _ any, _ statecharts.InvokeIO) (any, error) {
+							mu.Lock()
+							starts++
+							mu.Unlock()
+							startedOnce.Do(func() { close(started) })
+							<-ctx.Done()
+							return nil, nil
+						}, statecharts.WithInvokeID("work")),
+						statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("recovered")),
+					),
+					statecharts.Atomic("recovered"),
+				),
+			),
+			statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+		)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return chart
+	}
+
+	sys1 := NewSystem(WithLog(log), WithSnapshotStore(log), WithIdleTimeout(0))
+	chart1 := buildChart()
+	if err := sys1.Register(chart1); err != nil {
+		t.Fatalf("Register sys1: %v", err)
+	}
+	if err := sys1.Spawn(ctx, "worker", chart1.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn sys1: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("initial invoke never started")
+	}
+	if seq, err := log.LastSeq(ctx, "worker"); err != nil || seq != 1 {
+		t.Fatalf("LastSeq after durable start = %d, %v, want 1, nil (session-start marker)", seq, err)
+	}
+	// Simulate a process crash without checkpointing the System. Stopping the
+	// captured Instance merely prevents the test's stand-in invoke goroutine
+	// from leaking; no System checkpoint or actor message is written.
+	if err := testInstanceFor(sys1, "worker").Stop(ctx); err != nil {
+		t.Fatalf("stop crashed instance: %v", err)
+	}
+
+	sys2 := NewSystem(WithLog(log), WithSnapshotStore(log), WithIdleTimeout(0))
+	chart2 := buildChart()
+	if err := sys2.Register(chart2); err != nil {
+		t.Fatalf("Register sys2: %v", err)
+	}
+	if err := sys2.Spawn(ctx, "worker", chart2.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn sys2: %v", err)
+	}
+	mu.Lock()
+	gotStarts := starts
+	mu.Unlock()
+	if gotStarts != 1 {
+		t.Fatalf("initial invoke starts = %d, want 1 across crash recovery", gotStarts)
+	}
+	if inst := testInstanceFor(sys2, "worker"); inst == nil || !hasStateID(inst.Configuration(), "recovered") {
+		var cfg []statecharts.Identifier
+		if inst != nil {
+			cfg = inst.Configuration()
+		}
+		t.Fatalf("recovered configuration = %v, want recovered", cfg)
+	}
+	if err := sys1.Stop(ctx); err != nil {
+		t.Fatalf("Stop sys1: %v", err)
+	}
+	if err := sys2.Stop(ctx); err != nil {
+		t.Fatalf("Stop sys2: %v", err)
 	}
 }

@@ -11,25 +11,26 @@ import (
 // delivers, identifying the routing mechanism that populated Origin.
 const originTypeActors statecharts.Identifier = "actors"
 
-// actorOriginContextKey is the context key withActorOrigin/actorOriginFrom
-// use to carry a Send call's sending actor across the one seam that has no
-// field for it: a fallback IOProcessor's Send(ctx, req) (see WithFallback).
+// actorOriginContextKey carries the source actor's routing state across the
+// fallback IOProcessor seam. SendRequest has no sender/Dispatcher fields,
+// but an asynchronous Bridge needs both to preserve Origin, report a late
+// failure, and register its work with the source System's shutdown.
 type actorOriginContextKey struct{}
 
-// withActorOrigin returns a copy of ctx carrying self as the acting actor,
-// for a fallback IOProcessor's own Send to recover with actorOriginFrom.
-func withActorOrigin(ctx context.Context, self statecharts.Identifier) context.Context {
-	return context.WithValue(ctx, actorOriginContextKey{}, self)
+type actorRouteContext struct {
+	address    statecharts.Identifier
+	system     *System
+	dispatcher statecharts.Dispatcher
+	sendID     statecharts.Identifier
 }
 
-// actorOriginFrom reports the actor that made the Send call ctx was passed
-// to, if ctx reached a fallback IOProcessor through a System's own routing
-// (see withActorOrigin). ok is false for any other ctx, e.g. one an
-// IOProcessor receives directly from the interpreter for a non-fallback
-// Send.
-func actorOriginFrom(ctx context.Context) (statecharts.Identifier, bool) {
-	self, ok := ctx.Value(actorOriginContextKey{}).(statecharts.Identifier)
-	return self, ok
+func withActorOrigin(ctx context.Context, route actorRouteContext) context.Context {
+	return context.WithValue(ctx, actorOriginContextKey{}, route)
+}
+
+func actorRouteFrom(ctx context.Context) (actorRouteContext, bool) {
+	route, ok := ctx.Value(actorOriginContextKey{}).(actorRouteContext)
+	return route, ok
 }
 
 // routingProcessor is the statecharts.IOProcessor every actor a System
@@ -44,10 +45,10 @@ func actorOriginFrom(ctx context.Context) (statecharts.Identifier, bool) {
 // configured (see WithFallback), in which case the request is handed to it
 // instead of failing outright. Actually acquiring the target -- paging it
 // in if necessary, possibly evicting another resident actor first to stay
-// within the residency limit -- and delivering the event is handed off to a
-// goroutine, so Send never blocks on the target's own processing. Two
-// actors sending to each other at the same instant would otherwise be able
-// to deadlock each other's Send call.
+// within the residency limit -- and delivering the event is handed off to
+// the System's ordered dispatcher, so Send never blocks on the target's own
+// processing. Two actors sending to each other at the same instant would
+// otherwise be able to deadlock each other's Send call.
 type routingProcessor struct {
 	sys  *System
 	self statecharts.Identifier
@@ -71,7 +72,11 @@ func (p *routingProcessor) Attach(d statecharts.Dispatcher) {
 // Send implements statecharts.IOProcessor. See routingProcessor's own doc
 // comment for the synchronous/asynchronous split this relies on.
 func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest) error {
-	if _, ok := p.sys.resolve(req.Target); !ok {
+	if req.Type != statecharts.SCXMLEventProcessor && req.Type != originTypeActors {
+		return unsupportedPeerTypeError{typ: req.Type}
+	}
+	_, target, ok := p.sys.resolveTarget(req.Target)
+	if !ok {
 		if p.sys.cfg.fallback == nil {
 			return fmt.Errorf("actors: unknown actor %q", req.Target)
 		}
@@ -81,7 +86,9 @@ func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest
 		// one value shared by every actor in sys, so there is nowhere else
 		// to attach it without racing concurrent Send calls from different
 		// actors against each other. actorOriginFrom recovers it.
-		return p.sys.cfg.fallback.Send(withActorOrigin(ctx, p.self), req)
+		return p.sys.cfg.fallback.Send(withActorOrigin(ctx, actorRouteContext{
+			address: p.self, system: p.sys, dispatcher: p.disp, sendID: req.SendID,
+		}), req)
 	}
 
 	ev := statecharts.Event{
@@ -94,14 +101,18 @@ func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest
 	}
 
 	origin := p.disp
-	target := req.Target
-	p.sys.asyncWG.Add(1)
-	go func() {
-		defer p.sys.asyncWG.Done()
-		p.sys.deliverAsync(context.Background(), target, ev, origin)
-	}()
-	return nil
+	return p.sys.enqueueDispatch(func() {
+		p.sys.deliverAsync(context.Background(), target, ev, origin, req.SendID)
+	})
 }
+
+type unsupportedPeerTypeError struct{ typ statecharts.Identifier }
+
+func (e unsupportedPeerTypeError) Error() string {
+	return fmt.Sprintf("actors: routing IOProcessor does not support send type %q", e.typ)
+}
+
+func (unsupportedPeerTypeError) SendExecutionError() {}
 
 // Cancel implements statecharts.IOProcessor. Delayed-send bookkeeping lives
 // in the interpreter core (see clock.go, interpreter.go), never inside an
@@ -122,5 +133,6 @@ func (p *routingProcessor) Cancel(ctx context.Context, sendID statecharts.Identi
 func (p *routingProcessor) IOProcessors() []statecharts.IOProcessorInfo {
 	return []statecharts.IOProcessorInfo{
 		{Type: originTypeActors, Location: statecharts.LocationFromIdentifier(p.self)},
+		{Type: statecharts.SCXMLEventProcessor, Location: statecharts.LocationFromIdentifier(p.self)},
 	}
 }

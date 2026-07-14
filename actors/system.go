@@ -21,16 +21,18 @@ type systemConfig struct {
 	snapshots      statecharts.SnapshotStore
 	idleTimeout    time.Duration
 	residencyLimit func(resident int) bool
+	dispatchLimit  int
 	clock          statecharts.Clock
 	logger         statecharts.Logger
 	onSweepError   func(name statecharts.Identifier, err error)
 	fallback       statecharts.IOProcessor
 }
 
-// WithNodeName labels a System for diagnostics -- which process currently
-// has which actors resident shows up in error messages, for logs and
-// metrics, not for addressing. An actor's name means the same thing
-// regardless of which node's System happens to have it loaded right now.
+// WithNodeName gives this System its routing namespace. A spawned actor's
+// full address is "<node>.<name>"; that address is used as its Instance
+// session ID, durable-log key, advertised IOProcessor location, and event
+// Origin. Unqualified names remain accepted for calls made directly against
+// this System.
 func WithNodeName(name string) Option {
 	return func(c *systemConfig) { c.nodeName = name }
 }
@@ -74,6 +76,14 @@ func WithResidencyLimit(fn func(resident int) bool) Option {
 // resident >= n }).
 func WithMaxResident(n int) Option {
 	return WithResidencyLimit(func(resident int) bool { return resident >= n })
+}
+
+// WithDispatchLimit bounds the number of accepted peer deliveries waiting
+// for the System's ordered dispatcher. IOProcessor.Send never blocks; once
+// the queue is full it returns an error.communication to the sender instead
+// of allocating an unbounded goroutine per message. Defaults to 1024.
+func WithDispatchLimit(n int) Option {
+	return func(c *systemConfig) { c.dispatchLimit = n }
 }
 
 // WithClock sets the Clock a System uses for idle-timeout bookkeeping and
@@ -122,9 +132,10 @@ func WithFallback(io statecharts.IOProcessor) Option {
 
 func defaultSystemConfig() systemConfig {
 	return systemConfig{
-		idleTimeout: 5 * time.Minute,
-		clock:       statecharts.NewRealClock(),
-		logger:      statecharts.NoopLogger,
+		idleTimeout:   5 * time.Minute,
+		dispatchLimit: 1024,
+		clock:         statecharts.NewRealClock(),
+		logger:        statecharts.NoopLogger,
 	}
 }
 
@@ -141,14 +152,25 @@ type System struct {
 	tableMu sync.Mutex
 	table   map[statecharts.Identifier]*actorEntry
 
+	// admissionMu makes the residency check, any required eviction, and the
+	// publication of the newly started Instance one atomic admission. Entry
+	// locks still serialize lifecycle changes for an individual actor.
+	admissionMu sync.Mutex
+
 	stopped     atomic.Bool
 	sweepMu     sync.Mutex
 	sweepCancel func() bool
 
-	// asyncWG tracks in-flight asynchronous peer deliveries (see
-	// router.go), so Stop can wait for them to finish touching an Instance
-	// before returning.
-	asyncWG sync.WaitGroup
+	// dispatchMu/dispatchCond protect one bounded FIFO of asynchronous peer
+	// work. A single lazy worker preserves send order without allocating a
+	// goroutine per message. Bridge uses the source System's same queue, so
+	// Stop also waits for accepted cross-System deliveries.
+	dispatchMu      sync.Mutex
+	dispatchCond    *sync.Cond
+	dispatchQueue   []func()
+	dispatchRunning bool
+	dispatchClosed  bool
+	dispatchDone    chan struct{}
 }
 
 // actorEntry is the system's record of one named actor, whether or not it
@@ -182,6 +204,7 @@ func NewSystem(opts ...Option) *System {
 		charts: map[statecharts.Identifier]*statecharts.Chart{},
 		table:  map[statecharts.Identifier]*actorEntry{},
 	}
+	s.dispatchCond = sync.NewCond(&s.dispatchMu)
 	s.armSweep()
 	return s
 }
@@ -319,6 +342,7 @@ func (s *System) Spawn(ctx context.Context, name, kind statecharts.Identifier, o
 		return fmt.Errorf("actors: Spawn: %w", ErrDurabilityUnsupported)
 	}
 
+	name = s.unqualifyOwnAddress(name)
 	entry, err := s.entryFor(name, kind, cfg.durable)
 	if err != nil {
 		return err
@@ -370,6 +394,38 @@ func (s *System) resolve(name statecharts.Identifier) (*actorEntry, bool) {
 	return e, ok
 }
 
+func (s *System) address(name statecharts.Identifier) statecharts.Identifier {
+	if s.cfg.nodeName == "" {
+		return name
+	}
+	return statecharts.Identifier(s.cfg.nodeName + "." + string(name))
+}
+
+func (s *System) unqualifyOwnAddress(name statecharts.Identifier) statecharts.Identifier {
+	if s.cfg.nodeName == "" {
+		return name
+	}
+	local, ok := stripNamespace(name, statecharts.Identifier(s.cfg.nodeName))
+	if !ok {
+		return name
+	}
+	return local
+}
+
+// resolveTarget accepts both an actor's local name and its node-qualified
+// address, returning the local table entry and canonical local name.
+func (s *System) resolveTarget(target statecharts.Identifier) (*actorEntry, statecharts.Identifier, bool) {
+	if entry, ok := s.resolve(target); ok {
+		return entry, target, true
+	}
+	local := s.unqualifyOwnAddress(target)
+	if local == target {
+		return nil, "", false
+	}
+	entry, ok := s.resolve(local)
+	return entry, local, ok
+}
+
 // activateLocked makes entry resident, paging it in (durable actors, via
 // statecharts.Rehydrate) or starting it fresh (non-durable, via
 // statecharts.New plus Start), admitting it under the residency limit
@@ -395,6 +451,14 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 	if entry.instance.Load() != nil {
 		return nil
 	}
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	// Another caller can only have activated this entry before we acquired
+	// entry.mu, but retain this check beside the admission boundary so future
+	// lifecycle callers cannot accidentally reserve twice.
+	if entry.instance.Load() != nil {
+		return nil
+	}
 	if s.stopped.Load() {
 		return fmt.Errorf("actors: activate %q: %w", entry.name, ErrSystemStopped)
 	}
@@ -407,7 +471,23 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 		return fmt.Errorf("actors: activate %q: kind %q is not registered: %w", entry.name, entry.kind, ErrKindNotRegistered)
 	}
 	dm, _ := chart.NewDatamodel()
-	proc := newRoutingProcessor(s, entry.name)
+	address := s.address(entry.name)
+	proc := newRoutingProcessor(s, address)
+	ingressHook := func(ev statecharts.Event) error {
+		entry.lastActive.Store(s.cfg.clock.Now().UnixNano())
+		if !entry.durable {
+			return nil
+		}
+		if _, err := s.cfg.log.Append(context.Background(), statecharts.LogEntry{
+			SessionID: statecharts.SessionID(address),
+			Kind:      statecharts.KindExternalEvent,
+			Timestamp: s.cfg.clock.Now().UTC(),
+			Event:     ev,
+		}); err != nil {
+			return fmt.Errorf("actors: append %q: %w", address, err)
+		}
+		return nil
+	}
 
 	var inst *statecharts.Instance
 	var err error
@@ -418,13 +498,50 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 		// counterpart to System.deliver's explicit Log.Append before each
 		// externally-originated message (Tell, peer Send). Without this, a
 		// durable actor's self-scheduled sends would never be durable.
-		inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, statecharts.SessionID(entry.name), proc,
+		instanceOpts := []statecharts.Option{
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger),
-			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.log, statecharts.SessionID(entry.name), s.cfg.clock)),
-		)
+			statecharts.WithIngressHook(ingressHook),
+			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.log, statecharts.SessionID(address), s.cfg.clock)),
+		}
+		hasLogEntries := false
+		for _, readErr := range s.cfg.log.Read(ctx, statecharts.SessionID(address), 1) {
+			if readErr != nil {
+				return fmt.Errorf("actors: inspect log for %q: %w", address, readErr)
+			}
+			hasLogEntries = true
+			break
+		}
+		_, hasCheckpoint, loadErr := s.cfg.snapshots.Load(ctx, statecharts.SessionID(address))
+		if loadErr != nil {
+			return fmt.Errorf("actors: inspect checkpoint for %q: %w", address, loadErr)
+		}
+		if !hasLogEntries && !hasCheckpoint {
+			// This is a genuinely new actor, not a reconstruction. Starting it
+			// live is what lets initial <invoke> content run. Persist the start
+			// boundary first so a crash before the first ordinary message cannot
+			// make a later process mistake the actor for new and invoke twice.
+			if _, err := s.cfg.log.Append(ctx, statecharts.LogEntry{
+				SessionID: statecharts.SessionID(address),
+				Kind:      statecharts.KindSessionStarted,
+				Timestamp: s.cfg.clock.Now().UTC(),
+			}); err != nil {
+				return fmt.Errorf("actors: record session start for %q: %w", address, err)
+			}
+			liveOpts := append(instanceOpts,
+				statecharts.WithIOProcessor(proc),
+				statecharts.WithSessionID(statecharts.SessionID(address)),
+			)
+			inst = statecharts.New(chart, dm, liveOpts...)
+			err = inst.Start(ctx)
+		} else {
+			inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, statecharts.SessionID(address), proc, instanceOpts...)
+		}
 	} else {
-		inst = statecharts.New(chart, dm, statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock), statecharts.WithLogger(s.cfg.logger), statecharts.WithSessionID(statecharts.SessionID(entry.name)))
+		inst = statecharts.New(chart, dm,
+			statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock),
+			statecharts.WithLogger(s.cfg.logger), statecharts.WithIngressHook(ingressHook),
+			statecharts.WithSessionID(statecharts.SessionID(address)))
 		err = inst.Start(ctx)
 	}
 	if err != nil {
@@ -593,11 +710,12 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 		return nil
 	}
 	err := inst.Checkpoint(ctx, func(snap statecharts.Snapshot) error {
-		seq, err := s.cfg.log.LastSeq(ctx, statecharts.SessionID(entry.name))
+		address := s.address(entry.name)
+		seq, err := s.cfg.log.LastSeq(ctx, statecharts.SessionID(address))
 		if err != nil {
 			return fmt.Errorf("actors: last seq %q: %w", entry.name, err)
 		}
-		if err := s.cfg.snapshots.Save(ctx, statecharts.SessionID(entry.name), statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
+		if err := s.cfg.snapshots.Save(ctx, statecharts.SessionID(address), statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
 			return fmt.Errorf("actors: save checkpoint %q: %w", entry.name, err)
 		}
 		return nil
@@ -613,36 +731,30 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 // through, whether from Tell or from asynchronous peer delivery
 // (deliverAsync). It acquires name's live Instance -- paging it in first if
 // it names a known but not currently resident durable actor -- write-ahead
-// logs ev if name is durable, and only then calls Deliver, all while
-// holding entry.mu for name.
+// calls Deliver, all while holding entry.mu for name. A durable Instance's
+// ingress hook appends ev immediately before applying it on the actor
+// goroutine, so invocation results use this same write-ahead boundary.
 //
 // Holding entry.mu across this entire sequence, not just the pointer read,
 // is what makes delivery and eviction for the same name mutually
 // exclusive: an idle-timeout or residency-limit eviction (evictLocked,
 // runSweep, admit) cannot Snapshot-and-stop this same entry while a
 // delivery to it is in progress, and cannot run between this method's
-// Log.Append and its Deliver call either, since both happen under the same
-// lock acquisition. That in turn is what keeps Log.Append calls for a
-// given name strictly ordered the same as the Deliver calls they precede:
-// two concurrent callers targeting the same durable name are serialized
-// here, so the write-ahead log's order always matches application order,
-// never a race between them.
+// Deliver call. Two concurrent callers targeting the same durable name are
+// serialized here, and the Instance actor goroutine serializes every other
+// ingress source, so write-ahead log order always matches application order.
 //
 // This blocks its caller's goroutine for an entire macrostep (activation,
 // possibly a full replay, plus one Deliver), but never the goroutine of an
 // actor's own interpreter: Tell runs on whatever goroutine an application
-// called it from, and deliverAsync runs on the system's own per-Send
-// goroutine (see router.go) -- neither is the target's own interpreter
-// goroutine, so this holds up only the system's bookkeeping for name, not
-// any chart's own microstep execution. That is the same non-blocking
-// contract IOProcessor.Send itself relies on (see routingProcessor.Send,
-// which hands off to deliverAsync precisely so its own return is
-// immediate).
+// called it from, and deliverAsync runs on the System dispatcher (see
+// router.go) -- neither is the target's own interpreter goroutine. That is
+// the same non-blocking contract IOProcessor.Send itself relies on.
 func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev statecharts.Event) error {
 	if s.stopped.Load() {
 		return fmt.Errorf("actors: %q: %w", name, ErrSystemStopped)
 	}
-	entry, ok := s.resolve(name)
+	entry, _, ok := s.resolveTarget(name)
 	if !ok {
 		return fmt.Errorf("actors: unknown actor %q: %w", name, ErrUnknownActor)
 	}
@@ -661,26 +773,6 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 		inst = entry.instance.Load()
 	}
 
-	if entry.durable {
-		// Write-ahead: durability's entire premise (log.go's own contract)
-		// is that Append happens, and succeeds, before a message's effects
-		// are applied -- a crash between the two just means replay
-		// reprocesses this entry, which is safe since Instance.Deliver is
-		// deterministic given the event. Appending here, rather than only at
-		// the next checkpoint, is what keeps a crash from losing every
-		// message since the last checkpoint instead of just the one
-		// in-flight macrostep.
-		if _, err := s.cfg.log.Append(ctx, statecharts.LogEntry{
-			SessionID: statecharts.SessionID(name),
-			Kind:      statecharts.KindExternalEvent,
-			Timestamp: s.cfg.clock.Now().UTC(),
-			Event:     ev,
-		}); err != nil {
-			return fmt.Errorf("actors: append %q: %w", name, err)
-		}
-	}
-
-	entry.lastActive.Store(s.cfg.clock.Now().UnixNano())
 	err := inst.Deliver(ctx, ev)
 
 	// The overwhelmingly common way an actor reaches its own top-level
@@ -712,9 +804,9 @@ func (s *System) Tell(ctx context.Context, name statecharts.Identifier, ev state
 // back to origin, the sending actor's own Dispatcher, since there is no
 // other route back into that session once its own dispatchNow call has
 // already returned.
-func (s *System) deliverAsync(ctx context.Context, target statecharts.Identifier, ev statecharts.Event, origin statecharts.Dispatcher) {
+func (s *System) deliverAsync(ctx context.Context, target statecharts.Identifier, ev statecharts.Event, origin statecharts.Dispatcher, sendID statecharts.Identifier) {
 	if err := s.deliver(ctx, target, ev); err != nil {
-		s.reportDeliveryFailure(ctx, origin, target, err)
+		s.reportDeliveryFailure(ctx, origin, sendID, target, err)
 	}
 }
 
@@ -723,17 +815,82 @@ func (s *System) deliverAsync(ctx context.Context, target statecharts.Identifier
 // synchronously-discovered dispatch failure (see interpreter.go,
 // reportCommError), so a chart handles both the same way regardless of
 // whether the failure was discovered during Send or afterward.
-func (s *System) reportDeliveryFailure(ctx context.Context, origin statecharts.Dispatcher, target statecharts.Identifier, cause error) {
+func (s *System) reportDeliveryFailure(ctx context.Context, origin statecharts.Dispatcher, sendID, target statecharts.Identifier, cause error) {
 	if origin == nil {
 		return
 	}
 	ev := statecharts.Event{
 		Name:   statecharts.ErrEventCommunication,
-		Type:   statecharts.EventExternal,
+		Type:   statecharts.EventPlatform,
+		SendID: sendID,
 		Data:   fmt.Errorf("actors: deliver to %q failed: %w", target, cause),
-		Origin: target,
 	}
 	_ = origin.Deliver(ctx, ev)
+}
+
+var errDispatchQueueFull = errors.New("actors: peer dispatch queue is full")
+
+func (s *System) enqueueDispatch(job func()) error {
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+	if s.stopped.Load() || s.dispatchClosed {
+		return ErrSystemStopped
+	}
+	if len(s.dispatchQueue) >= s.cfg.dispatchLimit {
+		return errDispatchQueueFull
+	}
+	if !s.dispatchRunning {
+		s.dispatchRunning = true
+		s.dispatchDone = make(chan struct{})
+		go s.runDispatcher()
+	}
+	s.dispatchQueue = append(s.dispatchQueue, job)
+	s.dispatchCond.Signal()
+	return nil
+}
+
+func (s *System) runDispatcher() {
+	defer func() {
+		s.dispatchMu.Lock()
+		close(s.dispatchDone)
+		s.dispatchMu.Unlock()
+	}()
+	for {
+		s.dispatchMu.Lock()
+		for len(s.dispatchQueue) == 0 && !s.dispatchClosed {
+			s.dispatchCond.Wait()
+		}
+		if len(s.dispatchQueue) == 0 && s.dispatchClosed {
+			s.dispatchMu.Unlock()
+			return
+		}
+		job := s.dispatchQueue[0]
+		s.dispatchQueue[0] = nil
+		s.dispatchQueue = s.dispatchQueue[1:]
+		s.dispatchMu.Unlock()
+		job()
+	}
+}
+
+func (s *System) closeDispatcher() <-chan struct{} {
+	s.dispatchMu.Lock()
+	s.dispatchClosed = true
+	done := s.dispatchDone
+	s.dispatchCond.Broadcast()
+	s.dispatchMu.Unlock()
+	return done
+}
+
+func awaitDoneWithContext(ctx context.Context, done <-chan struct{}) error {
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // armSweep schedules the next idle-timeout check, if idle-timeout paging is
@@ -845,8 +1002,8 @@ func (s *System) runSweep() {
 // Running each entry's stop attempt on its own goroutine means a wedged
 // entry only blocks that one goroutine; Stop itself only waits on all of
 // them together, bounded by ctx, and returns ctx.Err() if it fires first
-// while those goroutines keep trying in the background -- the same "still
-// make a best effort" contract as the final asyncWG wait.
+// while those goroutines keep trying in the background. Accepted peer work
+// is likewise drained by the dispatcher, with its wait bounded by ctx.
 func (s *System) Stop(ctx context.Context) error {
 	s.tableMu.Lock()
 	firstStop := s.stopped.CompareAndSwap(false, true)
@@ -856,12 +1013,18 @@ func (s *System) Stop(ctx context.Context) error {
 	}
 	s.tableMu.Unlock()
 
+	var dispatchDone <-chan struct{}
 	if firstStop {
+		dispatchDone = s.closeDispatcher()
 		s.sweepMu.Lock()
 		if s.sweepCancel != nil {
 			s.sweepCancel()
 		}
 		s.sweepMu.Unlock()
+	} else {
+		s.dispatchMu.Lock()
+		dispatchDone = s.dispatchDone
+		s.dispatchMu.Unlock()
 	}
 
 	var errMu sync.Mutex
@@ -906,7 +1069,7 @@ func (s *System) Stop(ctx context.Context) error {
 		}(e)
 	}
 	recordErr(awaitWithContext(ctx, &wg))
-	recordErr(awaitWithContext(ctx, &s.asyncWG))
+	recordErr(awaitDoneWithContext(ctx, dispatchDone))
 
 	return errors.Join(errs...)
 }

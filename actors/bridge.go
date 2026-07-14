@@ -10,26 +10,21 @@ import (
 )
 
 // Bridge is a fallback IOProcessor (see WithFallback) that connects two
-// Systems. A Bridge is configured with a namespace and a target System:
-// Send accepts only targets whose first Identifier segment is that
-// namespace, strips it, and delivers the rest to target via Tell. An actor
-// in system A reaches an actor named "billing" in system B by addressing
-// "warehouse-b.billing", once A is built with:
+// Systems. Send accepts only targets qualified by the target System's node
+// name, strips that prefix, and delivers the rest to target via Tell. For a
+// target System without a node name, Bridge uses its configured namespace.
+// An actor in system A reaches an actor named "billing" in system B by
+// addressing "warehouse-b.billing", once A is built with:
 //
 //	sysA := actors.NewSystem(actors.WithFallback(
 //		actors.NewBridge("warehouse-b", sysB, "warehouse-a"),
 //	))
 //
-// origin is the namespace this Bridge stamps onto Origin for every event it
-// forwards, e.g. "warehouse-a.caller-1" for an event originally sent by
-// "caller-1". It exists so a reply from inside the target System is just
-// another Send targeting ev.Origin: system B's own routing doesn't
-// recognize "warehouse-a.caller-1" as one of its own actors either, falls
-// through to whatever fallback B was built with, and a Bridge configured the
-// other way around (namespace "warehouse-a", target sysA, origin
-// "warehouse-b") strips the prefix and delivers the reply back to
-// "caller-1". Two Systems bridged this way need one Bridge each, one per
-// direction.
+// Events from a node-named source System use the sender's already-qualified
+// address as Origin. For a source System without a node name, origin is the
+// namespace Bridge prepends to the local sender name. A reply from inside
+// the target System is then another Send targeting ev.Origin. Two Systems
+// bridged this way need one Bridge each, one per direction.
 //
 // Wiring two Systems together this way is inherently circular -- each
 // Bridge's target is the other System, but neither System can finish being
@@ -77,34 +72,35 @@ func (b *Bridge) targetSystem() *System {
 // WithFallback) -- so there is no Dispatcher for it to capture here.
 func (b *Bridge) Attach(statecharts.Dispatcher) {}
 
-// Send implements statecharts.IOProcessor. It resolves only whether
-// req.Target carries b's own namespace and whether the name that remains is
-// known to b's target System, both cheap and synchronous; either check
-// failing is an ordinary returned error, exactly as an unrecognized name is
-// for a System's own routing IOProcessor. Once both checks pass, delivering
-// the event -- which may page an actor into the target System, replay its
-// log, or block on its own bookkeeping -- happens on a new goroutine, so
-// Send itself always returns immediately. A failure discovered only during
-// that later delivery (paging the actor back in, say) is not reported back
-// to the sender the way a same-System peer Send's failure is -- there is no
-// Dispatcher here to report it to (see Attach) -- so it is silently
-// dropped.
+// Send implements statecharts.IOProcessor. It synchronously validates the
+// target node and actor, then queues delivery on the source System's ordered
+// dispatcher. This keeps Send non-blocking, preserves sender order, makes
+// source shutdown wait for accepted work, and lets a late delivery failure
+// return to the sending actor. A direct call without source routing context
+// instead uses the target System's dispatcher and cannot report late errors.
 func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
-	name, ok := stripNamespace(req.Target, b.namespace)
-	if !ok {
-		return fmt.Errorf("actors: Bridge: %q is not addressed to namespace %q", req.Target, b.namespace)
-	}
 	target := b.targetSystem()
 	if target == nil {
 		return fmt.Errorf("actors: Bridge: unknown actor %q (no target system configured)", req.Target)
 	}
-	if _, ok := target.resolve(name); !ok {
+	namespace := b.namespace
+	if target.cfg.nodeName != "" {
+		namespace = statecharts.Identifier(target.cfg.nodeName)
+	}
+	name, ok := stripNamespace(req.Target, namespace)
+	if !ok {
+		return fmt.Errorf("actors: Bridge: %q is not addressed to target node %q", req.Target, namespace)
+	}
+	if _, _, ok := target.resolveTarget(name); !ok {
 		return fmt.Errorf("actors: Bridge: unknown actor %q in target system", name)
 	}
 
-	sender, _ := actorOriginFrom(ctx)
+	route, routed := actorRouteFrom(ctx)
+	sender := route.address
 	origin := b.origin
-	if sender != "" {
+	if routed && route.system != nil && route.system.cfg.nodeName != "" {
+		origin = sender
+	} else if sender != "" {
 		origin = statecharts.Identifier(string(b.origin) + "." + string(sender))
 	}
 	ev := statecharts.Event{
@@ -116,10 +112,15 @@ func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
 		OriginType: originTypeActors,
 	}
 
-	go func() {
-		_ = target.Tell(context.Background(), name, ev)
-	}()
-	return nil
+	job := func() {
+		if err := target.Tell(context.Background(), name, ev); err != nil && routed && route.system != nil {
+			route.system.reportDeliveryFailure(context.Background(), route.dispatcher, route.sendID, req.Target, err)
+		}
+	}
+	if routed && route.system != nil {
+		return route.system.enqueueDispatch(job)
+	}
+	return target.enqueueDispatch(job)
 }
 
 // Cancel implements statecharts.IOProcessor. A Bridge keeps no bookkeeping
@@ -129,12 +130,13 @@ func (b *Bridge) Cancel(context.Context, statecharts.Identifier) error {
 	return nil
 }
 
-// stripNamespace reports the Identifier remaining after removing ns as
-// id's first dot-separated segment, and whether id had that segment at all.
+// stripNamespace reports the Identifier remaining after removing ns and its
+// following dot. Both namespace and remainder may contain multiple segments.
 func stripNamespace(id, ns statecharts.Identifier) (statecharts.Identifier, bool) {
-	segments := id.Segments()
-	if len(segments) < 2 || segments[0] != string(ns) {
+	prefix := string(ns) + "."
+	value := string(id)
+	if !strings.HasPrefix(value, prefix) || len(value) == len(prefix) {
 		return "", false
 	}
-	return statecharts.Identifier(strings.Join(segments[1:], ".")), true
+	return statecharts.Identifier(strings.TrimPrefix(value, prefix)), true
 }

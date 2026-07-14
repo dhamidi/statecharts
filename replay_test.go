@@ -1795,3 +1795,69 @@ func (s *spyIOProcessor) Send(ctx context.Context, req SendRequest) error {
 	return nil
 }
 func (s *spyIOProcessor) Cancel(ctx context.Context, sendID Identifier) error { return nil }
+
+type capturingIOProcessor struct {
+	dispatcher Dispatcher
+}
+
+func (c *capturingIOProcessor) Attach(d Dispatcher)                      { c.dispatcher = d }
+func (c *capturingIOProcessor) Send(context.Context, SendRequest) error  { return nil }
+func (c *capturingIOProcessor) Cancel(context.Context, Identifier) error { return nil }
+
+func TestRehydrateStopsStartedInstanceWhenReplayFails(t *testing.T) {
+	ctx := context.Background()
+	chart, err := Build(Atomic("live"))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	log := newMemLog()
+	if _, err := log.Append(ctx, LogEntry{
+		SessionID: "broken-replay", Kind: EntryKind("unknown"), Timestamp: time.Unix(1, 0),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	io := &capturingIOProcessor{}
+	if _, err := Rehydrate(ctx, chart, nil, log, newMemSnapshotStore(), "broken-replay", io); err == nil {
+		t.Fatalf("Rehydrate succeeded, want replay error")
+	}
+	inst, ok := io.dispatcher.(*Instance)
+	if !ok || inst == nil {
+		t.Fatalf("captured Dispatcher = %T, want *Instance", io.dispatcher)
+	}
+	select {
+	case <-inst.Done():
+	case <-time.After(time.Second):
+		t.Fatalf("Instance remained running after Rehydrate returned an error")
+	}
+}
+
+func TestRehydrateCleanupHonorsCallerCancellation(t *testing.T) {
+	release := make(chan struct{})
+	chart, err := Build(Atomic("blocked-start", OnEntry(
+		Action(func(_ *struct{}, _ ExecContext) error {
+			<-release
+			return nil
+		}),
+	)))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() {
+		_, err := Rehydrate(ctx, chart, &struct{}{}, newMemLog(), newMemSnapshotStore(), "blocked-start", NoopIOProcessor)
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		close(release)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Rehydrate error = %v, want context deadline", err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-returned
+		t.Fatalf("Rehydrate cleanup ignored its expired caller context")
+	}
+}

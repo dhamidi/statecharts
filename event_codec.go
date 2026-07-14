@@ -2,9 +2,12 @@ package statecharts
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 )
+
+const errorDataType = "statecharts.error"
 
 // DataMarshaler lets a concrete Event.Data type control its own persisted
 // encoding. There is no expression language or generic datamodel to
@@ -59,17 +62,21 @@ func EncodeEvent(ev Event) (EncodedEvent, error) {
 	if ev.Data == nil {
 		return enc, nil
 	}
-	m, ok := ev.Data.(DataMarshaler)
-	if !ok {
-		return EncodedEvent{}, fmt.Errorf("statecharts: Event.Data of type %T does not implement DataMarshaler", ev.Data)
+	if m, ok := ev.Data.(DataMarshaler); ok {
+		typeName, payload, err := m.MarshalData()
+		if err != nil {
+			return EncodedEvent{}, fmt.Errorf("statecharts: MarshalData: %w", err)
+		}
+		enc.DataType = typeName
+		enc.DataPayload = payload
+		return enc, nil
 	}
-	typeName, payload, err := m.MarshalData()
-	if err != nil {
-		return EncodedEvent{}, fmt.Errorf("statecharts: MarshalData: %w", err)
+	if err, ok := ev.Data.(error); ok {
+		enc.DataType = errorDataType
+		enc.DataPayload = []byte(err.Error())
+		return enc, nil
 	}
-	enc.DataType = typeName
-	enc.DataPayload = payload
-	return enc, nil
+	return EncodedEvent{}, fmt.Errorf("statecharts: Event.Data of type %T does not implement DataMarshaler", ev.Data)
 }
 
 // DecodeEvent reconstructs an Event from its flat encoding, looking up
@@ -80,6 +87,10 @@ func DecodeEvent(enc EncodedEvent) (Event, error) {
 		SendID: enc.SendID, Origin: enc.Origin, OriginType: enc.OriginType, InvokeID: enc.InvokeID,
 	}
 	if enc.DataType == "" {
+		return ev, nil
+	}
+	if enc.DataType == errorDataType {
+		ev.Data = errors.New(string(enc.DataPayload))
 		return ev, nil
 	}
 	dataRegistryMu.RLock()
