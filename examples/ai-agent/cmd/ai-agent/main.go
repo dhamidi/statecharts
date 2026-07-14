@@ -18,7 +18,7 @@ import (
 	"syscall"
 
 	"github.com/dhamidi/statecharts"
-	"github.com/dhamidi/statecharts/sqllog"
+	"github.com/dhamidi/statecharts/sqllog/sqlite3"
 
 	"github.com/dhamidi/statecharts/examples/ai-agent/internal/client"
 	"github.com/dhamidi/statecharts/examples/ai-agent/internal/llm"
@@ -78,8 +78,8 @@ func parseTools(raw string) []protocol.ToolName {
 	return tools
 }
 
-func openLog(dbPath string) (*sqllog.Storage, error) {
-	return sqllog.OpenSQLite(dbPath)
+func openLog(dbPath string) (*sqlite3.Storage, error) {
+	return sqlite3.Open(dbPath)
 }
 
 // startServer wires up and starts the workspace server's actors.System and

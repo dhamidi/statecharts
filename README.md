@@ -831,19 +831,35 @@ clock.Advance(30 * time.Second) // fires any delayed sends now due
 
 ### The sqllog subpackage
 
-`sqllog` implements `DurableLog` and `SnapshotStore` in one SQLite storage
-value:
+`sqllog` implements `DurableLog` and `SnapshotStore` on a caller-provided
+`*sql.DB`. It does not register or select a database driver:
 
 ```go
-import "github.com/dhamidi/statecharts/sqllog"
+import (
+	"database/sql"
 
-storage, err := sqllog.OpenSQLite("statecharts.db")
+	"github.com/dhamidi/statecharts/sqllog"
+	_ "modernc.org/sqlite" // or another SQLite database/sql driver
+)
+
+db, err := sql.Open("sqlite", "statecharts.db")
+storage, err := sqllog.New(db, sqllog.SQLite)
+```
+
+For an opt-in, batteries-included SQLite configuration, import
+`sqllog/sqlite3` instead:
+
+```go
+import "github.com/dhamidi/statecharts/sqllog/sqlite3"
+
+storage, err := sqlite3.Open("statecharts.db")
 defer storage.Close()
 ```
 
-The returned `*sqllog.Storage` satisfies both interfaces, enables WAL mode
-for file-backed databases, and is the complete durable boundary for one
-`actors.System`. Give each System its own SQLite file.
+The SQLite adapter explicitly opts into the pure-Go ModernC driver, enables
+WAL mode for file-backed databases, and configures every pooled connection.
+Both constructors return storage satisfying the complete durable boundary
+for one `actors.System`. Give each System its own database.
 
 ## Running actor systems
 
@@ -973,8 +989,8 @@ fails. Each System must use its own SQLite database file (for example,
 `WithResidencyLimit` (below) control automatic paging.
 
 ```go
-mainStorage, _ := sqllog.OpenSQLite("data/main.db")
-billingStorage, _ := sqllog.OpenSQLite("data/billing.db")
+mainStorage, _ := sqlite3.Open("data/main.db")
+billingStorage, _ := sqlite3.Open("data/billing.db")
 main := actors.NewSystem(actors.WithStorage(mainStorage))
 billing := actors.NewSystem(actors.WithStorage(billingStorage))
 ```
@@ -1162,7 +1178,7 @@ import (
 
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
-	"github.com/dhamidi/statecharts/sqllog"
+	"github.com/dhamidi/statecharts/sqllog/sqlite3"
 )
 
 type Notifier struct{}
@@ -1261,7 +1277,7 @@ func buildJobChart() (*statecharts.Chart, error) {
 	)
 }
 
-func buildSystem(storage *sqllog.Storage) (*actors.System, error) {
+func buildSystem(storage actors.Storage) (*actors.System, error) {
 	sys := actors.NewSystem(
 		actors.WithNodeName("main"),
 		actors.WithStorage(storage),
@@ -1287,7 +1303,7 @@ func buildSystem(storage *sqllog.Storage) (*actors.System, error) {
 }
 
 func run(ctx context.Context) error {
-	storage, err := sqllog.OpenSQLite("actors.db")
+	storage, err := sqlite3.Open("actors.db")
 	if err != nil {
 		return err
 	}

@@ -14,11 +14,11 @@ import (
 
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
-	"github.com/dhamidi/statecharts/sqllog"
+	"github.com/dhamidi/statecharts/sqllog/sqlite3"
 )
 
-func openLog(path string) (*sqllog.Storage, error) {
-	return sqllog.OpenSQLite(path)
+func openLog(path string) (*sqlite3.Storage, error) {
+	return sqlite3.Open(path)
 }
 
 type streamTransport struct {
@@ -74,10 +74,10 @@ func (t *streamTransport) Send(ctx context.Context, req statecharts.SendRequest)
 type counterRuntime struct {
 	counters, ui *actors.System
 	streams      *streamTransport
-	storage      *sqllog.Storage
+	storage      *sqlite3.Storage
 }
 
-func setupCounters(ctx context.Context, store *sqllog.Log) (*counterRuntime, error) {
+func setupCounters(ctx context.Context, store *sqlite3.Storage) (*counterRuntime, error) {
 	registerCounterDataTypes()
 	hubChart, err := buildHubChart()
 	if err != nil {

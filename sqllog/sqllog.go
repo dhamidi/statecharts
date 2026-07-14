@@ -12,14 +12,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
-	"net/url"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/dhamidi/statecharts"
-	_ "modernc.org/sqlite"
 )
 
 // Storage implements statecharts.Log and statecharts.SnapshotStore against a
@@ -32,70 +27,15 @@ type Storage struct {
 // Log is retained as a source-compatible name for Storage.
 type Log = Storage
 
-// OpenSQLite opens an isolated SQLite database and applies sqllog's schema.
-func OpenSQLite(path string) (*Storage, error) {
-	if path == "" {
-		return nil, fmt.Errorf("sqllog: empty SQLite path")
-	}
-	fileBacked := path != ":memory:" && !strings.Contains(path, "mode=memory")
-	if fileBacked && !strings.HasPrefix(path, "file:") {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return nil, fmt.Errorf("sqllog: create database directory: %w", err)
-		}
-	}
-	dsn := path
-	if !strings.HasPrefix(dsn, "file:") && dsn != ":memory:" {
-		dsn = "file:" + filepath.ToSlash(dsn)
-	}
-	pragmas := []string{"busy_timeout(5000)", "foreign_keys(ON)", "synchronous(NORMAL)", "wal_autocheckpoint(1000)"}
-	sep := "?"
-	if strings.Contains(dsn, "?") {
-		sep = "&"
-	}
-	for _, pragma := range pragmas {
-		dsn += sep + "_pragma=" + url.QueryEscape(pragma)
-		sep = "&"
-	}
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("sqllog: open SQLite: %w", err)
-	}
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
-	if !fileBacked {
-		db.SetMaxOpenConns(1)
-		db.SetMaxIdleConns(1)
-	}
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("sqllog: ping SQLite: %w", err)
-	}
-	if fileBacked {
-		var mode string
-		if err := db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&mode); err != nil || !strings.EqualFold(mode, "wal") {
-			db.Close()
-			if err != nil {
-				return nil, fmt.Errorf("sqllog: enable WAL: %w", err)
-			}
-			return nil, fmt.Errorf("sqllog: enable WAL: got journal_mode %q", mode)
-		}
-	}
-	s, err := New(db, SQLite)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	return s, nil
-}
-
 // Close releases the database and its pooled connections.
 func (l *Storage) Close() error { return l.db.Close() }
 
 // DB returns the underlying pool for diagnostics and advanced use.
 func (l *Storage) DB() *sql.DB { return l.db }
 
-// New opens (and lazily creates) the schema for dialect against db. No
-// external migration tool is used or required.
+// New applies sqllog's schema to a caller-provided database/sql pool. The
+// caller is responsible for importing, opening, and configuring its driver.
+// No external migration tool is used or required.
 func New(db *sql.DB, dialect Dialect) (*Storage, error) {
 	if dialect != SQLite {
 		return nil, fmt.Errorf("sqllog: dialect %q is not supported", dialect)
