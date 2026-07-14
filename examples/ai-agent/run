@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Builds and runs ai-agent in embedded mode: one process, one workspace
+# server on a random loopback port, and a client (with the shell_command
+# tool) pointed at it -- the quickest way to try the example. For the
+# actual recovery demonstration (killing/restarting the server
+# independently of a client), use the two-process `serve`/`connect` form
+# documented in README.md.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+mkdir -p bin
+go build -o bin/ai-agent ./cmd/ai-agent
+exec ./bin/ai-agent --tools=shell_command
