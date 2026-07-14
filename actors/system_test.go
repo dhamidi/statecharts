@@ -707,7 +707,7 @@ func TestNodeNameQualifiesActorAddressAndLocalRouting(t *testing.T) {
 	ctx := context.Background()
 	var dms []*callerModel
 	responder := buildResponderChart()
-	caller := buildCallerChart(&dms, "warehouse-a.responder-1")
+	caller := buildCallerChart(&dms, "services.responder-1@warehouse-a")
 
 	sys := NewSystem(WithNodeName("warehouse-a"))
 	if err := sys.Register(responder); err != nil {
@@ -716,25 +716,49 @@ func TestNodeNameQualifiesActorAddressAndLocalRouting(t *testing.T) {
 	if err := sys.Register(caller); err != nil {
 		t.Fatalf("Register caller: %v", err)
 	}
-	if err := sys.Spawn(ctx, "responder-1", responder.ID()); err != nil {
+	if err := sys.Spawn(ctx, "services.responder-1", responder.ID()); err != nil {
 		t.Fatalf("Spawn responder: %v", err)
 	}
-	if err := sys.Spawn(ctx, "caller-1", caller.ID()); err != nil {
+	if err := sys.Spawn(ctx, "clients.caller-1", caller.ID()); err != nil {
 		t.Fatalf("Spawn caller: %v", err)
 	}
 
-	callerInstance := testInstanceFor(sys, "caller-1")
-	if callerInstance.ID() != "warehouse-a.caller-1" {
-		t.Fatalf("caller Instance.ID() = %q, want node-qualified address %q", callerInstance.ID(), "warehouse-a.caller-1")
+	callerInstance := testInstanceFor(sys, "clients.caller-1")
+	if callerInstance.ID() != "clients.caller-1" {
+		t.Fatalf("caller Instance.ID() = %q, want stable hierarchical actor ID %q", callerInstance.ID(), "clients.caller-1")
 	}
-	if err := sys.Tell(ctx, "warehouse-a.caller-1", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+	if err := sys.Tell(ctx, "clients.caller-1@warehouse-a", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
 		t.Fatalf("Tell by qualified address: %v", err)
 	}
 	waitFor(t, 2*time.Second, func() bool { return hasStateID(callerInstance.Configuration(), "done") })
-	if got := dms[len(dms)-1].ReceivedFrom; got != "warehouse-a.responder-1" {
-		t.Fatalf("reply Origin = %q, want node-qualified address %q", got, "warehouse-a.responder-1")
+	if got := dms[len(dms)-1].ReceivedFrom; got != "services.responder-1@warehouse-a" {
+		t.Fatalf("reply Origin = %q, want routable address %q", got, "services.responder-1@warehouse-a")
 	}
 
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestSpawnRejectsRoutingKeyAsActorID(t *testing.T) {
+	ctx := context.Background()
+	chart, err := statecharts.Build(
+		statecharts.Atomic("worker"),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	sys := NewSystem(WithNodeName("host-a"))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "workers.invoice-42@host-a", chart.ID()); !errors.Is(err, ErrInvalidActorID) {
+		t.Fatalf("Spawn error = %v, want ErrInvalidActorID for a routing key", err)
+	}
+	if _, ok := sys.resolve("workers.invoice-42@host-a"); ok {
+		t.Fatalf("rejected routing key was inserted into the actor table")
+	}
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -748,14 +772,14 @@ func TestNodeNameQualifiesAdvertisedIOProcessorLocation(t *testing.T) {
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if err := sys.Spawn(ctx, "locator-1", chart.ID()); err != nil {
+	if err := sys.Spawn(ctx, "tools.locator-1", chart.ID()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	if err := sys.Tell(ctx, "locator-1", statecharts.Event{Name: "check", Type: statecharts.EventExternal}); err != nil {
+	if err := sys.Tell(ctx, "tools.locator-1", statecharts.Event{Name: "check", Type: statecharts.EventExternal}); err != nil {
 		t.Fatalf("Tell: %v", err)
 	}
-	if got := dms[len(dms)-1].Location; got != "warehouse-a.locator-1" {
-		t.Fatalf("IOProcessor location = %q, want %q", got, "warehouse-a.locator-1")
+	if got := dms[len(dms)-1].Location; got != "tools.locator-1@warehouse-a" {
+		t.Fatalf("IOProcessor location = %q, want %q", got, "tools.locator-1@warehouse-a")
 	}
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -766,7 +790,7 @@ func TestMultiSegmentNodeNameRoundTripsThroughActorAddress(t *testing.T) {
 	ctx := context.Background()
 	var dms []*callerModel
 	responder := buildResponderChart()
-	caller := buildCallerChart(&dms, "eu.warehouse-a.responder-1")
+	caller := buildCallerChart(&dms, "responder-1@eu.warehouse-a")
 
 	sys := NewSystem(WithNodeName("eu.warehouse-a"))
 	if err := sys.Register(responder); err != nil {
@@ -781,13 +805,13 @@ func TestMultiSegmentNodeNameRoundTripsThroughActorAddress(t *testing.T) {
 	if err := sys.Spawn(ctx, "caller-1", caller.ID()); err != nil {
 		t.Fatalf("Spawn caller: %v", err)
 	}
-	if err := sys.Tell(ctx, "eu.warehouse-a.caller-1", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+	if err := sys.Tell(ctx, "caller-1@eu.warehouse-a", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
 		t.Fatalf("Tell by multi-segment qualified address: %v", err)
 	}
 	callerInstance := testInstanceFor(sys, "caller-1")
 	waitFor(t, 2*time.Second, func() bool { return hasStateID(callerInstance.Configuration(), "done") })
-	if got := dms[len(dms)-1].ReceivedFrom; got != "eu.warehouse-a.responder-1" {
-		t.Fatalf("reply Origin = %q, want %q", got, "eu.warehouse-a.responder-1")
+	if got := dms[len(dms)-1].ReceivedFrom; got != "responder-1@eu.warehouse-a" {
+		t.Fatalf("reply Origin = %q, want %q", got, "responder-1@eu.warehouse-a")
 	}
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)

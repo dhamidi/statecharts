@@ -3,6 +3,7 @@ package actors
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/dhamidi/statecharts"
 )
@@ -10,6 +11,22 @@ import (
 // originTypeActors is the OriginType stamped on every event a System
 // delivers, identifying the routing mechanism that populated Origin.
 const originTypeActors statecharts.Identifier = "actors"
+
+func routingKey(actorID statecharts.Identifier, node string) statecharts.Identifier {
+	if node == "" {
+		return actorID
+	}
+	return statecharts.Identifier(string(actorID) + "@" + node)
+}
+
+func splitRoutingKey(key statecharts.Identifier) (actorID statecharts.Identifier, node string, ok bool) {
+	value := string(key)
+	separator := strings.IndexByte(value, '@')
+	if separator <= 0 || separator == len(value)-1 || strings.Contains(value[separator+1:], "@") {
+		return "", "", false
+	}
+	return statecharts.Identifier(value[:separator]), value[separator+1:], true
+}
 
 // actorOriginContextKey carries the source actor's routing state across the
 // fallback IOProcessor seam. SendRequest has no sender/Dispatcher fields,
@@ -123,13 +140,9 @@ func (p *routingProcessor) Cancel(ctx context.Context, sendID statecharts.Identi
 	return nil
 }
 
-// IOProcessors implements statecharts.IOProcessorDescriber, advertising
-// self's own name as the address any other actor in sys can already reach
-// it at -- see Send's own resolution of req.Target against sys, which
-// treats an actor's name as its address directly. This does not attempt to
-// account for a Bridge-qualified cross-system address (see WithFallback):
-// which Bridge, if any, exposes this actor to which peer under what
-// namespace is not something routingProcessor itself knows.
+// IOProcessors implements statecharts.IOProcessorDescriber. self is the
+// actor's routable ID@node key when the System has a node name, or its local
+// actor ID otherwise.
 func (p *routingProcessor) IOProcessors() []statecharts.IOProcessorInfo {
 	return []statecharts.IOProcessorInfo{
 		{Type: originTypeActors, Location: statecharts.LocationFromIdentifier(p.self)},

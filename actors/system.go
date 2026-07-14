@@ -28,11 +28,17 @@ type systemConfig struct {
 	fallback       statecharts.IOProcessor
 }
 
-// WithNodeName gives this System its routing namespace. A spawned actor's
-// full address is "<node>.<name>"; that address is used as its Instance
-// session ID, durable-log key, advertised IOProcessor location, and event
-// Origin. Unqualified names remain accepted for calls made directly against
-// this System.
+// ActorID is a stable actor identity within a System. It is an alias of
+// statecharts.Identifier, so IDs may be hierarchical (for example,
+// "accounts.invoice-42") and use the same validation and comparison APIs.
+// A node name is not part of an ActorID; routing appends it with "@".
+type ActorID = statecharts.Identifier
+
+// WithNodeName sets this System's routing location. An actor with ID
+// "accounts.invoice-42" on node "host-a" has routing key
+// "accounts.invoice-42@host-a". The node does not affect Instance session
+// IDs, Log keys, or SnapshotStore keys, so a System can retain its isolated
+// durable history when it moves to another host.
 func WithNodeName(name string) Option {
 	return func(c *systemConfig) { c.nodeName = name }
 }
@@ -310,10 +316,18 @@ var ErrResidencyExhausted = errors.New("actors: residency limit reached and no e
 // of Tell observes and can test for with errors.Is.
 var ErrUnknownActor = errors.New("actors: unknown actor")
 
-// Spawn gives an actor a name -- its address within the system -- and
+// ErrInvalidActorID is returned by Spawn when its actor ID is not a valid
+// statecharts.Identifier. In particular, "@" belongs only to routing keys;
+// pass the stable actor ID to Spawn and use "<actor-id>@<node>" with Tell or
+// SendOptions.Target.
+var ErrInvalidActorID = errors.New("actors: invalid actor ID")
+
+// Spawn gives an actor its stable ID within the system and
 // starts it running under the Chart registered for kind. Spawn is
-// idempotent for a name that is already resident: calling it again for the
-// same name, kind, and durability is a no-op.
+// idempotent for an ID that is already resident: calling it again for the
+// same ID, kind, and durability is a no-op. IDs are Identifiers and may be
+// hierarchical; routing locations such as "invoice-42@host-a" belong in
+// Tell or SendOptions.Target, not Spawn.
 //
 // Without Durable, Spawn behaves like statecharts.New plus Start: the actor
 // begins in kind's initial configuration and keeps no record of what it
@@ -321,13 +335,16 @@ var ErrUnknownActor = errors.New("actors: unknown actor")
 // history under name, loading its latest checkpoint and replaying whatever
 // came after -- one call handles both "start fresh" and "resume", since a
 // name with no prior history simply starts fresh.
-func (s *System) Spawn(ctx context.Context, name, kind statecharts.Identifier, opts ...SpawnOption) error {
+func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Identifier, opts ...SpawnOption) error {
 	// Fast, unsynchronized fail-fast path only -- avoids the chart lookup
 	// below for the common case of calling Spawn well after Stop. The
 	// authoritative check that actually prevents a Spawn/Stop race
 	// (entryFor, under tableMu) runs regardless of what this observes.
 	if s.stopped.Load() {
 		return fmt.Errorf("actors: Spawn: %w", ErrSystemStopped)
+	}
+	if _, err := statecharts.NewIdentifier(string(name)); err != nil {
+		return fmt.Errorf("actors: Spawn: %q: %v: %w", name, err, ErrInvalidActorID)
 	}
 
 	var cfg spawnConfig
@@ -342,7 +359,6 @@ func (s *System) Spawn(ctx context.Context, name, kind statecharts.Identifier, o
 		return fmt.Errorf("actors: Spawn: %w", ErrDurabilityUnsupported)
 	}
 
-	name = s.unqualifyOwnAddress(name)
 	entry, err := s.entryFor(name, kind, cfg.durable)
 	if err != nil {
 		return err
@@ -353,9 +369,9 @@ func (s *System) Spawn(ctx context.Context, name, kind statecharts.Identifier, o
 	return s.activateLocked(ctx, entry)
 }
 
-// entryFor returns the table entry for name, creating one on first use. A
-// name's kind and durability are fixed by whichever call creates its entry;
-// a later Spawn naming a different kind or durability is an error.
+// entryFor returns the table entry for an actor ID, creating one on first
+// use. An ID's kind and durability are fixed by whichever call creates its
+// entry; a later Spawn naming a different kind or durability is an error.
 //
 // The stopped check here, under the same tableMu Stop takes to snapshot the
 // table, is what closes the Spawn/Stop TOCTOU: Spawn's "is the system
@@ -383,7 +399,7 @@ func (s *System) entryFor(name, kind statecharts.Identifier, durable bool) (*act
 	return e, nil
 }
 
-// resolve reports whether name is known to s -- spawned at some point,
+// resolve reports whether an actor ID is known to s -- spawned at some point,
 // resident or not -- without paging anything in. This is the cheap,
 // synchronous check routingProcessor.Send performs to decide whether Send
 // itself should fail.
@@ -395,35 +411,21 @@ func (s *System) resolve(name statecharts.Identifier) (*actorEntry, bool) {
 }
 
 func (s *System) address(name statecharts.Identifier) statecharts.Identifier {
-	if s.cfg.nodeName == "" {
-		return name
-	}
-	return statecharts.Identifier(s.cfg.nodeName + "." + string(name))
+	return routingKey(name, s.cfg.nodeName)
 }
 
-func (s *System) unqualifyOwnAddress(name statecharts.Identifier) statecharts.Identifier {
-	if s.cfg.nodeName == "" {
-		return name
-	}
-	local, ok := stripNamespace(name, statecharts.Identifier(s.cfg.nodeName))
-	if !ok {
-		return name
-	}
-	return local
-}
-
-// resolveTarget accepts both an actor's local name and its node-qualified
-// address, returning the local table entry and canonical local name.
+// resolveTarget accepts both a local actor ID and an ID@node routing key for
+// this System, returning the table entry and stable actor ID.
 func (s *System) resolveTarget(target statecharts.Identifier) (*actorEntry, statecharts.Identifier, bool) {
 	if entry, ok := s.resolve(target); ok {
 		return entry, target, true
 	}
-	local := s.unqualifyOwnAddress(target)
-	if local == target {
+	actorID, node, addressed := splitRoutingKey(target)
+	if !addressed || node != s.cfg.nodeName {
 		return nil, "", false
 	}
-	entry, ok := s.resolve(local)
-	return entry, local, ok
+	entry, ok := s.resolve(actorID)
+	return entry, actorID, ok
 }
 
 // activateLocked makes entry resident, paging it in (durable actors, via
@@ -472,6 +474,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 	}
 	dm, _ := chart.NewDatamodel()
 	address := s.address(entry.name)
+	sessionID := statecharts.SessionID(entry.name)
 	proc := newRoutingProcessor(s, address)
 	ingressHook := func(ev statecharts.Event) error {
 		entry.lastActive.Store(s.cfg.clock.Now().UnixNano())
@@ -479,12 +482,12 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 			return nil
 		}
 		if _, err := s.cfg.log.Append(context.Background(), statecharts.LogEntry{
-			SessionID: statecharts.SessionID(address),
+			SessionID: sessionID,
 			Kind:      statecharts.KindExternalEvent,
 			Timestamp: s.cfg.clock.Now().UTC(),
 			Event:     ev,
 		}); err != nil {
-			return fmt.Errorf("actors: append %q: %w", address, err)
+			return fmt.Errorf("actors: append %q: %w", entry.name, err)
 		}
 		return nil
 	}
@@ -502,19 +505,19 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger),
 			statecharts.WithIngressHook(ingressHook),
-			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.log, statecharts.SessionID(address), s.cfg.clock)),
+			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.log, sessionID, s.cfg.clock)),
 		}
 		hasLogEntries := false
-		for _, readErr := range s.cfg.log.Read(ctx, statecharts.SessionID(address), 1) {
+		for _, readErr := range s.cfg.log.Read(ctx, sessionID, 1) {
 			if readErr != nil {
-				return fmt.Errorf("actors: inspect log for %q: %w", address, readErr)
+				return fmt.Errorf("actors: inspect log for %q: %w", entry.name, readErr)
 			}
 			hasLogEntries = true
 			break
 		}
-		_, hasCheckpoint, loadErr := s.cfg.snapshots.Load(ctx, statecharts.SessionID(address))
+		_, hasCheckpoint, loadErr := s.cfg.snapshots.Load(ctx, sessionID)
 		if loadErr != nil {
-			return fmt.Errorf("actors: inspect checkpoint for %q: %w", address, loadErr)
+			return fmt.Errorf("actors: inspect checkpoint for %q: %w", entry.name, loadErr)
 		}
 		if !hasLogEntries && !hasCheckpoint {
 			// This is a genuinely new actor, not a reconstruction. Starting it
@@ -522,26 +525,26 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 			// boundary first so a crash before the first ordinary message cannot
 			// make a later process mistake the actor for new and invoke twice.
 			if _, err := s.cfg.log.Append(ctx, statecharts.LogEntry{
-				SessionID: statecharts.SessionID(address),
+				SessionID: sessionID,
 				Kind:      statecharts.KindSessionStarted,
 				Timestamp: s.cfg.clock.Now().UTC(),
 			}); err != nil {
-				return fmt.Errorf("actors: record session start for %q: %w", address, err)
+				return fmt.Errorf("actors: record session start for %q: %w", entry.name, err)
 			}
 			liveOpts := append(instanceOpts,
 				statecharts.WithIOProcessor(proc),
-				statecharts.WithSessionID(statecharts.SessionID(address)),
+				statecharts.WithSessionID(sessionID),
 			)
 			inst = statecharts.New(chart, dm, liveOpts...)
 			err = inst.Start(ctx)
 		} else {
-			inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, statecharts.SessionID(address), proc, instanceOpts...)
+			inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, sessionID, proc, instanceOpts...)
 		}
 	} else {
 		inst = statecharts.New(chart, dm,
 			statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger), statecharts.WithIngressHook(ingressHook),
-			statecharts.WithSessionID(statecharts.SessionID(address)))
+			statecharts.WithSessionID(sessionID))
 		err = inst.Start(ctx)
 	}
 	if err != nil {
@@ -710,12 +713,12 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 		return nil
 	}
 	err := inst.Checkpoint(ctx, func(snap statecharts.Snapshot) error {
-		address := s.address(entry.name)
-		seq, err := s.cfg.log.LastSeq(ctx, statecharts.SessionID(address))
+		sessionID := statecharts.SessionID(entry.name)
+		seq, err := s.cfg.log.LastSeq(ctx, sessionID)
 		if err != nil {
 			return fmt.Errorf("actors: last seq %q: %w", entry.name, err)
 		}
-		if err := s.cfg.snapshots.Save(ctx, statecharts.SessionID(address), statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
+		if err := s.cfg.snapshots.Save(ctx, sessionID, statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
 			return fmt.Errorf("actors: save checkpoint %q: %w", entry.name, err)
 		}
 		return nil

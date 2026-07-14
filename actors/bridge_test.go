@@ -10,7 +10,7 @@ import (
 
 // TestFallbackRoutesToOtherSystemAndReplyRoutesBack is the round-trip case
 // WithFallback and Bridge exist for: an actor in sysA addresses a
-// namespaced name that belongs to sysB, sysA's own routing doesn't
+// node-qualified actor ID that belongs to sysB, sysA's own routing doesn't
 // recognize it, the fallback forwards it into sysB, and the reply -- sent
 // by the responding actor to ev.Origin, exactly like any other reply --
 // finds its way back to the original sender via sysB's own fallback.
@@ -19,7 +19,7 @@ func TestFallbackRoutesToOtherSystemAndReplyRoutesBack(t *testing.T) {
 
 	responder := buildResponderChart()
 	var dms []*callerModel
-	caller := buildCallerChart(&dms, "warehouse-b.responder-1")
+	caller := buildCallerChart(&dms, "responder-1@warehouse-b")
 
 	// sysA's Bridge needs sysB as its target, but sysB's own Bridge needs
 	// sysA -- built first here -- as its target, so sysA's Bridge starts
@@ -56,7 +56,7 @@ func TestFallbackRoutesToOtherSystemAndReplyRoutesBack(t *testing.T) {
 		t.Fatalf("caller datamodel count = 0, want at least 1")
 	}
 	live := dms[len(dms)-1]
-	want := statecharts.Identifier("warehouse-b.responder-1")
+	want := statecharts.Identifier("responder-1@warehouse-b")
 	if live.ReceivedFrom != want {
 		t.Fatalf("ReceivedFrom = %q, want %q", live.ReceivedFrom, want)
 	}
@@ -71,7 +71,7 @@ func TestFallbackRoutesToOtherSystemAndReplyRoutesBack(t *testing.T) {
 
 // TestFallbackRejectsNameOutsideItsNamespace is finding-shaped coverage for
 // "no regression to single-system behavior": a target that carries no
-// namespace a configured fallback recognizes must still surface as an
+// node a configured fallback recognizes must still surface as an
 // ordinary "unknown actor" communication error, exactly as it would with no
 // fallback configured at all.
 func TestFallbackRejectsNameOutsideItsNamespace(t *testing.T) {
@@ -96,7 +96,7 @@ func TestFallbackRejectsNameOutsideItsNamespace(t *testing.T) {
 		t.Fatalf("m-1 not resident after Spawn")
 	}
 	if !hasStateID(inst.Configuration(), "failed") {
-		t.Fatalf("configuration = %v, want to contain 'failed' for a name outside the fallback's namespace", inst.Configuration())
+		t.Fatalf("configuration = %v, want to contain 'failed' for a target outside the fallback's node", inst.Configuration())
 	}
 
 	if err := sysA.Stop(ctx); err != nil {
@@ -105,11 +105,11 @@ func TestFallbackRejectsNameOutsideItsNamespace(t *testing.T) {
 }
 
 // TestFallbackRejectsNameNotSpawnedInTargetSystem covers the other half of
-// Bridge.Send's synchronous check: the namespace matches, but the name that
-// remains was never spawned in the target System.
+// Bridge.Send's synchronous check: the node matches, but the actor ID was
+// never spawned in the target System.
 func TestFallbackRejectsNameNotSpawnedInTargetSystem(t *testing.T) {
 	ctx := context.Background()
-	chart := buildCommTestChart("warehouse-b.billing")
+	chart := buildCommTestChart("billing@warehouse-b")
 
 	sysB := NewSystem() // "billing" never spawned here
 	sysA := NewSystem(WithFallback(NewBridge("warehouse-b", sysB, "warehouse-a")))
@@ -170,7 +170,7 @@ func TestFallbackSendDoesNotBlockSender(t *testing.T) {
 	}
 
 	sendPing := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
-		ec.Send("ping", statecharts.SendOptions{Target: "warehouse-b.wedged-1"})
+		ec.Send("ping", statecharts.SendOptions{Target: "wedged-1@warehouse-b"})
 		return nil
 	})
 	callerChart, err := statecharts.Build(
@@ -213,7 +213,7 @@ func TestBridgeUsesSystemNodeNamesForQualifiedRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	responder := buildResponderChart()
 	var dms []*callerModel
-	caller := buildCallerChart(&dms, "warehouse-b.responder-1")
+	caller := buildCallerChart(&dms, "responder-1@warehouse-b")
 
 	toB := NewBridge("warehouse-b", nil, "ignored-source-name")
 	sysA := NewSystem(WithNodeName("warehouse-a"), WithFallback(toB))
@@ -239,7 +239,7 @@ func TestBridgeUsesSystemNodeNamesForQualifiedRoundTrip(t *testing.T) {
 	}
 	callerInstance := testInstanceFor(sysA, "caller-1")
 	waitFor(t, 2*time.Second, func() bool { return hasStateID(callerInstance.Configuration(), "done") })
-	if got := dms[len(dms)-1].ReceivedFrom; got != "warehouse-b.responder-1" {
+	if got := dms[len(dms)-1].ReceivedFrom; got != "responder-1@warehouse-b" {
 		t.Fatalf("reply Origin = %q, want target System's node-qualified actor address", got)
 	}
 	if err := sysA.Stop(ctx); err != nil {
@@ -274,7 +274,7 @@ func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 		t.Fatalf("Spawn target: %v", err)
 	}
 	send := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
-		ec.Send("ping", statecharts.SendOptions{Target: "warehouse-b.target"})
+		ec.Send("ping", statecharts.SendOptions{Target: "target@warehouse-b"})
 		return nil
 	})
 	sourceChart, err := statecharts.Build(
@@ -350,7 +350,7 @@ func TestBridgeAsyncFailureReturnsToSendingActor(t *testing.T) {
 	store.setFail(true)
 
 	var dms []*asyncFailureModel
-	sender := buildAsyncFailureSender(&dms, "warehouse-b.target")
+	sender := buildAsyncFailureSender(&dms, "target@warehouse-b")
 	sysA := NewSystem(
 		WithNodeName("warehouse-a"),
 		WithFallback(NewBridge("warehouse-b", sysB, "warehouse-a")),

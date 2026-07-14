@@ -3,7 +3,6 @@ package actors
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/dhamidi/statecharts"
@@ -11,18 +10,19 @@ import (
 
 // Bridge is a fallback IOProcessor (see WithFallback) that connects two
 // Systems. Send accepts only targets qualified by the target System's node
-// name, strips that prefix, and delivers the rest to target via Tell. For a
-// target System without a node name, Bridge uses its configured namespace.
+// name, parses the actor ID before "@", and delivers it to target via Tell.
+// For a target System without a node name, Bridge uses its configured target
+// node.
 // An actor in system A reaches an actor named "billing" in system B by
-// addressing "warehouse-b.billing", once A is built with:
+// addressing "billing@warehouse-b", once A is built with:
 //
 //	sysA := actors.NewSystem(actors.WithFallback(
 //		actors.NewBridge("warehouse-b", sysB, "warehouse-a"),
 //	))
 //
 // Events from a node-named source System use the sender's already-qualified
-// address as Origin. For a source System without a node name, origin is the
-// namespace Bridge prepends to the local sender name. A reply from inside
+// routing key as Origin. For a source System without a node name, Bridge
+// appends its configured source node with "@". A reply from inside
 // the target System is then another Send targeting ev.Origin. Two Systems
 // bridged this way need one Bridge each, one per direction.
 //
@@ -33,19 +33,19 @@ import (
 // both Systems with a Bridge apiece, target nil, then SetTarget each Bridge
 // once both Systems exist, before either receives any traffic.
 type Bridge struct {
-	namespace statecharts.Identifier
-	origin    statecharts.Identifier
+	targetNode statecharts.Identifier
+	sourceNode statecharts.Identifier
 
 	mu     sync.RWMutex
 	target *System
 }
 
-// NewBridge returns a Bridge that forwards a Send targeting
-// "<namespace>.<rest>" to target's Tell("<rest>", ...), stamping Origin as
-// "<origin>.<sender>" on the event target receives. target may be nil,
-// filled in later with SetTarget -- see Bridge's own doc comment for why.
-func NewBridge(namespace statecharts.Identifier, target *System, origin statecharts.Identifier) *Bridge {
-	return &Bridge{namespace: namespace, target: target, origin: origin}
+// NewBridge returns a Bridge that forwards "<actor-id>@<target-node>" to
+// target's actor ID and stamps Origin as "<sender-id>@<source-node>" when
+// the source or target System has no WithNodeName configuration of its own.
+// target may be nil and filled in later with SetTarget.
+func NewBridge(targetNode statecharts.Identifier, target *System, sourceNode statecharts.Identifier) *Bridge {
+	return &Bridge{targetNode: targetNode, target: target, sourceNode: sourceNode}
 }
 
 // SetTarget replaces the System b forwards into. It exists to complete a
@@ -83,13 +83,13 @@ func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
 	if target == nil {
 		return fmt.Errorf("actors: Bridge: unknown actor %q (no target system configured)", req.Target)
 	}
-	namespace := b.namespace
+	node := string(b.targetNode)
 	if target.cfg.nodeName != "" {
-		namespace = statecharts.Identifier(target.cfg.nodeName)
+		node = target.cfg.nodeName
 	}
-	name, ok := stripNamespace(req.Target, namespace)
-	if !ok {
-		return fmt.Errorf("actors: Bridge: %q is not addressed to target node %q", req.Target, namespace)
+	name, targetNode, ok := splitRoutingKey(req.Target)
+	if !ok || targetNode != node {
+		return fmt.Errorf("actors: Bridge: %q is not addressed to target node %q", req.Target, node)
 	}
 	if _, _, ok := target.resolveTarget(name); !ok {
 		return fmt.Errorf("actors: Bridge: unknown actor %q in target system", name)
@@ -97,11 +97,11 @@ func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
 
 	route, routed := actorRouteFrom(ctx)
 	sender := route.address
-	origin := b.origin
+	origin := b.sourceNode
 	if routed && route.system != nil && route.system.cfg.nodeName != "" {
 		origin = sender
 	} else if sender != "" {
-		origin = statecharts.Identifier(string(b.origin) + "." + string(sender))
+		origin = routingKey(sender, string(b.sourceNode))
 	}
 	ev := statecharts.Event{
 		Name:       req.Event,
@@ -128,15 +128,4 @@ func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
 // target (see Send), so there is nothing here for it to cancel.
 func (b *Bridge) Cancel(context.Context, statecharts.Identifier) error {
 	return nil
-}
-
-// stripNamespace reports the Identifier remaining after removing ns and its
-// following dot. Both namespace and remainder may contain multiple segments.
-func stripNamespace(id, ns statecharts.Identifier) (statecharts.Identifier, bool) {
-	prefix := string(ns) + "."
-	value := string(id)
-	if !strings.HasPrefix(value, prefix) || len(value) == len(prefix) {
-		return "", false
-	}
-	return statecharts.Identifier(strings.TrimPrefix(value, prefix)), true
 }

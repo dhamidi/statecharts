@@ -1066,31 +1066,61 @@ func TestFinishedDurableActorDoesNotAppendUndeliverableMessage(t *testing.T) {
 	}
 }
 
-func TestNodeQualifiedAddressIsDurableSessionID(t *testing.T) {
+func TestNodeNameDoesNotChangeDurableActorIdentity(t *testing.T) {
 	ctx := context.Background()
 	log := openTestLog(t)
 	var dms []*counterModel
 	chart := buildLadderChart(&dms)
-	sys := NewSystem(
+	actorID := statecharts.Identifier("accounts.counter-1")
+	sysA := NewSystem(
 		WithNodeName("warehouse-a"), WithLog(log), WithSnapshotStore(log),
 	)
-	if err := sys.Register(chart); err != nil {
+	if err := sysA.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if err := sys.Spawn(ctx, "counter-1", chart.ID(), Durable()); err != nil {
+	if err := sysA.Spawn(ctx, actorID, chart.ID(), Durable()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	if err := sys.Tell(ctx, "warehouse-a.counter-1", statecharts.Event{Name: "inc", Type: statecharts.EventExternal}); err != nil {
+	if err := sysA.Tell(ctx, "accounts.counter-1@warehouse-a", statecharts.Event{Name: "inc", Type: statecharts.EventExternal}); err != nil {
 		t.Fatalf("Tell: %v", err)
 	}
-	if seq, err := log.LastSeq(ctx, "warehouse-a.counter-1"); err != nil || seq != 2 {
-		t.Fatalf("qualified LastSeq = %d, %v, want 2, nil", seq, err)
+	if seq, err := log.LastSeq(ctx, statecharts.SessionID(actorID)); err != nil || seq != 2 {
+		t.Fatalf("actor-ID LastSeq = %d, %v, want 2, nil", seq, err)
 	}
-	if seq, err := log.LastSeq(ctx, "counter-1"); err != nil || seq != 0 {
-		t.Fatalf("unqualified LastSeq = %d, %v, want 0, nil", seq, err)
+	if seq, err := log.LastSeq(ctx, "accounts.counter-1@warehouse-a"); err != nil || seq != 0 {
+		t.Fatalf("address LastSeq = %d, %v, want 0, nil", seq, err)
 	}
-	if err := sys.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	if err := sysA.Stop(ctx); err != nil {
+		t.Fatalf("Stop A: %v", err)
+	}
+
+	// The same logical System can restart on another host while retaining its
+	// isolated Log. Its actor IDs and durable histories do not move with the
+	// routing address.
+	sysB := NewSystem(
+		WithNodeName("warehouse-b"), WithLog(log), WithSnapshotStore(log),
+	)
+	if err := sysB.Register(chart); err != nil {
+		t.Fatalf("Register B: %v", err)
+	}
+	if err := sysB.Spawn(ctx, actorID, chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn B: %v", err)
+	}
+	inst := testInstanceFor(sysB, actorID)
+	if inst.ID() != statecharts.SessionID(actorID) || !hasStateID(inst.Configuration(), "s1") {
+		t.Fatalf("rehydrated actor ID/configuration = %q/%v, want %q containing s1", inst.ID(), inst.Configuration(), actorID)
+	}
+	if err := sysB.Tell(ctx, "accounts.counter-1@warehouse-b", statecharts.Event{Name: "inc", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell B: %v", err)
+	}
+	if !hasStateID(inst.Configuration(), "s2") {
+		t.Fatalf("configuration after host move = %v, want s2", inst.Configuration())
+	}
+	if seq, err := log.LastSeq(ctx, statecharts.SessionID(actorID)); err != nil || seq != 3 {
+		t.Fatalf("actor-ID LastSeq after host move = %d, %v, want 3, nil", seq, err)
+	}
+	if err := sysB.Stop(ctx); err != nil {
+		t.Fatalf("Stop B: %v", err)
 	}
 }
 

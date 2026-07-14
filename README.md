@@ -927,7 +927,7 @@ func run(ctx context.Context) error {
 	if err := sys.Tell(ctx, "gateway", statecharts.Event{Name: "accept", Type: statecharts.EventExternal}); err != nil {
 		return err
 	}
-	time.Sleep(50 * time.Millisecond) // peer delivery hops through a goroutine
+	time.Sleep(50 * time.Millisecond) // peer delivery hops through the dispatcher
 
 	return sys.Stop(ctx)
 }
@@ -957,14 +957,17 @@ sys := actors.NewSystem(
 )
 ```
 
-`WithNodeName` labels the system for diagnostics only -- an actor's name
-means the same thing regardless of which node's `System` happens to have
-it loaded right now. `WithLog` and `WithSnapshotStore` supply the
-durability backing every `Durable` actor; `*sqllog.Log` satisfies both, so
-the same value is commonly passed to each. A `System` with neither
-configured still works -- `Spawn` without `Durable()` never touches them
--- but `Spawn(..., Durable())` fails if either is missing. `WithIdleTimeout`
-and `WithResidencyLimit` (below) control automatic paging.
+`WithNodeName` supplies the system's routing location. Actor IDs remain
+stable `Identifier` values, while routable keys append the node with `@`:
+actor `accounts.invoice-42` on node `main` is addressed as
+`accounts.invoice-42@main`. The node is not part of the actor's session ID
+or its key in this system's isolated log, so changing hosts does not strand
+durable history. `WithLog` and `WithSnapshotStore` supply the durability
+backing every `Durable` actor; `*sqllog.Log` satisfies both, so the same
+value is commonly passed to each. A `System` with neither configured still
+works -- `Spawn` without `Durable()` never touches them -- but
+`Spawn(..., Durable())` fails if either is missing. `WithIdleTimeout` and
+`WithResidencyLimit` (below) control automatic paging.
 
 ### Registering and spawning actors
 
@@ -977,12 +980,13 @@ sys.Register(notifierChart)
 sys.Register(jobChart)
 ```
 
-`Spawn` gives an actor a name -- its address within the system -- and
-starts it running under the chart registered for `kind` (`chart.ID()`):
+`Spawn` gives an actor a stable ID and starts it under the chart registered
+for `kind` (`chart.ID()`). IDs use `statecharts.Identifier`, so dots express
+hierarchy without implying a routing location:
 
 ```go
 sys.Spawn(ctx, "notifier", "notifier")             // not durable
-sys.Spawn(ctx, "job-482", "job", actors.Durable()) // durable
+sys.Spawn(ctx, "jobs.job-482", "job", actors.Durable()) // durable
 ```
 
 Without `Durable()`, `Spawn` behaves like `statecharts.New` plus `Start`:
@@ -990,7 +994,7 @@ the actor begins in its chart's initial configuration and keeps no record
 of what it does. If the process restarts, it's gone.
 
 `Durable()` changes that. A durable actor's messages are appended to the
-system's `Log` before they're applied, and its name doubles as its
+system's `Log` before they're applied, and its actor ID doubles as its
 session ID. One call handles both "start fresh" and "resume": if
 `"job-482"` has no prior log entries, `Spawn` starts it fresh; if it
 already has history -- because the process restarted, or because it was
@@ -1002,11 +1006,12 @@ practice: creating an actor and resuming one are the same call. A name's
 durability is fixed at its first `Spawn` -- a name spawned without
 `Durable()` cannot later be spawned durable, and vice versa.
 
-### Addressing actors by name
+### Addressing actors by ID
 
 Every actor a `System` spawns is wired to the same routing `IOProcessor`.
-Addressing another actor from inside a chart is ordinary executable
-content -- `Target` is just the other actor's name:
+Addressing another actor in the same `System` is ordinary executable
+content -- `Target` is its actor ID. A target on a named node uses
+`<actor-id>@<node>`:
 
 ```go
 sendNotify := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
@@ -1019,8 +1024,9 @@ sendNotify := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) er
 ```
 
 The receiving actor doesn't need to be told who sent the message: every
-event a `System` delivers carries `Origin` set to the sender's own name,
-so a reply is just another `Send` targeting `ev.Origin`:
+event a `System` delivers carries `Origin` set to the sender's routable
+`<actor-id>@<node>` key (or local ID when no node is configured), so a reply
+is just another `Send` targeting `ev.Origin`:
 
 ```go
 notify := statecharts.Action(func(n *Notifier, ec statecharts.ExecContext) error {
@@ -1333,18 +1339,15 @@ table. It's the same seam every actor already sends through,
 instead of between actors inside one.
 
 `Bridge` is a ready-made fallback `IOProcessor` for connecting two
-`System`s. It's configured with a namespace and a target `System`: `Send`
-accepts only targets whose first segment is that namespace, strips it, and
-delivers what's left to the target via `Tell`. An actor in `gatewaySystem`
-reaches an actor named `"job-482"` in `jobsSystem` by addressing
-`"jobs-system.job-482"`, once `gatewaySystem` is built with a `Bridge` for
-the `"jobs-system"` namespace pointed at `jobsSystem`.
+`System`s. It separates the actor ID from its node at `@` and delivers the
+ID to the target via `Tell`. An actor in `gatewaySystem` reaches actor
+`"job-482"` in `jobsSystem` with `"job-482@jobs-system"`, once
+`gatewaySystem` has a `Bridge` pointed at `jobsSystem`.
 
-Replies work the same way, in reverse. `Bridge` stamps `Origin` with its
-own namespace, so a reply -- an ordinary `Send` targeting `ev.Origin`,
-exactly like a same-`System` reply -- lands on a namespaced address a
-`Bridge` on the other side recognizes and strips in turn. Connecting two
-`System`s both ways takes one `Bridge` each, one per direction.
+Replies work the same way, in reverse. `Bridge` stamps `Origin` with the
+source node, so a reply -- an ordinary `Send` targeting `ev.Origin`, exactly
+like a same-`System` reply -- carries a routing key the reverse `Bridge`
+recognizes. Connecting two `System`s both ways takes one `Bridge` each.
 
 Wiring them together is circular: each `Bridge`'s target is the other
 `System`, but neither `System` can finish being built -- `WithFallback`
@@ -1366,11 +1369,10 @@ toJobs.SetTarget(jobsSystem)
 ```
 
 `Bridge.Send` never blocks on delivery, the same way a `System`'s own
-routing `IOProcessor` never does: it checks the namespace and looks up the
-target name in the target `System`'s table -- both cheap, synchronous
-lookups -- and hands the actual delivery off to a goroutine before
-returning. A slow or wedged actor on the far side of a bridge holds up only
-that goroutine, never the sender's own.
+routing `IOProcessor` never does: it checks the node and looks up the actor
+ID in the target `System`'s table, then queues delivery on the source
+System's bounded dispatcher. A slow target never blocks the sender's actor
+goroutine.
 
 A complete example: `gateway-system` holds a connection actor,
 `jobs-system` holds a job actor. Connections churn fast and are numerous
@@ -1401,7 +1403,7 @@ type ConnData struct {
 func buildConnChart() (*statecharts.Chart, error) {
 	forwardUpload := statecharts.Action(func(c *ConnData, ec statecharts.ExecContext) error {
 		ec.Send("job.start", statecharts.SendOptions{
-			Target: "jobs-system.job-482",
+			Target: "job-482@jobs-system",
 			Data:   "uploads/482.png",
 		})
 		return nil
