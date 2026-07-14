@@ -42,6 +42,19 @@ const (
 	toolOfferMaxRetries    = 6 // 6 * 10s = 60s grace period
 )
 
+// toolOfferRetrySendID is the fixed, deterministic SendID every delayed
+// "tool_offer_retry" self-send is armed under (see scheduleRetryTimer and
+// retryOfferAndReschedule). Only one such timer is ever meant to be
+// outstanding at a time per conversation instance, so it doesn't need to
+// vary per tool-call cycle -- a fixed ID lets cancelRetryTimer reliably
+// reach whichever one is currently pending when awaiting_tool is left,
+// regardless of which action last (re)armed it. Without this, the
+// interpreter would auto-generate a fresh, uncancelable "send.N" id (see
+// interpreter.go's doSend) for every arm, and a stale timer from a
+// finished tool-call cycle could fire against a later cycle's
+// awaiting_tool -- see cancelRetryTimer.
+const toolOfferRetrySendID statecharts.Identifier = "tool_offer_retry"
+
 // staticToolDefs is the fixed set of tools ConversationActor tells every
 // Provider it can offer. Whether a client is actually around to execute one
 // is ToolRegistryActor's concern (a lease), not the LLM-facing tool list.
@@ -211,7 +224,23 @@ var offerToolCall = statecharts.Action(func(d *conversationModel, ec statecharts
 })
 
 var scheduleRetryTimer = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
-	ec.Send("tool_offer_retry", statecharts.SendOptions{Delay: toolOfferRetryInterval})
+	ec.Send("tool_offer_retry", statecharts.SendOptions{Delay: toolOfferRetryInterval, SendID: toolOfferRetrySendID})
+	return nil
+})
+
+// cancelRetryTimer best-effort cancels the delayed "tool_offer_retry" send
+// currently armed under toolOfferRetrySendID, if any. It belongs in every
+// Then(...) list on a transition that leaves awaiting_tool, so a timer
+// armed by cycle A's scheduleRetryTimer/retryOfferAndReschedule can never
+// survive to fire against a later cycle B's awaiting_tool (where it would
+// otherwise increment cycle B's PendingRetries, or -- if it coincided with
+// retriesExhausted -- synthesize a bogus failure against cycle B's real,
+// possibly still in-flight, PendingCallID). ec.Cancel is a no-op for an
+// unknown or already-fired SendID (see interpreter.go's doCancel), so
+// including this unconditionally is always safe, including the first time
+// awaiting_tool is ever left (nothing to cancel yet).
+var cancelRetryTimer = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+	ec.Cancel(toolOfferRetrySendID)
 	return nil
 })
 
@@ -227,7 +256,12 @@ func retriesExhausted(d *conversationModel, ec statecharts.ExecContext) bool {
 // http.go's handleToolResult) -- so it is handled by the ordinary
 // "tool_result" transition below with no special-casing: the failure is
 // recorded in History and the LLM gets a turn to react to it, same as any
-// other tool error.
+// other tool error. It runs from the "tool_offer_retry" tick that just
+// fired (whose own pending record is already gone from ip.pending by the
+// time an action can observe it -- see interpreter.go's fireTimer), so
+// there is no armed timer to cancel here; the actual exit from
+// awaiting_tool happens once the synthetic "tool_result" it sends is
+// processed below, where cancelRetryTimer already runs.
 var failPendingToolCall = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
 	ec.Send("tool_result", statecharts.SendOptions{
 		Target: statecharts.Identifier(ec.SessionID()),
@@ -248,12 +282,26 @@ var failPendingToolCall = statecharts.Action(func(d *conversationModel, ec state
 // both folded into one action, since tool_offer_retry is now a targetless
 // transition (see below) rather than a re-entry into awaiting_tool, so
 // nothing else re-arms the timer.
+//
+// Known follow-up: this counts every tick as a retry, even one where
+// toolregistry's lease for PendingToolName is currently held and the
+// in-flight call simply hasn't answered yet (see toolregistry.go's
+// toolLease.DeliveredCallID, which distinguishes "already handed to a
+// still-current owner, maybe still running" from "nobody has the lease" --
+// but only inside toolregistry's own datamodel). A genuinely slow-but-alive
+// tool call can therefore still hit toolOfferMaxRetries and be killed by
+// failPendingToolCall's synthetic timeout, which is meant for "nobody ever
+// claimed the lease" rather than "someone's running it and it's slow".
+// Fixing that cleanly needs toolregistry to answer a query about whether
+// PendingCallID was actually delivered/claimed, which is a new
+// cross-actor request/reply this actor doesn't have today -- left as a
+// follow-up rather than folded in here.
 var retryOfferAndReschedule = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
 	d.PendingRetries++
 	if err := offerToolCall(ec); err != nil {
 		return err
 	}
-	ec.Send("tool_offer_retry", statecharts.SendOptions{Delay: toolOfferRetryInterval})
+	ec.Send("tool_offer_retry", statecharts.SendOptions{Delay: toolOfferRetryInterval, SendID: toolOfferRetrySendID})
 	return nil
 })
 
@@ -359,7 +407,7 @@ func BuildConversationChart() (*statecharts.Chart, error) {
 					statecharts.On("tool_result",
 						statecharts.Target("thinking"),
 						statecharts.If(statecharts.Cond(matchesPendingCallID)),
-						statecharts.Then(appendToolResultMessage, broadcastLastMessage, clearPendingToolCall),
+						statecharts.Then(cancelRetryTimer, appendToolResultMessage, broadcastLastMessage, clearPendingToolCall),
 					),
 				),
 			),
