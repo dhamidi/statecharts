@@ -428,6 +428,15 @@ func (s *System) resolveTarget(target statecharts.Identifier) (*actorEntry, stat
 	return entry, actorID, ok
 }
 
+// IsResident reports whether target names a known actor that is currently
+// loaded in memory. target may be a local actor ID or this System's qualified
+// ID@node routing key. Unknown and remotely addressed targets return false.
+// IsResident is observational: it never activates or pages in an actor.
+func (s *System) IsResident(target statecharts.Identifier) bool {
+	entry, _, ok := s.resolveTarget(target)
+	return ok && entry.instance.Load() != nil
+}
+
 // activateLocked makes entry resident, paging it in (durable actors, via
 // statecharts.Rehydrate) or starting it fresh (non-durable, via
 // statecharts.New plus Start), admitting it under the residency limit

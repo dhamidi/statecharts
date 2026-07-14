@@ -1070,6 +1070,10 @@ path `Spawn` uses, with the message held until the actor is caught up and
 ready to receive it. Nothing about sending to a durable actor reveals
 whether it happened to already be resident.
 
+`System.IsResident` provides an observational check for dashboards and
+operational tooling. It accepts either a stable actor ID or this system's
+qualified `ID@node` routing key, and never activates a paged-out actor.
+
 Idle timeouts alone don't protect a node from holding more resident
 actors than it has room for -- a system under heavy, broad traffic may
 never see any one actor go idle. `WithResidencyLimit` gives the system a

@@ -764,6 +764,44 @@ func TestSpawnRejectsRoutingKeyAsActorID(t *testing.T) {
 	}
 }
 
+func TestIsResidentAcceptsLocalIDAndRoutingKeyWithoutPagingIn(t *testing.T) {
+	ctx := context.Background()
+	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := openTestLog(t)
+	sys := NewSystem(WithNodeName("host-a"), WithLog(log), WithSnapshotStore(log), WithMaxResident(1))
+	if err := sys.Register(chart); err != nil {
+		t.Fatal(err)
+	}
+	if err := sys.Spawn(ctx, "one", chart.ID(), Durable()); err != nil {
+		t.Fatal(err)
+	}
+	if !sys.IsResident("one") || !sys.IsResident("one@host-a") {
+		t.Fatal("resident actor was not reported resident")
+	}
+	if sys.IsResident("missing") || sys.IsResident("one@host-b") {
+		t.Fatal("unknown or remote target was reported resident")
+	}
+
+	if err := sys.Spawn(ctx, "two", chart.ID(), Durable()); err != nil {
+		t.Fatal(err)
+	}
+	if sys.IsResident("one") || sys.IsResident("one@host-a") {
+		t.Fatal("paged-out actor was reported resident")
+	}
+	if !sys.IsResident("two") || !sys.IsResident("two@host-a") {
+		t.Fatal("newly resident actor was not reported resident")
+	}
+	if sys.IsResident("one") || !sys.IsResident("two") {
+		t.Fatal("residency query paged an actor in or evicted another actor")
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNodeNameQualifiesAdvertisedIOProcessorLocation(t *testing.T) {
 	ctx := context.Background()
 	var dms []*locationModel
