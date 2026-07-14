@@ -397,6 +397,21 @@ const pageCSS = `
 	--font-size-base: 14px;
 	--font-size-lg: 16px;
 	--line-height-base: 1.45;
+
+	/* Spacing scale: a 4px base grid, replacing what used to be a long tail
+	   of near-arbitrary padding/margin/gap literals (1px, 2px, 6px, 7px,
+	   9px, 10px, 14px, 18px, ...) with six steps that every spacing
+	   declaration in this file now snaps to the nearest of. This
+	   deliberately merges some previously-distinct values -- e.g.
+	   .new-form's old gap: 4px and .send-form's old gap: 6px both round to
+	   --space-1 below, which is fine (arguably a bugfix: two nearly
+	   identical forms no longer differ in internal spacing for no reason). */
+	--space-1: 4px;
+	--space-2: 8px;
+	--space-3: 12px;
+	--space-4: 16px;
+	--space-5: 20px;
+	--space-6: 24px;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
@@ -406,14 +421,14 @@ body {
 	font-size: var(--font-size-base); line-height: var(--line-height-base);
 	color: var(--color-text); background: var(--color-bg);
 }
-.topbar { flex: none; padding: 8px 16px; background: var(--color-surface); border-bottom: 1px solid var(--color-border); }
+.topbar { flex: none; padding: var(--space-2) var(--space-4); background: var(--color-surface); border-bottom: 1px solid var(--color-border); }
 .sidebar-toggle, .dialog-close {
-	padding: 6px 12px; border-radius: 6px; border: 1px solid var(--color-border-input); background: var(--color-surface);
+	padding: var(--space-1) var(--space-3); border-radius: 6px; border: 1px solid var(--color-border-input); background: var(--color-surface);
 	cursor: pointer; font-size: var(--font-size-sm);
 }
 .sidebar-toggle:hover, .dialog-close:hover { background: var(--color-surface-hover); }
 .link-banner {
-	flex: none; padding: 6px 16px; font-size: var(--font-size-xs); font-weight: 600;
+	flex: none; padding: var(--space-1) var(--space-4); font-size: var(--font-size-xs); font-weight: 600;
 	text-align: center; letter-spacing: .02em;
 }
 .link-connected { background: var(--color-success-bg); color: var(--color-success-fg); }
@@ -429,7 +444,7 @@ body {
    <dialog> element itself, so an open/closed dialog's own state survives
    every sidebar update untouched. */
 .sidebar-dialog {
-	padding: 16px; border: none; border-radius: 10px; box-shadow: 0 8px 30px var(--color-shadow);
+	padding: var(--space-4); border: none; border-radius: 10px; box-shadow: 0 8px 30px var(--color-shadow);
 	width: min(340px, 92vw); max-height: 80vh; margin: auto;
 }
 /* A <dialog> with no "open" attribute is display:none by the UA stylesheet
@@ -439,26 +454,26 @@ body {
 .sidebar-dialog[open] { display: flex; flex-direction: column; }
 .sidebar-dialog::backdrop { background: var(--color-overlay); }
 .sidebar { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
-.sidebar h3 { margin: 0 0 10px; font-size: var(--font-size-sm); text-transform: uppercase; letter-spacing: .04em; color: var(--color-text-subtle); }
-.conv-filter { padding: 7px 9px; margin-bottom: 10px; border: 1px solid var(--color-border-input); border-radius: 6px; flex: none; font-size: var(--font-size-base); }
+.sidebar h3 { margin: 0 0 var(--space-2); font-size: var(--font-size-sm); text-transform: uppercase; letter-spacing: .04em; color: var(--color-text-subtle); }
+.conv-filter { padding: var(--space-2); margin-bottom: var(--space-2); border: 1px solid var(--color-border-input); border-radius: 6px; flex: none; font-size: var(--font-size-base); }
 .sidebar-list { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 /* .placeholder's own rule (below, shared with #message-list) only sets
    vertical padding; give it the same horizontal inset as .conv-link here so
    the "no conversations yet" message lines up with where rows would sit
    instead of touching the sidebar's edges. */
-.sidebar-list .placeholder { padding: 8px 10px; }
+.sidebar-list .placeholder { padding: var(--space-2); }
 .conv-link {
-	display: block; padding: 8px 10px; border-radius: 6px; text-decoration: none;
-	color: var(--color-text-secondary); margin-bottom: 2px; overflow-wrap: anywhere;
+	display: block; padding: var(--space-2); border-radius: 6px; text-decoration: none;
+	color: var(--color-text-secondary); margin-bottom: var(--space-1); overflow-wrap: anywhere;
 }
 .conv-link.active { background: var(--color-accent-bg); color: var(--color-accent-fg); font-weight: 600; }
-.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: var(--font-size-xs); margin-left: 4px; white-space: nowrap; }
+.badge { display: inline-block; padding: var(--space-1) var(--space-2); border-radius: 10px; font-size: var(--font-size-xs); margin-left: var(--space-1); white-space: nowrap; }
 .badge-idle { background: var(--color-success-bg); color: var(--color-success-fg); }
 .badge-thinking { background: var(--color-warning-bg); color: var(--color-warning-fg); }
 .badge-awaiting_tool { background: var(--color-danger-conversation-bg); color: var(--color-danger-conversation-fg); }
-.new-form { margin-top: 12px; display: flex; gap: 4px; flex: none; }
-.new-form input { flex: 1; min-width: 0; padding: 6px; font-size: var(--font-size-base); }
-.dialog-close { margin-top: 12px; flex: none; align-self: flex-end; }
+.new-form { margin-top: var(--space-3); display: flex; gap: var(--space-1); flex: none; }
+.new-form input { flex: 1; min-width: 0; padding: var(--space-1); font-size: var(--font-size-base); }
+.dialog-close { margin-top: var(--space-3); flex: none; align-self: flex-end; }
 .layout { flex: 1; min-height: 0; display: flex; }
 /* .main is a full-height flex column (its own height comes from .layout's
    flex: 1 inside a min-height:0 ancestor chain up to <body>, itself a
@@ -470,10 +485,10 @@ body {
    in their own #message-list div, distinct from the form, rather than the
    older flat list of bubbles-then-form as direct children of #main. */
 .main { flex: 1; min-height: 0; max-width: 800px; margin: 0 auto; width: 100%; display: flex; flex-direction: column; }
-#message-list { flex: 1; min-height: 0; overflow-y: auto; overflow-wrap: break-word; padding: 20px 24px; }
-.placeholder { color: var(--color-text-subtle); padding: 8px 0; }
-.bubble { margin: 8px 0; padding: 8px 12px; border-radius: 10px; overflow-wrap: break-word; white-space: pre-wrap; }
-.bubble-role { font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .03em; opacity: .6; display: block; margin-bottom: 2px; }
+#message-list { flex: 1; min-height: 0; overflow-y: auto; overflow-wrap: break-word; padding: var(--space-5) var(--space-6); }
+.placeholder { color: var(--color-text-subtle); padding: var(--space-2) 0; }
+.bubble { margin: var(--space-2) 0; padding: var(--space-2) var(--space-3); border-radius: 10px; overflow-wrap: break-word; white-space: pre-wrap; }
+.bubble-role { font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .03em; opacity: .6; display: block; margin-bottom: var(--space-1); }
 .bubble-user { background: var(--color-accent-bg); }
 .bubble-assistant { background: var(--color-bubble-assistant-bg); }
 .bubble-tool { background: var(--color-bubble-tool-bg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: var(--font-size-sm); }
@@ -482,8 +497,8 @@ body {
 /* flex: none (not a scrolling flow child of #message-list) plus its own
    background + border-top is what keeps the composer legible and pinned
    below the transcript instead of scrolling away with it. */
-.send-form { flex: none; display: flex; gap: 6px; padding: 12px 24px 18px; border-top: 1px solid var(--color-border); background: var(--color-bg); }
-.send-form input[type=text] { flex: 1; min-width: 0; padding: 8px; font-size: var(--font-size-base); }
+.send-form { flex: none; display: flex; gap: var(--space-1); padding: var(--space-3) var(--space-6) var(--space-4); border-top: 1px solid var(--color-border); background: var(--color-bg); }
+.send-form input[type=text] { flex: 1; min-width: 0; padding: var(--space-2); font-size: var(--font-size-base); }
 /* Form controls don't inherit body's font-size the way ordinary flow
    elements (like .bubble) do -- browsers give <button>/<input> their own
    UA-stylesheet default (commonly ~13.3px) that ignores the page's typeface
@@ -492,13 +507,13 @@ body {
 button { cursor: pointer; font-size: var(--font-size-base); }
 
 @media (max-width: 700px) {
-	#message-list { padding: 14px 16px; }
-	.send-form { padding: 10px 16px 14px; }
+	#message-list { padding: var(--space-3) var(--space-4); }
+	.send-form { padding: var(--space-2) var(--space-4) var(--space-3); }
 	/* 16px keeps iOS Safari from zooming the page in on focus -- that's
 	   --font-size-lg, referenced here rather than repeated as a literal,
 	   but still exactly 16px. */
-	.new-form input, .send-form input[type=text], .conv-filter { font-size: var(--font-size-lg); padding: 10px; }
-	.new-form button, .send-form button { padding: 10px 14px; font-size: var(--font-size-lg); }
+	.new-form input, .send-form input[type=text], .conv-filter { font-size: var(--font-size-lg); padding: var(--space-2); }
+	.new-form button, .send-form button { padding: var(--space-2) var(--space-3); font-size: var(--font-size-lg); }
 }
 `
 
