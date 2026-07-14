@@ -123,30 +123,29 @@ func (h *uiHTTP) fetchConversations(ctx context.Context) ([]protocol.Conversatio
 func (h *uiHTTP) handleIndex(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	var snap uiSnapshot
+	var err error
 	if convParam := r.URL.Query().Get("conversation"); convParam != "" {
-		cur, _ := getUISnapshot(ctx, h.sys)
-		if string(cur.ConversationID) != convParam {
-			id := protocol.ConversationID(convParam)
-			// Tell "link" to actually redial SSE for the new conversation
-			// (this is async, and separately forwards its own
-			// "conversation_switched" to "ui" once it gets around to it --
-			// harmless, applySwitch is a no-op if ui is already there) --
-			// but ALSO Tell "ui" directly, synchronously, right here, so
-			// the snapshot read just below reflects the switch the user
-			// just asked for immediately, rather than racing link's own
-			// async forward and rendering the previous conversation for
-			// one more request.
-			_ = h.sys.Tell(ctx, "link", statecharts.Event{
-				Name: "switch", Type: statecharts.EventExternal,
-				Data: switchRequest{ConversationID: id},
-			})
-			_ = h.sys.Tell(ctx, "ui", statecharts.Event{
-				Name: "conversation_switched", Type: statecharts.EventExternal, Data: id,
-			})
-		}
+		id := protocol.ConversationID(convParam)
+		// Tell "link" to actually redial SSE for the new conversation --
+		// asynchronously, from link's own perspective, forwarding its own
+		// "conversation_switched" to "ui" once it gets around to actually
+		// processing the "switch" (see link.go's handleSwitch). This
+		// handler doesn't wait on that: it separately asks "ui" itself,
+		// via switch_and_snapshot, to apply the exact same reset
+		// (idempotent -- see ui.go's resetForSwitch) and hand back the
+		// resulting snapshot in one atomic round trip, so the page
+		// rendered in THIS response already reflects the new conversation
+		// without this handler ever emitting "conversation_switched"
+		// itself -- that stays exclusively LinkActor's own notification.
+		_ = h.sys.Tell(ctx, "link", statecharts.Event{
+			Name: "switch", Type: statecharts.EventExternal,
+			Data: switchRequest{ConversationID: id},
+		})
+		snap, err = getUISnapshotForSwitch(ctx, h.sys, id)
+	} else {
+		snap, err = getUISnapshot(ctx, h.sys)
 	}
-
-	snap, err := getUISnapshot(ctx, h.sys)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
