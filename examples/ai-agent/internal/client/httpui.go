@@ -278,6 +278,15 @@ func (h *uiHTTP) handleCreate(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, conversationLink(created.ID.String()), http.StatusSeeOther)
 }
 
+// handleSend is called via Datastar's own @post action (see .send-form's
+// data-on:submit in renderMain), not a native form POST: submitting a
+// message must never trigger a full page navigation, since the live SSE
+// push (UIServerActor's own pushMain, see ui.go) already lands the new
+// message -- in every open tab, including this one -- well before a
+// redirect-and-reload round trip would. So this handler responds with a
+// bare 204 (or a 4xx on a genuine error) rather than http.Redirect: the
+// browser's fetch just resolves, the SSE push does the actual UI update,
+// and .send-form's own data-on:submit clears the input client-side.
 func (h *uiHTTP) handleSend(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -286,7 +295,7 @@ func (h *uiHTTP) handleSend(w http.ResponseWriter, r *http.Request) {
 	convID := r.FormValue("conversation")
 	text := r.FormValue("text")
 	if convID == "" || text == "" {
-		http.Redirect(w, r, conversationLink(convID), http.StatusSeeOther)
+		http.Error(w, "conversation and text are required", http.StatusBadRequest)
 		return
 	}
 
@@ -318,7 +327,13 @@ func (h *uiHTTP) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, conversationLink(convID), http.StatusSeeOther)
+	// No redirect, no body: the live SSE push (pushMain, triggered by the
+	// remote workspace server's own reply to the POST above) is what
+	// actually updates every open tab's transcript, this one included.
+	// Datastar's fetch actions treat a bare 204 as a clean success (no
+	// retry, no console warning) -- see Te's status handling in
+	// datastar.js.
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // pageCSS is the whole UI's styling: plain CSS, no build step, matching
@@ -545,6 +560,16 @@ func renderSidebar(snap uiSnapshot) *htmlutil.Element {
 			"data-bind": "convfilter",
 		}),
 		htmlutil.New("div", map[string]string{"class": "sidebar-list"}, rows...),
+		// Deliberately left as a native form POST, unlike .send-form: this
+		// only reloads once per conversation CREATED, not once per message
+		// SENT, so it isn't the wasteful reload .send-form was (the actual
+		// bug this file's @post conversion exists to fix). handleCreate's
+		// redirect also does real, wanted work here -- switching the
+		// browser into the newly created conversation -- which a bare
+		// @post response can't do without extra plumbing (e.g. a client
+		// script reading the new id back out of the response and doing
+		// window.location itself). Not worth the complexity for a
+		// once-per-conversation action.
 		htmlutil.New("form", map[string]string{"method": "POST", "action": "/conversations", "class": "new-form"},
 			htmlutil.New("input", map[string]string{"name": "title", "placeholder": "New conversation title"}),
 			htmlutil.New("button", map[string]string{"type": "submit"}, htmlutil.Text("+ New")),
@@ -594,9 +619,26 @@ func renderMain(snap uiSnapshot) *htmlutil.Element {
 
 	return htmlutil.New("div", map[string]string{"id": "main", "class": "main"},
 		htmlutil.New("div", map[string]string{"id": "message-list"}, children...),
-		htmlutil.New("form", map[string]string{"method": "POST", "action": "/send", "class": "send-form"},
+		// Submitting is a Datastar @post, not a native form POST: no
+		// navigation, no reload. contentType:'form' is required explicitly
+		// -- @post's own default is 'json' (see Te's contentType:u="json" in
+		// datastar.js), which would send this tab's reactive $signals
+		// instead of this form's own fields. submit__prevent stops the
+		// browser's native submit-and-navigate outright (Datastar's "on"
+		// plugin already auto-prevents default for data-on:submit on a
+		// <form>, but this is explicit rather than relying on that).
+		// evt.target.reset() clears the text input for the next message --
+		// safe to run right after @post(...) with no await, since @post's
+		// own FormData read and the underlying fetch() call both happen
+		// synchronously before the first await inside it (see Ln/Te in
+		// datastar.js). The actual transcript update comes from the live
+		// SSE push (pushMain, see ui.go), not from this response.
+		htmlutil.New("form", map[string]string{
+			"class":                    "send-form",
+			"data-on:submit__prevent": "@post('/send', {contentType: 'form'}); evt.target.reset()",
+		},
 			htmlutil.New("input", map[string]string{"type": "hidden", "name": "conversation", "value": snap.ConversationID.String()}),
-			htmlutil.New("input", map[string]string{"type": "text", "name": "text", "autofocus": "autofocus", "autocomplete": "off"}),
+			htmlutil.New("input", map[string]string{"type": "text", "name": "text", "required": "required", "autofocus": "autofocus", "autocomplete": "off"}),
 			htmlutil.New("button", map[string]string{"type": "submit"}, htmlutil.Text("Send")),
 		),
 	)
