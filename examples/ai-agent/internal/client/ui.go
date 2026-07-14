@@ -2,8 +2,8 @@ package client
 
 import (
 	"context"
-	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
@@ -94,12 +94,33 @@ func snapshotOf(d *uiModel) uiSnapshot {
 
 // datastarPatch formats one datastar-patch-elements SSE event -- see
 // https://data-star.dev/reference/sse_events. elementHTML must be a single
-// top-level element carrying the `id` Datastar morphs it into place by;
-// htmlutil never emits embedded newlines, so a single "data:" line is
-// always enough (SSE would otherwise require one "data:" line per line of
-// the payload).
+// top-level element carrying the `id` Datastar morphs it into place by.
+//
+// elementHTML routinely contains embedded raw newlines -- e.g. any
+// shell_command output ends up as message text rendered verbatim into a
+// bubble, and shell output almost always ends in "\n" -- so a single
+// "data:" line is NOT always enough: per the SSE framing Datastar's own
+// client parses (see the vendored static/datastar.js's onmessage, which
+// reconstructs a multi-line field by splitting the whole event's data on
+// "\n" and grouping lines by their leading keyword), every line of a
+// multi-line value must repeat the "elements " keyword, or the client
+// silently misparses/truncates everything after the first embedded
+// newline -- observed live as a conversation's final assistant reply (the
+// turn following a tool call, whose History includes the tool's own,
+// newline-terminated output) never reaching the browser, with the compose
+// form vanishing along with it, no console error, and no server-side
+// symptom at all (the server-side actor state reaches "idle" correctly;
+// only this client-to-browser SSE framing was ever broken).
 func datastarPatch(elementHTML string) string {
-	return fmt.Sprintf("event: datastar-patch-elements\ndata: elements %s\n\n", elementHTML)
+	var b strings.Builder
+	b.WriteString("event: datastar-patch-elements\n")
+	for _, line := range strings.Split(elementHTML, "\n") {
+		b.WriteString("data: elements ")
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+	return b.String()
 }
 
 // pushMain re-renders the main pane from d's current state and pushes it
