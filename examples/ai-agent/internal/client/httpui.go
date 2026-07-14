@@ -383,22 +383,37 @@ const pageCSS = `
 	/* One-off surfaces that don't fit a status/accent semantic. */
 	--color-bubble-assistant-bg: #f0f0f0;
 	--color-bubble-tool-bg: #fff8e1;
+
+	/* Typographic scale: four sizes tied to semantic roles (meta labels,
+	   secondary/dense text, body copy, and the one mobile-only size that
+	   isn't really about hierarchy at all) rather than the six-odd ad hoc
+	   pixel values this used to be. --font-size-lg stays pinned at 16px
+	   for a non-negotiable reason: iOS Safari zooms the page in on focus
+	   of any input below 16px, so the mobile media query below reuses
+	   this token for text inputs instead of picking its own "large"
+	   value -- don't lower it. */
+	--font-size-xs: 11px;
+	--font-size-sm: 13px;
+	--font-size-base: 14px;
+	--font-size-lg: 16px;
+	--line-height-base: 1.45;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
 	margin: 0; display: flex; flex-direction: column;
 	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+	font-size: var(--font-size-base); line-height: var(--line-height-base);
 	color: var(--color-text); background: var(--color-bg);
 }
 .topbar { flex: none; padding: 8px 16px; background: var(--color-surface); border-bottom: 1px solid var(--color-border); }
 .sidebar-toggle, .dialog-close {
 	padding: 6px 12px; border-radius: 6px; border: 1px solid var(--color-border-input); background: var(--color-surface);
-	cursor: pointer; font-size: 14px;
+	cursor: pointer; font-size: var(--font-size-sm);
 }
 .sidebar-toggle:hover, .dialog-close:hover { background: var(--color-surface-hover); }
 .link-banner {
-	flex: none; padding: 6px 16px; font-size: 12px; font-weight: 600;
+	flex: none; padding: 6px 16px; font-size: var(--font-size-xs); font-weight: 600;
 	text-align: center; letter-spacing: .02em;
 }
 .link-connected { background: var(--color-success-bg); color: var(--color-success-fg); }
@@ -424,8 +439,8 @@ body {
 .sidebar-dialog[open] { display: flex; flex-direction: column; }
 .sidebar-dialog::backdrop { background: var(--color-overlay); }
 .sidebar { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
-.sidebar h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--color-text-subtle); }
-.conv-filter { padding: 7px 9px; margin-bottom: 10px; border: 1px solid var(--color-border-input); border-radius: 6px; flex: none; }
+.sidebar h3 { margin: 0 0 10px; font-size: var(--font-size-sm); text-transform: uppercase; letter-spacing: .04em; color: var(--color-text-subtle); }
+.conv-filter { padding: 7px 9px; margin-bottom: 10px; border: 1px solid var(--color-border-input); border-radius: 6px; flex: none; font-size: var(--font-size-base); }
 .sidebar-list { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 /* .placeholder's own rule (below, shared with #message-list) only sets
    vertical padding; give it the same horizontal inset as .conv-link here so
@@ -437,12 +452,12 @@ body {
 	color: var(--color-text-secondary); margin-bottom: 2px; overflow-wrap: anywhere;
 }
 .conv-link.active { background: var(--color-accent-bg); color: var(--color-accent-fg); font-weight: 600; }
-.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; margin-left: 4px; white-space: nowrap; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: var(--font-size-xs); margin-left: 4px; white-space: nowrap; }
 .badge-idle { background: var(--color-success-bg); color: var(--color-success-fg); }
 .badge-thinking { background: var(--color-warning-bg); color: var(--color-warning-fg); }
 .badge-awaiting_tool { background: var(--color-danger-conversation-bg); color: var(--color-danger-conversation-fg); }
 .new-form { margin-top: 12px; display: flex; gap: 4px; flex: none; }
-.new-form input { flex: 1; min-width: 0; padding: 6px; }
+.new-form input { flex: 1; min-width: 0; padding: 6px; font-size: var(--font-size-base); }
 .dialog-close { margin-top: 12px; flex: none; align-self: flex-end; }
 .layout { flex: 1; min-height: 0; display: flex; }
 /* .main is a full-height flex column (its own height comes from .layout's
@@ -458,25 +473,32 @@ body {
 #message-list { flex: 1; min-height: 0; overflow-y: auto; overflow-wrap: break-word; padding: 20px 24px; }
 .placeholder { color: var(--color-text-subtle); padding: 8px 0; }
 .bubble { margin: 8px 0; padding: 8px 12px; border-radius: 10px; overflow-wrap: break-word; white-space: pre-wrap; }
-.bubble-role { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; opacity: .6; display: block; margin-bottom: 2px; }
+.bubble-role { font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .03em; opacity: .6; display: block; margin-bottom: 2px; }
 .bubble-user { background: var(--color-accent-bg); }
 .bubble-assistant { background: var(--color-bubble-assistant-bg); }
-.bubble-tool { background: var(--color-bubble-tool-bg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+.bubble-tool { background: var(--color-bubble-tool-bg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: var(--font-size-sm); }
 .bubble-thinking { color: var(--color-text-subtle); font-style: italic; background: transparent; padding-left: 0; }
-.bubble-toolcall { background: var(--color-warning-bg); color: var(--color-warning-fg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+.bubble-toolcall { background: var(--color-warning-bg); color: var(--color-warning-fg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: var(--font-size-sm); }
 /* flex: none (not a scrolling flow child of #message-list) plus its own
    background + border-top is what keeps the composer legible and pinned
    below the transcript instead of scrolling away with it. */
 .send-form { flex: none; display: flex; gap: 6px; padding: 12px 24px 18px; border-top: 1px solid var(--color-border); background: var(--color-bg); }
-.send-form input[type=text] { flex: 1; min-width: 0; padding: 8px; }
-button { cursor: pointer; }
+.send-form input[type=text] { flex: 1; min-width: 0; padding: 8px; font-size: var(--font-size-base); }
+/* Form controls don't inherit body's font-size the way ordinary flow
+   elements (like .bubble) do -- browsers give <button>/<input> their own
+   UA-stylesheet default (commonly ~13.3px) that ignores the page's typeface
+   otherwise, so this has to be set explicitly to land buttons on the same
+   base tier as everything else instead of that silently mismatched default. */
+button { cursor: pointer; font-size: var(--font-size-base); }
 
 @media (max-width: 700px) {
 	#message-list { padding: 14px 16px; }
 	.send-form { padding: 10px 16px 14px; }
-	/* 16px keeps iOS Safari from zooming the page in on focus. */
-	.new-form input, .send-form input[type=text], .conv-filter { font-size: 16px; padding: 10px; }
-	.new-form button, .send-form button { padding: 10px 14px; font-size: 16px; }
+	/* 16px keeps iOS Safari from zooming the page in on focus -- that's
+	   --font-size-lg, referenced here rather than repeated as a literal,
+	   but still exactly 16px. */
+	.new-form input, .send-form input[type=text], .conv-filter { font-size: var(--font-size-lg); padding: 10px; }
+	.new-form button, .send-form button { padding: 10px 14px; font-size: var(--font-size-lg); }
 }
 `
 
