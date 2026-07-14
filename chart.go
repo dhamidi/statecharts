@@ -1,6 +1,9 @@
 package statecharts
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Chart is an immutable, validated, indexed chart definition produced by
 // Build. It is safe for concurrent use by multiple Instances.
@@ -46,8 +49,8 @@ type compiledState struct {
 	initial     Identifier // compound: default child id. history: default target id.
 	parent      *compiledState
 	children    []*compiledState // document order
-	onEntry     []ActionFunc
-	onExit      []ActionFunc
+	onEntry     []actionBlock
+	onExit      []actionBlock
 	transitions []*compiledTransition
 	invokes     []*compiledInvoke
 	done        DoneDataFunc
@@ -58,7 +61,7 @@ type compiledTransition struct {
 	events   []Identifier
 	target   []Identifier
 	cond     CondFunc
-	actions  []ActionFunc
+	actions  []actionBlock
 	internal bool
 	source   *compiledState
 }
@@ -96,8 +99,25 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 	if spec.ID == "" {
 		return nil, fmt.Errorf("statecharts: state has empty ID")
 	}
+	if err := validateStateID(spec.ID); err != nil {
+		return nil, err
+	}
+	if spec.Kind > KindHistory {
+		return nil, fmt.Errorf("statecharts: state %q has invalid kind %d", spec.ID, spec.Kind)
+	}
+	if spec.Kind == KindHistory && spec.HistoryKind > Deep {
+		return nil, fmt.Errorf("statecharts: history state %q has invalid history kind %d", spec.ID, spec.HistoryKind)
+	}
 	if _, exists := c.byID[spec.ID]; exists {
 		return nil, fmt.Errorf("statecharts: duplicate state ID %q", spec.ID)
+	}
+	onEntry, err := reconcileActionBlocks(spec.OnEntry, spec.onEntryBlocks)
+	if err != nil {
+		return nil, fmt.Errorf("statecharts: state %q onentry: %w", spec.ID, err)
+	}
+	onExit, err := reconcileActionBlocks(spec.OnExit, spec.onExitBlocks)
+	if err != nil {
+		return nil, fmt.Errorf("statecharts: state %q onexit: %w", spec.ID, err)
 	}
 
 	cs := &compiledState{
@@ -106,8 +126,8 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 		historyKind: spec.HistoryKind,
 		initial:     spec.Initial,
 		parent:      parent,
-		onEntry:     spec.OnEntry,
-		onExit:      spec.OnExit,
+		onEntry:     onEntry,
+		onExit:      onExit,
 		done:        spec.Done,
 		docOrder:    *counter,
 	}
@@ -116,22 +136,30 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 	c.order = append(c.order, cs)
 
 	for _, t := range spec.Transitions {
+		actions, err := reconcileActionBlocks(t.Actions, t.actionBlocks)
+		if err != nil {
+			return nil, fmt.Errorf("statecharts: state %q transition actions: %w", spec.ID, err)
+		}
 		cs.transitions = append(cs.transitions, &compiledTransition{
 			events:   t.Events,
 			target:   t.Target,
 			cond:     t.Cond,
-			actions:  t.Actions,
+			actions:  actions,
 			internal: t.Internal,
 			source:   cs,
 		})
 	}
 
 	for _, inv := range spec.Invokes {
+		finalize, err := reconcileActionBlocks(inv.Finalize, inv.finalizeBlocks)
+		if err != nil {
+			return nil, fmt.Errorf("statecharts: state %q invoke finalize: %w", spec.ID, err)
+		}
 		cs.invokes = append(cs.invokes, &compiledInvoke{
 			id:          inv.ID,
 			start:       inv.Start,
 			params:      inv.Params,
-			finalize:    inv.Finalize,
+			finalize:    finalize,
 			autoForward: inv.AutoForward,
 			resume:      inv.Resume,
 		})
@@ -147,11 +175,65 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 	return cs, nil
 }
 
+// reconcileActionBlocks keeps the exported action slices authoritative while
+// retaining the block boundaries recorded by builder options. Actions added
+// directly to a public slice after using a builder option form one additional
+// block instead of being silently dropped.
+func reconcileActionBlocks(actions []ActionFunc, recorded []actionBlock) ([]actionBlock, error) {
+	if len(recorded) == 0 {
+		if len(actions) == 0 {
+			return nil, nil
+		}
+		return []actionBlock{append(actionBlock(nil), actions...)}, nil
+	}
+	blocks := make([]actionBlock, 0, len(recorded)+1)
+	offset := 0
+	for _, block := range recorded {
+		end := offset + len(block)
+		if end > len(actions) {
+			return nil, fmt.Errorf("public action list was shortened after builder options recorded its block boundaries")
+		}
+		blocks = append(blocks, append(actionBlock(nil), actions[offset:end]...))
+		offset = end
+	}
+	if offset < len(actions) {
+		blocks = append(blocks, append(actionBlock(nil), actions[offset:]...))
+	}
+	return blocks, nil
+}
+
+func validateStateID(id Identifier) error {
+	if _, err := NewIdentifier(string(id)); err != nil {
+		return fmt.Errorf("statecharts: invalid state ID %q: %w", id, err)
+	}
+	s := string(id)
+	if strings.HasPrefix(s, "#") || s == "*" || strings.HasSuffix(s, ".") || strings.HasSuffix(s, ".*") {
+		return fmt.Errorf("statecharts: invalid state ID %q", id)
+	}
+	return nil
+}
+
+func validateEventDescriptor(id Identifier) error {
+	if _, err := NewIdentifier(string(id)); err != nil {
+		return fmt.Errorf("statecharts: invalid event descriptor %q: %w", id, err)
+	}
+	return nil
+}
+
 func (c *Chart) validateReferences() error {
+	explicitInvokeIDs := map[Identifier]Identifier{}
 	for _, cs := range c.order {
+		if cs.kind != KindFinal && cs.done != nil {
+			return fmt.Errorf("statecharts: non-final state %q must not have done data", cs.id)
+		}
+		if cs == c.root && (cs.kind == KindCompound || cs.kind == KindParallel) {
+			if len(cs.onEntry) > 0 || len(cs.onExit) > 0 || len(cs.invokes) > 0 {
+				return fmt.Errorf("statecharts: document root %q must not have onentry, onexit, or invoke content", cs.id)
+			}
+		}
 		switch cs.kind {
 		case KindCompound:
-			if len(cs.children) == 0 {
+			if len(realChildren(cs)) == 0 {
 				return fmt.Errorf("statecharts: compound state %q has no children", cs.id)
 			}
 			if cs.initial == "" {
@@ -166,13 +248,24 @@ func (c *Chart) validateReferences() error {
 			if !ok || !isDescendant(child, cs) {
 				return fmt.Errorf("statecharts: compound state %q initial %q is not a descendant of it", cs.id, cs.initial)
 			}
+			if err := c.validateStateSpecification([]Identifier{cs.initial}); err != nil {
+				return fmt.Errorf("statecharts: compound state %q has invalid initial target: %w", cs.id, err)
+			}
 		case KindParallel:
-			if len(cs.children) == 0 {
+			if len(realChildren(cs)) == 0 {
 				return fmt.Errorf("statecharts: parallel state %q has no children", cs.id)
+			}
+			for _, child := range realChildren(cs) {
+				if child.kind == KindFinal {
+					return fmt.Errorf("statecharts: parallel state %q must not contain final child %q", cs.id, child.id)
+				}
 			}
 		case KindAtomic, KindFinal:
 			if len(cs.children) != 0 {
 				return fmt.Errorf("statecharts: %s state %q must not have children", cs.kind, cs.id)
+			}
+			if cs.kind == KindFinal && (len(cs.transitions) > 0 || len(cs.invokes) > 0) {
+				return fmt.Errorf("statecharts: final state %q must not have transitions or invokes", cs.id)
 			}
 		case KindHistory:
 			if len(cs.children) != 0 {
@@ -187,14 +280,142 @@ func (c *Chart) validateReferences() error {
 			if _, ok := c.byID[cs.initial]; !ok {
 				return fmt.Errorf("statecharts: history state %q default target %q does not exist", cs.id, cs.initial)
 			}
+			if len(cs.transitions) > 0 || len(cs.invokes) > 0 || len(cs.onEntry) > 0 || len(cs.onExit) > 0 || cs.done != nil {
+				return fmt.Errorf("statecharts: history state %q contains unsupported state content", cs.id)
+			}
+			target := c.byID[cs.initial]
+			if !isDescendant(target, cs.parent) {
+				return fmt.Errorf("statecharts: history state %q default target %q is outside parent %q", cs.id, target.id, cs.parent.id)
+			}
+			if cs.historyKind == Shallow && target.parent != cs.parent {
+				return fmt.Errorf("statecharts: shallow history state %q default target %q is not an immediate child", cs.id, target.id)
+			}
+			if err := c.validateStateSpecification([]Identifier{cs.initial}); err != nil {
+				return fmt.Errorf("statecharts: history state %q has invalid default target: %w", cs.id, err)
+			}
 		}
 
 		for _, t := range cs.transitions {
+			if len(t.events) == 0 && t.cond == nil && len(t.target) == 0 {
+				return fmt.Errorf("statecharts: state %q has transition without event, condition, or target", cs.id)
+			}
+			for _, event := range t.events {
+				if err := validateEventDescriptor(event); err != nil {
+					return fmt.Errorf("statecharts: state %q: %w", cs.id, err)
+				}
+			}
 			for _, target := range t.target {
 				if _, ok := c.byID[target]; !ok {
 					return fmt.Errorf("statecharts: state %q transition targets unresolved state %q", cs.id, target)
 				}
 			}
+			if err := c.validateStateSpecification(t.target); err != nil {
+				return fmt.Errorf("statecharts: state %q has invalid transition target: %w", cs.id, err)
+			}
+		}
+		for _, inv := range cs.invokes {
+			if inv.start == nil {
+				return fmt.Errorf("statecharts: state %q has invoke without a start function", cs.id)
+			}
+			if inv.id == "" {
+				continue
+			}
+			if err := validateStateID(inv.id); err != nil {
+				return fmt.Errorf("statecharts: state %q has invalid invoke ID: %w", cs.id, err)
+			}
+			if owner, exists := explicitInvokeIDs[inv.id]; exists {
+				return fmt.Errorf("statecharts: duplicate invoke ID %q on states %q and %q", inv.id, owner, cs.id)
+			}
+			explicitInvokeIDs[inv.id] = cs.id
+		}
+	}
+	return nil
+}
+
+func (c *Chart) validateStateSpecification(ids []Identifier) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	states := make([]*compiledState, 0, len(ids))
+	seen := map[*compiledState]bool{}
+	for _, id := range ids {
+		s := c.byID[id]
+		if s == nil {
+			continue // unresolved references receive the more specific caller error
+		}
+		if seen[s] {
+			return fmt.Errorf("state %q occurs more than once", id)
+		}
+		seen[s] = true
+		states = append(states, s)
+	}
+	for i, a := range states {
+		for _, b := range states[i+1:] {
+			if isDescendant(a, b) || isDescendant(b, a) {
+				return fmt.Errorf("states %q and %q have an ancestor/descendant relationship", a.id, b.id)
+			}
+		}
+	}
+
+	atomSet := map[*compiledState]bool{}
+	for _, s := range states {
+		if err := c.collectDefaultAtomicStates(s, atomSet, map[*compiledState]bool{}); err != nil {
+			return err
+		}
+	}
+	atoms := make([]*compiledState, 0, len(atomSet))
+	for atom := range atomSet {
+		atoms = append(atoms, atom)
+	}
+	if len(atoms) == 0 {
+		return fmt.Errorf("target does not expand to an atomic state")
+	}
+	for i, a := range atoms {
+		for _, b := range atoms[i+1:] {
+			lca := leastCommonAncestor(a, b)
+			if lca == nil || lca.kind != KindParallel {
+				return fmt.Errorf("states %q and %q cannot be active together", a.id, b.id)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Chart) collectDefaultAtomicStates(s *compiledState, atoms, visiting map[*compiledState]bool) error {
+	if visiting[s] {
+		return fmt.Errorf("default target cycle through state %q", s.id)
+	}
+	if isAtomicKind(s) {
+		atoms[s] = true
+		return nil
+	}
+	visiting[s] = true
+	defer delete(visiting, s)
+	switch s.kind {
+	case KindHistory, KindCompound:
+		target := c.byID[s.initial]
+		if target == nil {
+			return fmt.Errorf("state %q has unresolved default target %q", s.id, s.initial)
+		}
+		return c.collectDefaultAtomicStates(target, atoms, visiting)
+	case KindParallel:
+		for _, child := range realChildren(s) {
+			if err := c.collectDefaultAtomicStates(child, atoms, visiting); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func leastCommonAncestor(a, b *compiledState) *compiledState {
+	ancestors := map[*compiledState]bool{}
+	for s := a; s != nil; s = s.parent {
+		ancestors[s] = true
+	}
+	for s := b; s != nil; s = s.parent {
+		if ancestors[s] {
+			return s
 		}
 	}
 	return nil

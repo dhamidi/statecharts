@@ -88,7 +88,7 @@ func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest
 		Name:       req.Event,
 		Type:       statecharts.EventExternal,
 		Data:       req.Data,
-		SendID:     req.SendID,
+		SendID:     req.EventSendID,
 		Origin:     p.self,
 		OriginType: originTypeActors,
 	}

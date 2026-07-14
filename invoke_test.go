@@ -3,6 +3,7 @@ package statecharts
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -602,6 +603,7 @@ func childPingPongChart(t *testing.T) *Chart {
 // child with no explicit "#_<invokeid>" addressing needed.
 func TestInvokeChartRoundTripsThroughParentAndAutoForward(t *testing.T) {
 	childChart := childPingPongChart(t)
+	var childOrigin, childOriginType Identifier
 
 	parentChart, err := Build(
 		Compound("proot", "invoking",
@@ -613,7 +615,11 @@ func TestInvokeChartRoundTripsThroughParentAndAutoForward(t *testing.T) {
 				// it.
 				Compound("invoking", "waitingHello",
 					Children(
-						Atomic("waitingHello", On("hello", Target("waitingPong"))),
+						Atomic("waitingHello", On("hello", Target("waitingPong"), Then(func(ec ExecContext) error {
+							ev, _ := ec.Event()
+							childOrigin, childOriginType = ev.Origin, ev.OriginType
+							return nil
+						}))),
 						Atomic("waitingPong", On("pong", Target("done"))),
 					),
 					Invoke(
@@ -643,6 +649,9 @@ func TestInvokeChartRoundTripsThroughParentAndAutoForward(t *testing.T) {
 			t.Fatalf("configuration = %v, want 'waitingPong' after the child's #_parent 'hello'", parent.Configuration())
 		}
 		time.Sleep(time.Millisecond)
+	}
+	if !strings.HasPrefix(string(childOrigin), "#_scxml_") || childOriginType != "scxml" {
+		t.Fatalf("child #_parent event origin = %q/%q, want #_scxml_<child-session>/scxml", childOrigin, childOriginType)
 	}
 
 	// The parent has no transition of its own for "ping" -- it only
@@ -762,10 +771,9 @@ func TestInvokeChartCancelledOnStateExitStopsChildSession(t *testing.T) {
 }
 
 // TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry confirms
-// parentIOProcessor.IOProcessors forwards baseIO's advertised entries into
-// the child session's own ExecContext, and never synthesizes a "#_parent"
-// entry -- _ioprocessors describes how others reach this session, and
-// "#_parent" is the reverse (how the child reaches its parent).
+// parentIOProcessor.IOProcessors includes the mandatory address of the child
+// SCXML session and forwards baseIO's advertised entries, without synthesizing
+// a reverse-direction "#_parent" entry.
 func TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry(t *testing.T) {
 	seen := make(chan []IOProcessorInfo, 1)
 	childChart, err := Build(
@@ -801,19 +809,18 @@ func TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry(t *testing.
 
 	select {
 	case got := <-seen:
-		if len(got) != 1 || got[0].Type != "mock" || got[0].Location.String() != "mock://base" {
-			t.Fatalf("child ExecContext.IOProcessors() = %v, want [{mock mock://base}] (baseIO's entries, no synthetic #_parent entry)", got)
+		if len(got) != 2 || got[0].Type != SCXMLEventProcessor || !strings.HasPrefix(got[0].Location.String(), "#_scxml_") || got[1].Type != "mock" || got[1].Location.String() != "mock://base" {
+			t.Fatalf("child ExecContext.IOProcessors() = %v, want its SCXML address followed by {mock mock://base}", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("child's OnEntry action never ran")
 	}
 }
 
-// TestInvokeChartChildIOProcessorsEmptyWithNilBaseIO confirms a nil baseIO
-// (InvokeChart's own "defer to NoopIOProcessor" default) leaves the child
-// with nothing to advertise, mirroring a bare Instance with no IOProcessor
-// configured.
-func TestInvokeChartChildIOProcessorsEmptyWithNilBaseIO(t *testing.T) {
+// TestInvokeChartChildIOProcessorsIncludesSCXMLWithNilBaseIO confirms the
+// mandatory child-session SCXML address remains available with no base
+// transport configured.
+func TestInvokeChartChildIOProcessorsIncludesSCXMLWithNilBaseIO(t *testing.T) {
 	seen := make(chan []IOProcessorInfo, 1)
 	childChart, err := Build(
 		Atomic("only",
@@ -847,10 +854,137 @@ func TestInvokeChartChildIOProcessorsEmptyWithNilBaseIO(t *testing.T) {
 
 	select {
 	case got := <-seen:
-		if len(got) != 0 {
-			t.Fatalf("child ExecContext.IOProcessors() = %v, want empty (nil baseIO has nothing to advertise)", got)
+		if len(got) != 1 || got[0].Type != SCXMLEventProcessor || !strings.HasPrefix(got[0].Location.String(), "#_scxml_") {
+			t.Fatalf("child ExecContext.IOProcessors() = %v, want its mandatory SCXML address", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("child's OnEntry action never ran")
+	}
+}
+
+func TestInvokeChartPropagatesTopLevelDoneData(t *testing.T) {
+	child, err := Build(
+		Compound("child", "done", Children(
+			Final("done", WithDone(func(ExecContext) any { return "child result" })),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build child: %v", err)
+	}
+
+	var got any
+	parent, err := Build(
+		Compound("parent", "working", Children(
+			Atomic("working",
+				Invoke(InvokeChart(child, func(any) any { return nil }, nil), WithInvokeID("child")),
+				On("done.invoke.child", Target("finished"), Then(func(ec ExecContext) error {
+					ev, _ := ec.Event()
+					got = ev.Data
+					return nil
+				})),
+			),
+			Final("finished"),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build parent: %v", err)
+	}
+
+	in := New(parent, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := in.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got != "child result" {
+		t.Fatalf("done.invoke data = %#v, want child result", got)
+	}
+}
+
+func TestInvokeFullIncomingQueueProducesCommunicationError(t *testing.T) {
+	chart, err := Build(
+		Compound("root", "active", Children(
+			Atomic("active",
+				Invoke(func(ctx context.Context, _ any, _ InvokeIO) (any, error) {
+					<-ctx.Done()
+					return nil, nil
+				}, WithInvokeID("service")),
+				On("fill", Then(func(ec ExecContext) error {
+					for i := 0; i <= invokeIncomingBuffer; i++ {
+						ec.Send("message", SendOptions{Target: "#_service"})
+					}
+					return nil
+				})),
+				On(string(ErrEventCommunication), Target("failed")),
+			),
+			Atomic("failed"),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if err := in.Send(ctx, Event{Name: "fill"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !hasState(in.Configuration(), "failed") {
+		t.Fatalf("configuration = %v, want failed after invocation mailbox saturation", in.Configuration())
+	}
+}
+
+func TestInvokeParamsPanicBecomesExecutionError(t *testing.T) {
+	started := false
+	chart, err := Build(
+		Compound("root", "active", Children(
+			Atomic("active",
+				Invoke(func(context.Context, any, InvokeIO) (any, error) {
+					started = true
+					return nil, nil
+				}, WithInvokeParams(func(ExecContext) any { panic("boom") })),
+				On(string(ErrEventExecution), Target("recovered")),
+			),
+			Atomic("recovered"),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if started {
+		t.Fatal("invoke started despite its params failing to evaluate")
+	}
+	if !hasState(in.Configuration(), "recovered") {
+		t.Fatalf("configuration = %v, want recovered after params panic", in.Configuration())
+	}
+}
+
+func TestInvokeGeneratedIDDoesNotCollideWithExplicitID(t *testing.T) {
+	service := func(context.Context, any, InvokeIO) (any, error) { return nil, nil }
+	chart, err := Build(Atomic("root",
+		Invoke(service, WithInvokeID("root.invoke1")),
+		Invoke(service),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	if len(ip.invokesByID) != 2 || ip.invokesByID["root.invoke1"] == nil || ip.invokesByID["root.invoke2"] == nil {
+		t.Fatalf("active invoke IDs = %v, want root.invoke1 and root.invoke2", sortedInvokeIDs(ip.invokesByID))
 	}
 }

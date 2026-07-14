@@ -3,11 +3,12 @@ package statecharts
 // TransitionSpec is the uncompiled description of one transition, built via
 // On/Eventless plus TransitionOptions.
 type TransitionSpec struct {
-	Events   []Identifier // event descriptors; empty = eventless
-	Target   []Identifier // resolved state IDs; empty = targetless (internal-only actions)
-	Cond     CondFunc     // nil = always true
-	Actions  []ActionFunc
-	Internal bool // SCXML transition type="internal"
+	Events       []Identifier // event descriptors; empty = eventless
+	Target       []Identifier // resolved state IDs; empty = targetless (internal-only actions)
+	Cond         CondFunc     // nil = always true
+	Actions      []ActionFunc
+	Internal     bool // SCXML transition type="internal"
+	actionBlocks []actionBlock
 }
 
 // TransitionOption configures a TransitionSpec being built by On/Eventless.
@@ -26,7 +27,10 @@ func If(cond CondFunc) TransitionOption {
 
 // Then attaches executable content run when the transition fires.
 func Then(actions ...ActionFunc) TransitionOption {
-	return func(t *TransitionSpec) { t.Actions = append(t.Actions, actions...) }
+	return func(t *TransitionSpec) {
+		t.Actions = append(t.Actions, actions...)
+		t.actionBlocks = append(t.actionBlocks, append(actionBlock(nil), actions...))
+	}
 }
 
 // AsInternal marks the transition as SCXML transition type="internal".

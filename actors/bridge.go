@@ -111,7 +111,7 @@ func (b *Bridge) Send(ctx context.Context, req statecharts.SendRequest) error {
 		Name:       req.Event,
 		Type:       statecharts.EventExternal,
 		Data:       req.Data,
-		SendID:     req.SendID,
+		SendID:     req.EventSendID,
 		Origin:     origin,
 		OriginType: originTypeActors,
 	}

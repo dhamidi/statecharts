@@ -2,6 +2,7 @@ package statecharts
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -27,14 +28,17 @@ type interpretation struct {
 	internalQueue []Event
 	externalQueue []Event
 	running       bool
+	result        any
+	completed     bool
 	lastEvent     Event
 	hasLastEvent  bool
 
-	io      IOProcessor
-	clock   Clock
-	logger  Logger
-	pending map[Identifier]*pendingSendRecord
-	sendSeq int
+	io         IOProcessor
+	clock      Clock
+	logger     Logger
+	pending    map[*pendingSendRecord]bool
+	sendSeq    int
+	pendingSeq int
 
 	// statesToInvoke, activeInvokes, invokesByID, and invokeSeq are the
 	// <invoke> bookkeeping (SCXML 6.4): statesToInvoke accumulates states
@@ -78,6 +82,7 @@ type pendingSendRecord struct {
 	typ    Identifier
 	event  Event
 	fireAt time.Time
+	order  int
 	stop   func() bool
 }
 
@@ -87,7 +92,7 @@ func newInterpretation(chart *Chart, datamodel any) *interpretation {
 		datamodel:      datamodel,
 		configuration:  map[*compiledState]bool{},
 		historyValue:   map[*compiledState][]*compiledState{},
-		pending:        map[Identifier]*pendingSendRecord{},
+		pending:        map[*pendingSendRecord]bool{},
 		io:             NoopIOProcessor,
 		clock:          NewRealClock(),
 		logger:         NoopLogger,
@@ -183,6 +188,15 @@ func (ip *interpretation) reportCommError(err error) {
 	ip.enqueueInternal(Event{Name: ErrEventCommunication, Type: EventPlatform, Data: err})
 }
 
+func (ip *interpretation) reportSendError(sendID Identifier, err error) {
+	name := ErrEventCommunication
+	var executionError SendExecutionError
+	if errors.As(err, &executionError) {
+		name = ErrEventExecution
+	}
+	ip.enqueueInternal(Event{Name: name, Type: EventPlatform, SendID: sendID, Data: err})
+}
+
 // --- <send> / <cancel> (SCXML 6.2, 6.3) ---------------------------------
 //
 // Delay timer bookkeeping lives here, in the interpreter core, rather than
@@ -195,7 +209,7 @@ func (ip *interpretation) reportCommError(err error) {
 
 // SendOptions configures a scheduled event, mirroring <send>'s attributes.
 type SendOptions struct {
-	SendID Identifier // auto-generated if empty
+	SendID Identifier // author-visible ID; empty uses an unexposed execution ID
 	Target Identifier // "" = own external queue (default); "#_internal"; or an external target
 	Type   Identifier // IOProcessor selector, meaningful for external targets only
 	Data   any
@@ -208,32 +222,50 @@ func (ip *interpretation) doSend(name Identifier, opts SendOptions) {
 		ip.sendSeq++
 		sendID = Identifier(fmt.Sprintf("send.%d", ip.sendSeq))
 	}
-	ev := Event{Name: name, Data: opts.Data, SendID: sendID}
+	if opts.Type == "" {
+		opts.Type = SCXMLEventProcessor
+	}
+	ev := Event{Name: name, Data: opts.Data, SendID: opts.SendID}
 
 	if opts.Delay <= 0 {
 		ip.dispatchNow(sendID, opts.Target, opts.Type, ev)
 		return
 	}
 
+	ip.pendingSeq++
 	rec := &pendingSendRecord{
 		sendID: sendID,
 		target: opts.Target,
 		typ:    opts.Type,
 		event:  ev,
 		fireAt: ip.clock.Now().Add(opts.Delay),
+		order:  ip.pendingSeq,
 	}
-	ip.pending[sendID] = rec
-	rec.stop = ip.clock.AfterFunc(opts.Delay, func() { ip.handleTimerFire(sendID) })
+	ip.pending[rec] = true
+	rec.stop = ip.clock.AfterFunc(opts.Delay, func() { ip.handleTimerFire(rec) })
+}
+
+func (ip *interpretation) stampExternalEvent(ev Event) Event {
+	ev.Type = EventExternal
+	ev.Origin = Identifier("#_scxml_" + string(ip.sessionID))
+	ev.OriginType = "scxml"
+	return ev
 }
 
 func (ip *interpretation) dispatchNow(sendID, target, typ Identifier, ev Event) {
+	if typ == "" {
+		typ = SCXMLEventProcessor
+	}
 	switch {
 	case target == "#_internal":
 		ev.Type = EventInternal
+		ev.Origin = ""
+		ev.OriginType = ""
 		ip.enqueueInternal(ev)
 	case target == "":
-		ev.Type = EventExternal
-		ip.enqueueExternal(ev)
+		ip.enqueueExternal(ip.stampExternalEvent(ev))
+	case target == Identifier("#_scxml_"+string(ip.sessionID)):
+		ip.enqueueExternal(ip.stampExternalEvent(ev))
 	case strings.HasPrefix(string(target), "#_"):
 		// SCXML 6.4.4: "#_<invokeid>" addresses a specific running
 		// invocation. An unrecognized invoke ID (already finished, never
@@ -243,21 +275,23 @@ func (ip *interpretation) dispatchNow(sendID, target, typ Identifier, ev Event) 
 		// any other unhandled target, which reports it as a communication
 		// error rather than silently dropping it.
 		if ri, ok := ip.invokesByID[Identifier(strings.TrimPrefix(string(target), "#_"))]; ok && ri.incoming != nil {
+			ev = ip.stampExternalEvent(ev)
 			select {
 			case ri.incoming <- ev:
-			default: // never block the interpreter on a slow/absent reader
+			default:
+				ip.reportSendError(sendID, fmt.Errorf("statecharts: invoke %q cannot accept another event", ri.id))
 			}
 			return
 		}
 		fallthrough
 	default:
 		if ip.io == nil {
-			ip.reportCommError(fmt.Errorf("statecharts: no IOProcessor configured for send target %q", target))
+			ip.reportSendError(sendID, fmt.Errorf("statecharts: no IOProcessor configured for send target %q", target))
 			return
 		}
-		req := SendRequest{SendID: sendID, Target: target, Type: typ, Event: ev.Name, Data: ev.Data}
+		req := SendRequest{SendID: sendID, EventSendID: ev.SendID, Target: target, Type: typ, Event: ev.Name, Data: ev.Data}
 		if err := ip.io.Send(context.Background(), req); err != nil {
-			ip.reportCommError(err)
+			ip.reportSendError(sendID, err)
 		}
 	}
 }
@@ -269,44 +303,84 @@ func (ip *interpretation) dispatchNow(sendID, target, typ Identifier, ev Event) 
 // this runs on the actor's own goroutine, never a raw timer goroutine).
 // It gives timerFiredHook a chance to run (and veto) before the event is
 // actually applied.
-func (ip *interpretation) handleTimerFire(sendID Identifier) {
-	rec, ok := ip.pending[sendID]
-	if !ok {
+func (ip *interpretation) handleTimerFire(rec *pendingSendRecord) {
+	if !ip.pending[rec] {
 		return // already cancelled
 	}
 	if ip.timerFiredHook != nil {
-		if err := ip.timerFiredHook(sendID, rec.target, rec.typ, rec.event); err != nil {
+		if err := ip.timerFiredHook(rec.sendID, rec.target, rec.typ, rec.event); err != nil {
 			ip.hookErr = err
 			ip.running = false
 			return
 		}
 	}
-	ip.fireTimer(sendID)
+	ip.fireTimer(rec)
 }
 
 // fireTimer applies a delayed send whose timer has elapsed, unconditionally
 // (timerFiredHook has already run, if configured).
-func (ip *interpretation) fireTimer(sendID Identifier) {
-	rec, ok := ip.pending[sendID]
-	if !ok {
+func (ip *interpretation) fireTimer(rec *pendingSendRecord) {
+	if !ip.pending[rec] {
 		return // already cancelled, or fired twice (shouldn't happen)
 	}
-	delete(ip.pending, sendID)
+	delete(ip.pending, rec)
 	ip.dispatchNow(rec.sendID, rec.target, rec.typ, rec.event)
+}
+
+// replayTimerFire consumes one pending record matching a durable timer-fired
+// log entry. Multiple delayed sends may intentionally share a send ID; the
+// event metadata disambiguates them when possible.
+func (ip *interpretation) replayTimerFire(sendID, target, typ Identifier, ev Event) bool {
+	var candidates, exact []*pendingSendRecord
+	for rec := range ip.pending {
+		if rec.sendID != sendID {
+			continue
+		}
+		candidates = append(candidates, rec)
+		if rec.target == target && rec.typ == typ && rec.event.Name == ev.Name {
+			exact = append(exact, rec)
+		}
+	}
+	if len(candidates) == 0 {
+		return false
+	}
+	matches := candidates
+	if len(exact) > 0 {
+		matches = exact
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if !matches[i].fireAt.Equal(matches[j].fireAt) {
+			return matches[i].fireAt.Before(matches[j].fireAt)
+		}
+		return matches[i].order < matches[j].order
+	})
+	match := matches[0]
+	delete(ip.pending, match)
+	if match.stop != nil {
+		match.stop()
+	}
+	ip.dispatchNow(sendID, target, typ, ev)
+	return true
 }
 
 // doCancel best-effort cancels a pending delayed send. Per SCXML, a miss
 // (unknown or already-fired sendID) is not an error.
 func (ip *interpretation) doCancel(sendID Identifier) {
-	rec, ok := ip.pending[sendID]
-	if !ok {
+	if sendID == "" {
 		return
 	}
-	delete(ip.pending, sendID)
-	if rec.stop != nil {
-		rec.stop()
+	found := false
+	for rec := range ip.pending {
+		if rec.event.SendID != sendID {
+			continue
+		}
+		found = true
+		delete(ip.pending, rec)
+		if rec.stop != nil {
+			rec.stop()
+		}
 	}
-	if ip.io != nil {
+	if found && ip.io != nil {
 		_ = ip.io.Cancel(context.Background(), sendID)
 	}
 }
@@ -354,16 +428,45 @@ func (ip *interpretation) execContext() ExecContext {
 	}
 }
 
-func (ip *interpretation) runActions(actions []ActionFunc) {
-	ec := ip.execContext()
+func (ip *interpretation) runActions(actions actionBlock) {
+	ip.runActionsWithContext(actions, ip.execContext())
+}
+
+func (ip *interpretation) runActionsWithContext(actions actionBlock, ec ExecContext) {
 	for _, a := range actions {
 		if a == nil {
 			continue
 		}
-		if err := a(ec); err != nil {
+		if err := callAction(a, ec); err != nil {
 			ip.reportError(err)
+			break
 		}
 	}
+}
+
+func (ip *interpretation) runActionBlocks(blocks []actionBlock) {
+	for _, block := range blocks {
+		ip.runActions(block)
+	}
+}
+
+func callAction(action ActionFunc, ec ExecContext) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			err = fmt.Errorf("statecharts: action panicked: %v", value)
+		}
+	}()
+	return action(ec)
+}
+
+func (ip *interpretation) evaluateDone(done DoneDataFunc) (data any) {
+	defer func() {
+		if value := recover(); value != nil {
+			ip.reportError(fmt.Errorf("statecharts: done data panicked: %v", value))
+			data = nil
+		}
+	}()
+	return done(ip.execContext())
 }
 
 // activeStates returns the current configuration's state IDs in document order.
@@ -444,17 +547,19 @@ func (ip *interpretation) effectiveTargetStates(t *compiledTransition) []*compil
 	seen := map[*compiledState]bool{}
 	for _, id := range t.target {
 		if s := ip.chart.byID[id]; s != nil {
-			ip.collectEffectiveTarget(s, &result, seen, 0)
+			ip.collectEffectiveTarget(s, &result, seen, map[*compiledState]bool{})
 		}
 	}
 	return result
 }
 
-func (ip *interpretation) collectEffectiveTarget(s *compiledState, result *[]*compiledState, seen map[*compiledState]bool, depth int) {
-	if depth > 32 {
-		return // guard against pathological history reference cycles
-	}
+func (ip *interpretation) collectEffectiveTarget(s *compiledState, result *[]*compiledState, seen, visiting map[*compiledState]bool) {
 	if s.kind == KindHistory {
+		if visiting[s] {
+			return // Build rejects cycles; retain a guard for corrupt restored state.
+		}
+		visiting[s] = true
+		defer delete(visiting, s)
 		if recorded, ok := ip.historyValue[s]; ok {
 			for _, r := range recorded {
 				if !seen[r] {
@@ -463,7 +568,7 @@ func (ip *interpretation) collectEffectiveTarget(s *compiledState, result *[]*co
 				}
 			}
 		} else if def := ip.chart.byID[s.initial]; def != nil {
-			ip.collectEffectiveTarget(def, result, seen, depth+1)
+			ip.collectEffectiveTarget(def, result, seen, visiting)
 		}
 		return
 	}
@@ -575,7 +680,7 @@ func (ip *interpretation) isInFinalState(s *compiledState) bool {
 
 func (ip *interpretation) enterState(s *compiledState, _ bool) {
 	ip.configuration[s] = true
-	ip.runActions(s.onEntry)
+	ip.runActionBlocks(s.onEntry)
 
 	if len(s.invokes) > 0 {
 		// Deferred to the end of the macrostep by processInvokes, per
@@ -590,6 +695,10 @@ func (ip *interpretation) enterState(s *compiledState, _ bool) {
 	if s.parent == nil || s.parent == ip.chart.root {
 		// a top-level final state (root itself is Final, or its direct
 		// parent is the chart root) ends the machine.
+		if s.done != nil {
+			ip.result = ip.evaluateDone(s.done)
+		}
+		ip.completed = true
 		ip.running = false
 		return
 	}
@@ -597,11 +706,11 @@ func (ip *interpretation) enterState(s *compiledState, _ bool) {
 
 	var data any
 	if s.done != nil {
-		data = s.done(ip.execContext())
+		data = ip.evaluateDone(s.done)
 	}
 	ip.enqueueInternal(Event{
 		Name: Identifier("done.state." + string(parent.id)),
-		Type: EventInternal,
+		Type: EventPlatform,
 		Data: data,
 	})
 
@@ -616,14 +725,14 @@ func (ip *interpretation) enterState(s *compiledState, _ bool) {
 		if allDone {
 			ip.enqueueInternal(Event{
 				Name: Identifier("done.state." + string(grandparent.id)),
-				Type: EventInternal,
+				Type: EventPlatform,
 			})
 		}
 	}
 }
 
 func (ip *interpretation) exitState(s *compiledState) {
-	ip.runActions(s.onExit)
+	ip.runActionBlocks(s.onExit)
 	ip.cancelInvokes(s)
 	delete(ip.statesToInvoke, s)
 	delete(ip.configuration, s)
@@ -669,17 +778,51 @@ func (ip *interpretation) processInvokes() {
 func (ip *interpretation) beginInvoke(s *compiledState, specIndex int, spec *compiledInvoke) {
 	id := spec.id
 	if id == "" {
-		ip.invokeSeq++
-		id = Identifier(fmt.Sprintf("%s.invoke%d", s.id, ip.invokeSeq))
+		for {
+			ip.invokeSeq++
+			id = Identifier(fmt.Sprintf("%s.invoke%d", s.id, ip.invokeSeq))
+			if !ip.invokeIDReserved(id) {
+				break
+			}
+		}
 	}
 	var params any
 	if spec.params != nil {
-		params = spec.params(ip.execContext())
+		var ok bool
+		params, ok = ip.evaluateInvokeParams(spec.params, ip.execContext())
+		if !ok {
+			return
+		}
 	}
 	cancel, incoming := ip.startInvoke(id, spec, params)
 	ri := &runningInvoke{id: id, state: s, specIndex: specIndex, finalize: spec.finalize, autoForward: spec.autoForward, cancel: cancel, incoming: incoming}
 	ip.activeInvokes[s] = append(ip.activeInvokes[s], ri)
 	ip.invokesByID[id] = ri
+}
+
+func (ip *interpretation) invokeIDReserved(id Identifier) bool {
+	if ip.invokesByID[id] != nil {
+		return true
+	}
+	for _, state := range ip.chart.order {
+		for _, spec := range state.invokes {
+			if spec.id == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (ip *interpretation) evaluateInvokeParams(fn func(ExecContext) any, ec ExecContext) (params any, ok bool) {
+	ok = true
+	defer func() {
+		if value := recover(); value != nil {
+			ip.reportError(fmt.Errorf("statecharts: invoke params panicked: %v", value))
+			params, ok = nil, false
+		}
+	}()
+	return fn(ec), true
 }
 
 // applyInvokeSideEffects runs whichever of two per-invocation side effects
@@ -708,12 +851,13 @@ func (ip *interpretation) applyInvokeSideEffects(ev Event) {
 	for _, id := range sortedInvokeIDs(ip.invokesByID) {
 		ri := ip.invokesByID[id]
 		if ev.InvokeID != "" && ri.id == ev.InvokeID {
-			ip.runActions(ri.finalize)
+			ip.runActionBlocks(ri.finalize)
 		}
 		if ri.autoForward && ri.incoming != nil {
 			select {
 			case ri.incoming <- ev:
-			default: // never block the interpreter on a slow/absent reader
+			default:
+				ip.reportCommError(fmt.Errorf("statecharts: invoke %q cannot accept an autoforwarded event", ri.id))
 			}
 		}
 	}
@@ -749,8 +893,8 @@ func (ip *interpretation) exitInterpreter() {
 	// Pending delayed sends belong to this interpreter's lifetime. Leaving
 	// their callbacks armed after terminal exit retains the whole Instance
 	// until their deadlines and can race a separately restored copy.
-	for id, rec := range ip.pending {
-		delete(ip.pending, id)
+	for rec := range ip.pending {
+		delete(ip.pending, rec)
 		if rec.stop != nil {
 			rec.stop()
 		}
@@ -823,11 +967,21 @@ func (ip *interpretation) condMatches(t *compiledTransition) bool {
 	if t.cond == nil {
 		return true
 	}
-	return t.cond(ip.execContext())
+	matched := false
+	func() {
+		defer func() {
+			if value := recover(); value != nil {
+				ip.reportError(fmt.Errorf("statecharts: condition panicked: %v", value))
+			}
+		}()
+		matched = t.cond(ip.execContext())
+	}()
+	return matched
 }
 
 func (ip *interpretation) selectTransitions(ev Event) []*compiledTransition {
 	var enabled []*compiledTransition
+	seen := map[*compiledTransition]bool{}
 	for _, s := range ip.atomicStatesInDocOrder() {
 		chain := append([]*compiledState{s}, properAncestors(s, nil)...)
 	branchLoop:
@@ -836,7 +990,10 @@ func (ip *interpretation) selectTransitions(ev Event) []*compiledTransition {
 				if len(t.events) == 0 || !ip.eventMatches(t, ev.Name) || !ip.condMatches(t) {
 					continue
 				}
-				enabled = append(enabled, t)
+				if !seen[t] {
+					seen[t] = true
+					enabled = append(enabled, t)
+				}
 				break branchLoop
 			}
 		}
@@ -846,6 +1003,7 @@ func (ip *interpretation) selectTransitions(ev Event) []*compiledTransition {
 
 func (ip *interpretation) selectEventlessTransitions() []*compiledTransition {
 	var enabled []*compiledTransition
+	seen := map[*compiledTransition]bool{}
 	for _, s := range ip.atomicStatesInDocOrder() {
 		chain := append([]*compiledState{s}, properAncestors(s, nil)...)
 	branchLoop:
@@ -854,7 +1012,10 @@ func (ip *interpretation) selectEventlessTransitions() []*compiledTransition {
 				if len(t.events) != 0 || !ip.condMatches(t) {
 					continue
 				}
-				enabled = append(enabled, t)
+				if !seen[t] {
+					seen[t] = true
+					enabled = append(enabled, t)
+				}
 				break branchLoop
 			}
 		}
@@ -919,7 +1080,7 @@ func (ip *interpretation) removeConflictingTransitions(enabled []*compiledTransi
 func (ip *interpretation) microstep(transitions []*compiledTransition) {
 	ip.exitStates(transitions)
 	for _, t := range transitions {
-		ip.runActions(t.actions)
+		ip.runActionBlocks(t.actions)
 	}
 	ip.enterStates(transitions)
 }

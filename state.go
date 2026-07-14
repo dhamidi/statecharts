@@ -52,16 +52,18 @@ func (k HistoryKind) String() string {
 // tree, built via Atomic/Compound/Parallel/Final/History and StateOptions,
 // then compiled once by Build.
 type StateSpec struct {
-	ID          Identifier
-	Kind        StateKind
-	Initial     Identifier // compound: default child. history: default target.
-	HistoryKind HistoryKind
-	OnEntry     []ActionFunc
-	OnExit      []ActionFunc
-	Transitions []TransitionSpec
-	Children    []StateSpec // preserved in call order == SCXML document order
-	Invokes     []InvokeSpec
-	Done        DoneDataFunc
+	ID            Identifier
+	Kind          StateKind
+	Initial       Identifier // compound: default child. history: default target.
+	HistoryKind   HistoryKind
+	OnEntry       []ActionFunc
+	OnExit        []ActionFunc
+	Transitions   []TransitionSpec
+	Children      []StateSpec // preserved in call order == SCXML document order
+	Invokes       []InvokeSpec
+	Done          DoneDataFunc
+	onEntryBlocks []actionBlock
+	onExitBlocks  []actionBlock
 }
 
 // StateOption configures a StateSpec being built by Atomic/Compound/etc.
@@ -74,12 +76,18 @@ func Children(children ...StateSpec) StateOption {
 
 // OnEntry attaches executable content run when the state is entered.
 func OnEntry(actions ...ActionFunc) StateOption {
-	return func(s *StateSpec) { s.OnEntry = append(s.OnEntry, actions...) }
+	return func(s *StateSpec) {
+		s.OnEntry = append(s.OnEntry, actions...)
+		s.onEntryBlocks = append(s.onEntryBlocks, append(actionBlock(nil), actions...))
+	}
 }
 
 // OnExit attaches executable content run when the state is exited.
 func OnExit(actions ...ActionFunc) StateOption {
-	return func(s *StateSpec) { s.OnExit = append(s.OnExit, actions...) }
+	return func(s *StateSpec) {
+		s.OnExit = append(s.OnExit, actions...)
+		s.onExitBlocks = append(s.onExitBlocks, append(actionBlock(nil), actions...))
+	}
 }
 
 // WithDone sets the done-data callback for a Final state.

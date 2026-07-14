@@ -67,12 +67,13 @@ type InvokeResumeFunc func(ctx context.Context, id Identifier, params any, io In
 // InvokeSpec is the uncompiled description of one <invoke> attached to a
 // state, built via Invoke and InvokeOptions.
 type InvokeSpec struct {
-	ID          Identifier // empty = auto-generated ("<stateid>.invoke<n>") at invoke time
-	Start       InvokeFunc
-	Params      func(ExecContext) any // evaluated once, synchronously, when the invocation starts; nil => nil params
-	Finalize    []ActionFunc
-	AutoForward bool
-	Resume      InvokeResumeFunc
+	ID             Identifier // empty = auto-generated ("<stateid>.invoke<n>") at invoke time
+	Start          InvokeFunc
+	Params         func(ExecContext) any // evaluated once, synchronously, when the invocation starts; nil => nil params
+	Finalize       []ActionFunc
+	AutoForward    bool
+	Resume         InvokeResumeFunc
+	finalizeBlocks []actionBlock
 }
 
 // InvokeOption configures an InvokeSpec being built by Invoke.
@@ -97,7 +98,10 @@ func WithInvokeParams(fn func(ExecContext) any) InvokeOption {
 // are selected for it (SCXML 6.5): the mechanism for normalizing data an
 // invoked service returns before any transition's guard inspects it.
 func WithFinalize(actions ...ActionFunc) InvokeOption {
-	return func(s *InvokeSpec) { s.Finalize = append(s.Finalize, actions...) }
+	return func(s *InvokeSpec) {
+		s.Finalize = append(s.Finalize, actions...)
+		s.finalizeBlocks = append(s.finalizeBlocks, append(actionBlock(nil), actions...))
+	}
 }
 
 // WithAutoForward makes the chart forward an exact copy of every external
@@ -138,7 +142,7 @@ type compiledInvoke struct {
 	id          Identifier
 	start       InvokeFunc
 	params      func(ExecContext) any
-	finalize    []ActionFunc
+	finalize    []actionBlock
 	autoForward bool
 	resume      InvokeResumeFunc
 }
@@ -155,7 +159,7 @@ type runningInvoke struct {
 	id          Identifier
 	state       *compiledState
 	specIndex   int // this invocation's position among state's <invoke> elements, in document order
-	finalize    []ActionFunc
+	finalize    []actionBlock
 	autoForward bool
 	cancel      func()
 	incoming    chan<- Event
@@ -182,11 +186,13 @@ func noopInvokeRunner(Identifier, *compiledInvoke, any) (func(), chan<- Event) {
 // nil reports an honest "no transport" error for those, the same posture
 // as LocalIOProcessor.
 type parentIOProcessor struct {
-	deliver func(Event)
-	next    IOProcessor
+	deliver    func(Event)
+	next       IOProcessor
+	dispatcher Dispatcher
 }
 
 func (p *parentIOProcessor) Attach(d Dispatcher) {
+	p.dispatcher = d
 	if p.next != nil {
 		p.next.Attach(d)
 	}
@@ -194,10 +200,23 @@ func (p *parentIOProcessor) Attach(d Dispatcher) {
 
 func (p *parentIOProcessor) Send(ctx context.Context, req SendRequest) error {
 	if req.Target == "#_parent" {
-		p.deliver(Event{Name: req.Event, Data: req.Data, OriginType: "scxml"})
+		if req.Type != SCXMLEventProcessor {
+			return localUnsupportedSendError{typ: req.Type}
+		}
+		origin := Identifier("")
+		for _, info := range p.IOProcessors() {
+			if info.Type == SCXMLEventProcessor {
+				origin = Identifier(info.Location.String())
+				break
+			}
+		}
+		p.deliver(Event{Name: req.Event, Data: req.Data, SendID: req.EventSendID, Origin: origin, OriginType: "scxml"})
 		return nil
 	}
 	if p.next == nil {
+		if req.Type != SCXMLEventProcessor {
+			return localUnsupportedSendError{typ: req.Type}
+		}
 		return fmt.Errorf("statecharts: no IOProcessor configured for send target %q", req.Target)
 	}
 	return p.next.Send(ctx, req)
@@ -210,21 +229,29 @@ func (p *parentIOProcessor) Cancel(ctx context.Context, sendID Identifier) error
 	return p.next.Cancel(ctx, sendID)
 }
 
-// IOProcessors implements IOProcessorDescriber by forwarding straight
-// through to next, if it implements the interface itself; nil if next is
-// nil. It deliberately does not synthesize a "#_parent" entry: _ioprocessors
-// describes how *other* sessions reach *this* one, and "#_parent" is the
-// reverse -- how this child reaches its own parent -- so adding it here
-// would misrepresent the direction.
+// IOProcessors includes the child's mandatory SCXML session address and any
+// entries advertised by next. It deliberately does not synthesize a
+// "#_parent" entry: _ioprocessors describes how *other* sessions reach this
+// one, while "#_parent" is the reverse direction.
 func (p *parentIOProcessor) IOProcessors() []IOProcessorInfo {
-	if p.next == nil {
-		return nil
+	var infos []IOProcessorInfo
+	if d, ok := p.next.(IOProcessorDescriber); ok {
+		infos = append(infos, d.IOProcessors()...)
 	}
-	d, ok := p.next.(IOProcessorDescriber)
+	for _, info := range infos {
+		if info.Type == SCXMLEventProcessor {
+			return infos
+		}
+	}
+	identified, ok := p.dispatcher.(interface{ ID() SessionID })
 	if !ok {
-		return nil
+		return infos
 	}
-	return d.IOProcessors()
+	self := IOProcessorInfo{
+		Type:     SCXMLEventProcessor,
+		Location: LocationFromIdentifier(Identifier("#_scxml_" + string(identified.ID()))),
+	}
+	return append([]IOProcessorInfo{self}, infos...)
 }
 
 // InvokeChart returns an InvokeFunc that runs chart as a full child SCXML
@@ -232,8 +259,7 @@ func (p *parentIOProcessor) IOProcessors() []IOProcessorInfo {
 // than an arbitrary external service. newDatamodel builds the child's
 // datamodel from whatever Params produced (SCXML's <param>/namelist
 // equivalent); baseIO is used for any send target other than "#_parent"
-// (nil defaults to NoopIOProcessor, matching a bare Instance's own
-// default).
+// (nil means no fallback transport for those targets).
 //
 // The child's own Send(name, SendOptions{Target: "#_parent"}) reaches
 // back into this invocation's InvokeIO.Deliver, tagged with this
@@ -281,6 +307,9 @@ func InvokeChart(chart *Chart, newDatamodel func(params any) any, baseIO IOProce
 			}
 		}()
 
-		return nil, child.Wait(ctx)
+		if err := child.Wait(ctx); err != nil {
+			return nil, err
+		}
+		return child.Result()
 	}
 }

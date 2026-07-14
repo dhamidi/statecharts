@@ -1,6 +1,9 @@
 package statecharts
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 type Door struct {
 	OpenCount int
@@ -150,6 +153,7 @@ func TestBuildCompoundInitialCanTargetDeepDescendant(t *testing.T) {
 }
 
 func TestBuildValidationErrors(t *testing.T) {
+	invoke := Invoke(func(context.Context, any, InvokeIO) (any, error) { return nil, nil })
 	cases := []struct {
 		name string
 		spec StateSpec
@@ -199,6 +203,121 @@ func TestBuildValidationErrors(t *testing.T) {
 				History("h", Shallow, "missing"),
 			)),
 		},
+		{
+			name: "transition targets siblings in one compound state",
+			spec: Compound("root", "a", Children(
+				Atomic("a", On("go", Target("a", "b"))),
+				Atomic("b"),
+			)),
+		},
+		{
+			name: "transition targets an ancestor and its descendant",
+			spec: Compound("root", "parent", Children(
+				Compound("parent", "child", Children(
+					Atomic("child", On("go", Target("parent", "child"))),
+				)),
+			)),
+		},
+		{
+			name: "shallow history default is not an immediate child",
+			spec: Compound("root", "parent", Children(
+				Compound("parent", "nested", Children(
+					Compound("nested", "leaf", Children(Atomic("leaf"))),
+					History("history", Shallow, "leaf"),
+				)),
+			)),
+		},
+		{
+			name: "history default is outside parent subtree",
+			spec: Compound("root", "parent", Children(
+				Compound("parent", "inside", Children(
+					Atomic("inside"),
+					History("history", Deep, "outside"),
+				)),
+				Atomic("outside"),
+			)),
+		},
+		{
+			name: "history default cycle",
+			spec: Compound("root", "active", Children(
+				Atomic("active"),
+				History("h1", Shallow, "h2"),
+				History("h2", Shallow, "h1"),
+			)),
+		},
+		{
+			name: "compound has only history pseudo-state children",
+			spec: Compound("root", "history", Children(
+				History("history", Shallow, "history"),
+			)),
+		},
+		{
+			name: "parallel has final child",
+			spec: Compound("root", "parallel", Children(
+				Parallel("parallel", Children(Final("done"))),
+			)),
+		},
+		{
+			name: "final has transition",
+			spec: Compound("root", "done", Children(
+				Final("done", On("again", Target("other"))),
+				Atomic("other"),
+			)),
+		},
+		{
+			name: "final has invoke",
+			spec: Compound("root", "done", Children(
+				Final("done", invoke),
+			)),
+		},
+		{
+			name: "done data is attached to non-final state",
+			spec: Atomic("root", WithDone(func(ExecContext) any { return "unused" })),
+		},
+		{
+			name: "transition has no event condition or target",
+			spec: Atomic("root", Eventless()),
+		},
+		{
+			name: "invalid state identifier",
+			spec: Atomic("bad id"),
+		},
+		{
+			name: "invalid event descriptor",
+			spec: Atomic("root", On("bad..event", Target("root"))),
+		},
+		{
+			name: "invalid state kind",
+			spec: StateSpec{ID: "root", Kind: StateKind(99)},
+		},
+		{
+			name: "invalid history kind",
+			spec: Compound("root", "active", Children(
+				Atomic("active"),
+				History("history", HistoryKind(99), "active"),
+			)),
+		},
+		{
+			name: "duplicate explicit invoke ids",
+			spec: Compound("root", "parallel", Children(
+				Parallel("parallel", Children(
+					Atomic("a", Invoke(func(context.Context, any, InvokeIO) (any, error) { return nil, nil }, WithInvokeID("service"))),
+					Atomic("b", Invoke(func(context.Context, any, InvokeIO) (any, error) { return nil, nil }, WithInvokeID("service"))),
+				)),
+			)),
+		},
+		{
+			name: "compound document root has onentry that would be ignored",
+			spec: Compound("root", "active", OnEntry(func(ExecContext) error { return nil }), Children(Atomic("active"))),
+		},
+		{
+			name: "compound document root has onexit that would be ignored",
+			spec: Compound("root", "active", OnExit(func(ExecContext) error { return nil }), Children(Atomic("active"))),
+		},
+		{
+			name: "compound document root has invoke that would be ignored",
+			spec: Compound("root", "active", invoke, Children(Atomic("active"))),
+		},
 	}
 
 	for _, c := range cases {
@@ -207,6 +326,63 @@ func TestBuildValidationErrors(t *testing.T) {
 				t.Fatalf("Build(%s): expected error, got nil", c.name)
 			}
 		})
+	}
+}
+
+func TestBuildAcceptsLegalTargetsInSeparateParallelRegions(t *testing.T) {
+	_, err := Build(
+		Compound("root", "parallel",
+			Children(
+				Parallel("parallel",
+					Children(
+						Compound("left", "left.a", Children(
+							Atomic("left.a", On("go", Target("left.b", "right.b"))),
+							Atomic("left.b"),
+						)),
+						Compound("right", "right.a", Children(
+							Atomic("right.a"),
+							Atomic("right.b"),
+						)),
+					),
+				),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+}
+
+func TestBuildPreservesDirectActionsAddedAfterBuilderOptions(t *testing.T) {
+	noop := func(ExecContext) error { return nil }
+	spec := Atomic("root",
+		OnEntry(noop),
+		On("go", Then(noop)),
+		Invoke(func(context.Context, any, InvokeIO) (any, error) { return nil, nil }, WithFinalize(noop)),
+	)
+	spec.OnEntry = append(spec.OnEntry, noop)
+	spec.Transitions[0].Actions = append(spec.Transitions[0].Actions, noop)
+	spec.Invokes[0].Finalize = append(spec.Invokes[0].Finalize, noop)
+
+	chart, err := Build(spec)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	countActions := func(blocks []actionBlock) int {
+		count := 0
+		for _, block := range blocks {
+			count += len(block)
+		}
+		return count
+	}
+	if got := countActions(chart.root.onEntry); got != 2 {
+		t.Fatalf("compiled onentry action count = %d, want 2", got)
+	}
+	if got := countActions(chart.root.transitions[0].actions); got != 2 {
+		t.Fatalf("compiled transition action count = %d, want 2", got)
+	}
+	if got := countActions(chart.root.invokes[0].finalize); got != 2 {
+		t.Fatalf("compiled finalize action count = %d, want 2", got)
 	}
 }
 

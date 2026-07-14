@@ -3,6 +3,7 @@ package statecharts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -180,7 +181,7 @@ func TestInstanceNaturalTerminationRunsOnExitForRemainingStates(t *testing.T) {
 	}
 }
 
-func TestInstancePanicBecomesTerminalError(t *testing.T) {
+func TestInstanceActionPanicBecomesExecutionError(t *testing.T) {
 	boom := Action(func(d *struct{}, ec ExecContext) error {
 		panic("boom")
 	})
@@ -188,8 +189,12 @@ func TestInstancePanicBecomesTerminalError(t *testing.T) {
 	chart, err := Build(
 		Compound("m", "a",
 			Children(
-				Atomic("a", On("go", Target("b"), Then(boom))),
-				Atomic("b"),
+				Atomic("a",
+					On("go", Target("b"), Then(boom)),
+					On(string(ErrEventExecution), Target("recovered")),
+				),
+				Atomic("b", On(string(ErrEventExecution), Target("recovered"))),
+				Atomic("recovered"),
 			),
 		),
 	)
@@ -203,16 +208,17 @@ func TestInstancePanicBecomesTerminalError(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// The Send call itself may or may not observe an error (the panic
-	// happens while processing, possibly after the reply is already sent);
-	// what matters is that the instance terminates with a non-nil Err().
-	_ = in.Send(ctx, Event{Name: "go", Type: EventExternal})
-
-	if err := in.Wait(ctx); err == nil {
-		t.Fatalf("Wait() after panic: expected non-nil error")
+	if err := in.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
+		t.Fatalf("Send: %v", err)
 	}
-	if in.Err() == nil {
-		t.Fatalf("Err() after panic: expected non-nil error")
+	if !hasState(in.Configuration(), "recovered") {
+		t.Fatalf("configuration = %v, want recovered after error.execution", in.Configuration())
+	}
+	if err := in.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }
 
@@ -429,13 +435,14 @@ func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
 	}
 }
 
-func TestExecContextIOProcessorsEmptyForNonDescriber(t *testing.T) {
+func TestExecContextIOProcessorsIncludesDefaultSCXMLProcessor(t *testing.T) {
 	var gotList []IOProcessorInfo
+	var gotLocation Location
 	var gotOK bool
 
 	record := Action(func(d *Door, ec ExecContext) error {
 		gotList = ec.IOProcessors()
-		_, gotOK = ec.IOProcessorLocation("mock")
+		gotLocation, gotOK = ec.IOProcessorLocation(SCXMLEventProcessor)
 		d.OpenCount++
 		return nil
 	})
@@ -453,9 +460,7 @@ func TestExecContextIOProcessorsEmptyForNonDescriber(t *testing.T) {
 	}
 
 	d := &Door{}
-	// No WithIOProcessor: the default is NoopIOProcessor, which has no
-	// transport and therefore nothing to advertise.
-	in := New(chart, d)
+	in := New(chart, d, WithSessionID("door-1"))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -464,11 +469,11 @@ func TestExecContextIOProcessorsEmptyForNonDescriber(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	if len(gotList) != 0 {
-		t.Fatalf("ExecContext.IOProcessors() = %v, want empty (NoopIOProcessor has nothing to advertise)", gotList)
+	if len(gotList) != 1 || gotList[0].Type != SCXMLEventProcessor || gotList[0].Location.String() != "#_scxml_door-1" {
+		t.Fatalf("ExecContext.IOProcessors() = %v, want the default SCXML processor at #_scxml_door-1", gotList)
 	}
-	if gotOK {
-		t.Fatalf("ExecContext.IOProcessorLocation(%q) ok = true, want false", "mock")
+	if !gotOK || gotLocation.String() != "#_scxml_door-1" {
+		t.Fatalf("ExecContext.IOProcessorLocation(default) = (%q, %v), want (#_scxml_door-1, true)", gotLocation, gotOK)
 	}
 
 	if err := in.Stop(ctx); err != nil {
@@ -579,5 +584,451 @@ func TestInstanceStopCancelsAndForgetsPendingSends(t *testing.T) {
 	defer clock.mu.Unlock()
 	if len(clock.timers) != 1 || !clock.timers[0].stopped {
 		t.Fatalf("manual timers after Stop = %+v, want the pending timer stopped", clock.timers)
+	}
+}
+
+type captureIOProcessor struct {
+	requests []SendRequest
+	err      error
+}
+
+func (p *captureIOProcessor) Attach(Dispatcher) {}
+
+func (p *captureIOProcessor) Send(_ context.Context, req SendRequest) error {
+	p.requests = append(p.requests, req)
+	return p.err
+}
+
+func (p *captureIOProcessor) Cancel(context.Context, Identifier) error { return nil }
+
+type invalidSendTestError struct{}
+
+func (invalidSendTestError) Error() string       { return "unsupported send target" }
+func (invalidSendTestError) SendExecutionError() {}
+
+func TestInstanceDefaultIOProcessorReportsUndeliverableSend(t *testing.T) {
+	chart, err := Build(
+		Compound("root", "active", Children(
+			Atomic("active",
+				OnEntry(SendEvent("outbound", SendOptions{Target: "missing"})),
+				On("error", Target("failed")),
+			),
+			Atomic("failed"),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if !hasState(in.Configuration(), "failed") {
+		t.Fatalf("configuration = %v, want failed after undeliverable send", in.Configuration())
+	}
+}
+
+func TestInstanceSendAlwaysEntersThroughExternalQueue(t *testing.T) {
+	var got EventType
+	chart, err := Build(Atomic("root", On("go", Then(func(ec ExecContext) error {
+		ev, _ := ec.Event()
+		got = ev.Type
+		return nil
+	}))))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if err := in.Send(ctx, Event{Name: "go", Type: EventPlatform}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got != EventExternal {
+		t.Fatalf("event type observed through Instance.Send = %v, want external", got)
+	}
+}
+
+func TestInstanceSelfSendPopulatesSCXMLOriginMetadata(t *testing.T) {
+	var got Event
+	chart, err := Build(Atomic("root",
+		OnEntry(SendEvent("self", SendOptions{})),
+		On("self", Then(func(ec ExecContext) error {
+			got, _ = ec.Event()
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithSessionID("session-1"))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if got.Origin != "#_scxml_session-1" || got.OriginType != "scxml" {
+		t.Fatalf("self-send origin = %q/%q, want #_scxml_session-1/scxml", got.Origin, got.OriginType)
+	}
+}
+
+func TestInstanceExplicitOwnSCXMLTargetRoutesToExternalQueue(t *testing.T) {
+	var received bool
+	chart, err := Build(Atomic("root",
+		OnEntry(SendEvent("self", SendOptions{Target: "#_scxml_session-1"})),
+		On("self", Then(func(ExecContext) error {
+			received = true
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithSessionID("session-1"))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if !received {
+		t.Fatal("send to this session's #_scxml_<sessionid> target was not delivered")
+	}
+}
+
+func TestInstanceFailedSendErrorCarriesGeneratedSendID(t *testing.T) {
+	processor := &captureIOProcessor{err: errors.New("offline")}
+	var got Identifier
+	chart, err := Build(
+		Compound("root", "active", Children(
+			Atomic("active",
+				OnEntry(SendEvent("outbound", SendOptions{Target: "service"})),
+				On(string(ErrEventCommunication), Then(func(ec ExecContext) error {
+					ev, _ := ec.Event()
+					got = ev.SendID
+					return nil
+				})),
+			),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithIOProcessor(processor))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if got != "send.1" {
+		t.Fatalf("failed-send error SendID = %q, want generated execution ID send.1", got)
+	}
+}
+
+func TestInstanceSendUsesDefaultSCXMLEventProcessorType(t *testing.T) {
+	processor := &captureIOProcessor{}
+	chart, err := Build(Atomic("root", OnEntry(SendEvent("outbound", SendOptions{Target: "service"}))))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithIOProcessor(processor))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if len(processor.requests) != 1 {
+		t.Fatalf("processor requests = %d, want 1", len(processor.requests))
+	}
+	if got, want := processor.requests[0].Type, Identifier("http://www.w3.org/TR/scxml/#SCXMLEventProcessor"); got != want {
+		t.Fatalf("default send type = %q, want %q", got, want)
+	}
+}
+
+func TestInstanceUnsupportedSendProducesExecutionError(t *testing.T) {
+	processor := &captureIOProcessor{err: invalidSendTestError{}}
+	chart, err := Build(
+		Compound("root", "active", Children(
+			Atomic("active",
+				OnEntry(SendEvent("outbound", SendOptions{Target: "unsupported"})),
+				On(string(ErrEventExecution), Target("execution-error")),
+				On(string(ErrEventCommunication), Target("communication-error")),
+			),
+			Atomic("execution-error"),
+			Atomic("communication-error"),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithIOProcessor(processor))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if !hasState(in.Configuration(), "execution-error") {
+		t.Fatalf("configuration = %v, want execution-error", in.Configuration())
+	}
+}
+
+func TestInstanceDefaultProcessorReportsUnsupportedTypeAsExecutionError(t *testing.T) {
+	chart, err := Build(
+		Compound("root", "active", Children(
+			Atomic("active",
+				OnEntry(SendEvent("outbound", SendOptions{Target: "service", Type: "unsupported"})),
+				On(string(ErrEventExecution), Target("execution-error")),
+				On(string(ErrEventCommunication), Target("communication-error")),
+			),
+			Atomic("execution-error"),
+			Atomic("communication-error"),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if !hasState(in.Configuration(), "execution-error") {
+		t.Fatalf("configuration = %v, want execution-error for unsupported send type", in.Configuration())
+	}
+}
+
+func TestInstanceDelayedInternalSendRetainsInternalEventType(t *testing.T) {
+	clock := NewManualClock(time.Unix(0, 0))
+	var got EventType
+	chart, err := Build(
+		Compound("root", "active", Children(
+			Atomic("active",
+				OnEntry(SendEvent("later", SendOptions{Target: "#_internal", Delay: time.Second})),
+				On("later", Target("done"), Then(func(ec ExecContext) error {
+					ev, _ := ec.Event()
+					got = ev.Type
+					return nil
+				})),
+			),
+			Atomic("done"),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithClock(clock))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	clock.Advance(time.Second)
+	if err := in.Send(ctx, Event{Name: "drain"}); err != nil {
+		t.Fatalf("drain timer: %v", err)
+	}
+	if !hasState(in.Configuration(), "done") || got != EventInternal {
+		t.Fatalf("configuration/type = %v/%v, want done/internal", in.Configuration(), got)
+	}
+}
+
+func TestInstanceDelayedSendsWithSameIDKeepTheirOwnDeadlines(t *testing.T) {
+	clock := NewManualClock(time.Unix(0, 0))
+	var received []Identifier
+	chart, err := Build(Atomic("root",
+		OnEntry(func(ec ExecContext) error {
+			ec.Send("first", SendOptions{SendID: "shared", Delay: time.Hour})
+			ec.Send("second", SendOptions{SendID: "shared", Delay: 2 * time.Hour})
+			return nil
+		}),
+		On("first second", Then(func(ec ExecContext) error {
+			ev, _ := ec.Event()
+			received = append(received, ev.Name)
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithClock(clock))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	snap, err := in.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(snap.PendingSends) != 2 || !snap.PendingSends[0].FireAt.Equal(time.Unix(0, 0).Add(time.Hour)) || !snap.PendingSends[1].FireAt.Equal(time.Unix(0, 0).Add(2*time.Hour)) {
+		t.Fatalf("pending sends = %+v, want both sends sharing an ID at their own deadlines", snap.PendingSends)
+	}
+
+	clock.Advance(time.Hour)
+	if err := in.Send(ctx, Event{Name: "drain"}); err != nil {
+		t.Fatalf("drain first timer: %v", err)
+	}
+	if fmt.Sprint(received) != "[first]" {
+		t.Fatalf("events after first deadline = %v, want [first]", received)
+	}
+
+	clock.Advance(time.Hour)
+	if err := in.Send(ctx, Event{Name: "drain"}); err != nil {
+		t.Fatalf("drain second timer: %v", err)
+	}
+	if fmt.Sprint(received) != "[first second]" {
+		t.Fatalf("events after second deadline = %v, want [first second]", received)
+	}
+}
+
+func TestInstanceCancelStopsAllDelayedSendsSharingAnID(t *testing.T) {
+	clock := NewManualClock(time.Unix(0, 0))
+	var received []Identifier
+	chart, err := Build(Atomic("root",
+		OnEntry(
+			SendEvent("first", SendOptions{SendID: "shared", Delay: time.Hour}),
+			SendEvent("second", SendOptions{SendID: "shared", Delay: 2 * time.Hour}),
+			CancelSend("shared"),
+		),
+		On("first second", Then(func(ec ExecContext) error {
+			ev, _ := ec.Event()
+			received = append(received, ev.Name)
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithClock(clock))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	clock.Advance(3 * time.Hour)
+	if err := in.Send(ctx, Event{Name: "drain"}); err != nil {
+		t.Fatalf("drain timers: %v", err)
+	}
+	if len(received) != 0 {
+		t.Fatalf("events after cancelling shared send ID = %v, want none", received)
+	}
+}
+
+func TestInstanceCancelDoesNotMatchUnexposedGeneratedSendID(t *testing.T) {
+	clock := NewManualClock(time.Unix(0, 0))
+	received := false
+	chart, err := Build(Atomic("root",
+		OnEntry(
+			SendEvent("explicit", SendOptions{SendID: "send.1", Delay: time.Hour}),
+			SendEvent("generated", SendOptions{Delay: time.Hour}),
+			CancelSend("send.1"),
+		),
+		On("generated", Then(func(ExecContext) error {
+			received = true
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil, WithClock(clock))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	clock.Advance(time.Hour)
+	if err := in.Send(ctx, Event{Name: "drain"}); err != nil {
+		t.Fatalf("drain timers: %v", err)
+	}
+	if !received {
+		t.Fatal("cancel matched an implementation-generated send ID that was not exposed to the author")
+	}
+}
+
+func TestInstanceRestorePreservesEqualDeadlineSendOrder(t *testing.T) {
+	clock := NewManualClock(time.Unix(0, 0))
+	var received []Identifier
+	chart, err := Build(Atomic("root",
+		OnEntry(
+			SendEvent("z-first", SendOptions{SendID: "z", Delay: time.Hour}),
+			SendEvent("a-second", SendOptions{SendID: "a", Delay: time.Hour}),
+		),
+		On("z-first a-second", Then(func(ec ExecContext) error {
+			ev, _ := ec.Event()
+			received = append(received, ev.Name)
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ctx := context.Background()
+	original := New(chart, nil, WithClock(clock))
+	if err := original.Start(ctx); err != nil {
+		t.Fatalf("Start original: %v", err)
+	}
+	snap, err := original.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if err := original.Stop(ctx); err != nil {
+		t.Fatalf("Stop original: %v", err)
+	}
+
+	restored, err := Restore(chart, nil, snap, WithClock(clock))
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if err := restored.Start(ctx); err != nil {
+		t.Fatalf("Start restored: %v", err)
+	}
+	defer restored.Stop(ctx)
+	clock.Advance(time.Hour)
+	if err := restored.Send(ctx, Event{Name: "drain"}); err != nil {
+		t.Fatalf("drain timers: %v", err)
+	}
+	if fmt.Sprint(received) != "[z-first a-second]" {
+		t.Fatalf("equal-deadline events after restore = %v, want [z-first a-second]", received)
+	}
+}
+
+func TestInstanceResultUsesTopLevelFinalDoneData(t *testing.T) {
+	chart, err := Build(
+		Compound("root", "done", Children(
+			Final("done", WithDone(func(ExecContext) any { return "root result" })),
+		)),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	if err := in.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	got, err := in.Result()
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if got != "root result" {
+		t.Fatalf("Result = %#v, want root result", got)
 	}
 }

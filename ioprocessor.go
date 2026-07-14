@@ -12,12 +12,17 @@ import (
 // <send delay="..."> has already elapsed: delay-timer bookkeeping belongs
 // to the interpreter core, so Send is always an immediate dispatch request.
 type SendRequest struct {
-	SendID Identifier
-	Target Identifier
-	Type   Identifier
-	Event  Identifier
-	Data   any
+	SendID      Identifier // execution ID, including an implementation-generated ID
+	EventSendID Identifier // author-specified ID exposed as _event.sendid; empty if none
+	Target      Identifier
+	Type        Identifier
+	Event       Identifier
+	Data        any
 }
+
+// SCXMLEventProcessor is the mandatory SCXML Event I/O Processor type and
+// the default for a send that does not specify a type.
+const SCXMLEventProcessor Identifier = "http://www.w3.org/TR/scxml/#SCXMLEventProcessor"
 
 // Dispatcher lets an IOProcessor deliver events back into whichever
 // Instance attached it -- fired invoke results, responses, or messages from
@@ -49,6 +54,15 @@ type IOProcessor interface {
 	Cancel(ctx context.Context, sendID Identifier) error
 }
 
+// SendExecutionError marks an IOProcessor.Send failure as an invalid or
+// unsupported target/type rather than a delivery failure. The interpreter
+// turns marked errors into error.execution; all other Send errors become
+// error.communication.
+type SendExecutionError interface {
+	error
+	SendExecutionError()
+}
+
 // IOProcessorInfo describes one Event I/O Processor available to the
 // current session, per SCXML 5.10's _ioprocessors: Type is the same value
 // an action would put in SendOptions.Type / that arrives as SendRequest.Type
@@ -78,9 +92,8 @@ func (noopIOProcessor) Send(context.Context, SendRequest) error { return nil }
 func (noopIOProcessor) Cancel(context.Context, Identifier) error { return nil }
 
 // NoopIOProcessor suppresses all outbound dispatch while reporting success.
-// It is the default for a bare Instance, and is what a replaying Instance
-// gates real dispatch through, so real-world effects are never repeated
-// when reconstructing state from a Log (see replay.go).
+// Replaying Instances use it so real-world effects are never repeated when
+// reconstructing state from a Log (see replay.go).
 var NoopIOProcessor IOProcessor = noopIOProcessor{}
 
 // LocalIOProcessor is the default IOProcessor for a single, non-distributed
@@ -98,11 +111,34 @@ func NewLocalIOProcessor() *LocalIOProcessor { return &LocalIOProcessor{} }
 func (p *LocalIOProcessor) Attach(d Dispatcher) { p.dispatcher = d }
 
 func (p *LocalIOProcessor) Send(ctx context.Context, req SendRequest) error {
+	if req.Type != SCXMLEventProcessor {
+		return localUnsupportedSendError{typ: req.Type}
+	}
 	return fmt.Errorf("statecharts: LocalIOProcessor has no transport for target %q", req.Target)
 }
 
+type localUnsupportedSendError struct{ typ Identifier }
+
+func (e localUnsupportedSendError) Error() string {
+	return fmt.Sprintf("statecharts: LocalIOProcessor does not support send type %q", e.typ)
+}
+
+func (localUnsupportedSendError) SendExecutionError() {}
+
 func (p *LocalIOProcessor) Cancel(ctx context.Context, sendID Identifier) error {
 	return nil
+}
+
+// IOProcessors advertises this session's mandatory SCXML processor address.
+func (p *LocalIOProcessor) IOProcessors() []IOProcessorInfo {
+	identified, ok := p.dispatcher.(interface{ ID() SessionID })
+	if !ok {
+		return nil
+	}
+	return []IOProcessorInfo{{
+		Type:     SCXMLEventProcessor,
+		Location: LocationFromIdentifier(Identifier("#_scxml_" + string(identified.ID()))),
+	}}
 }
 
 // SendEvent returns executable content that schedules delivery of an event

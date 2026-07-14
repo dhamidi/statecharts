@@ -104,7 +104,20 @@ func (in *Instance) buildSnapshot() Snapshot {
 		}
 		snap.HistoryValue[hs.id] = ids
 	}
-	for _, rec := range ip.pending {
+	pending := make([]*pendingSendRecord, 0, len(ip.pending))
+	for rec := range ip.pending {
+		pending = append(pending, rec)
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		if !pending[i].fireAt.Equal(pending[j].fireAt) {
+			return pending[i].fireAt.Before(pending[j].fireAt)
+		}
+		if pending[i].order != pending[j].order {
+			return pending[i].order < pending[j].order
+		}
+		return pending[i].sendID < pending[j].sendID
+	})
+	for _, rec := range pending {
 		snap.PendingSends = append(snap.PendingSends, PendingSend{
 			SendID: rec.sendID,
 			Target: rec.target,
@@ -113,9 +126,6 @@ func (in *Instance) buildSnapshot() Snapshot {
 			FireAt: rec.fireAt,
 		})
 	}
-	sort.Slice(snap.PendingSends, func(i, j int) bool {
-		return snap.PendingSends[i].SendID < snap.PendingSends[j].SendID
-	})
 	for _, invokes := range ip.activeInvokes {
 		for _, ri := range invokes {
 			snap.ActiveInvokes = append(snap.ActiveInvokes, ActiveInvoke{
@@ -206,8 +216,8 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 	ip.sendSeq = snap.SendSeq
 	ip.invokeSeq = snap.InvokeSeq
 
-	ip.pending = map[Identifier]*pendingSendRecord{}
-	for _, ps := range snap.PendingSends {
+	ip.pending = map[*pendingSendRecord]bool{}
+	for i, ps := range snap.PendingSends {
 		sendID := ps.SendID
 		rec := &pendingSendRecord{
 			sendID: sendID,
@@ -215,9 +225,11 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 			typ:    ps.Type,
 			event:  ps.Event,
 			fireAt: ps.FireAt,
+			order:  i + 1,
 		}
-		ip.pending[sendID] = rec
+		ip.pending[rec] = true
 	}
+	ip.pendingSeq = len(snap.PendingSends)
 
 	// Reconstructed as bookkeeping, not as a running invocation: cancel and
 	// incoming are left as the same no-op/nil shape startInvoke returns

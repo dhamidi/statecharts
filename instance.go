@@ -82,7 +82,8 @@ type instanceConfig struct {
 }
 
 // WithIOProcessor sets the IOProcessor used for genuinely external dispatch.
-// Defaults to NoopIOProcessor.
+// Defaults to LocalIOProcessor, which reports unreachable targets instead of
+// silently discarding them.
 func WithIOProcessor(p IOProcessor) Option {
 	return func(c *instanceConfig) { c.io = p }
 }
@@ -149,7 +150,7 @@ func WithSessionID(id SessionID) Option {
 
 func defaultInstanceConfig() instanceConfig {
 	return instanceConfig{
-		io:        NoopIOProcessor,
+		io:        NewLocalIOProcessor(),
 		clock:     NewRealClock(),
 		logger:    NoopLogger,
 		inboxSize: 1,
@@ -205,7 +206,7 @@ func (in *Instance) ID() SessionID {
 }
 
 // invokeIncomingBuffer bounds how many "#_<invokeid>"-addressed events an
-// invocation can have queued before dispatchNow starts dropping them
+// invocation can have queued before dispatchNow reports error.communication
 // (never blocking the interpreter goroutine on a slow or absent reader).
 const invokeIncomingBuffer = 16
 
@@ -299,7 +300,12 @@ func (in *Instance) resumeInvokesAfterReplay() {
 			// or on anything processed afterward.
 			ec := in.ip.execContext()
 			ec.event, ec.hasEvent = Event{}, false
-			params = spec.params(ec)
+			var paramsOK bool
+			params, paramsOK = in.ip.evaluateInvokeParams(spec.params, ec)
+			if !paramsOK {
+				in.ip.runToStable()
+				continue
+			}
 		}
 		cancel, incoming := in.resumeInvoke(id, spec, params)
 		ri.cancel = cancel
@@ -393,18 +399,18 @@ func (in *Instance) activatePendingTimers(clock Clock) error {
 	in.ip.clock = &actorClock{real: clock, inbox: in.inbox, done: in.doneCh}
 
 	records := make([]*pendingSendRecord, 0, len(in.ip.pending))
-	for _, rec := range in.ip.pending {
+	for rec := range in.ip.pending {
 		records = append(records, rec)
 	}
 	sort.Slice(records, func(i, j int) bool {
 		if records[i].fireAt.Equal(records[j].fireAt) {
-			return records[i].sendID < records[j].sendID
+			return records[i].order < records[j].order
 		}
 		return records[i].fireAt.Before(records[j].fireAt)
 	})
 
 	for _, rec := range records {
-		if current, ok := in.ip.pending[rec.sendID]; !ok || current != rec {
+		if !in.ip.pending[rec] {
 			continue // an earlier overdue send cancelled or replaced it
 		}
 		if rec.stop != nil {
@@ -414,12 +420,11 @@ func (in *Instance) activatePendingTimers(clock Clock) error {
 
 		delay := rec.fireAt.Sub(clock.Now())
 		if delay > 0 {
-			sendID := rec.sendID
-			rec.stop = in.ip.clock.AfterFunc(delay, func() { in.ip.handleTimerFire(sendID) })
+			rec.stop = in.ip.clock.AfterFunc(delay, func() { in.ip.handleTimerFire(rec) })
 			continue
 		}
 
-		in.ip.handleTimerFire(rec.sendID)
+		in.ip.handleTimerFire(rec)
 		if err := in.takeTimerHookError(); err != nil {
 			return err
 		}
@@ -513,6 +518,7 @@ func (in *Instance) run() {
 			return
 		}
 	}
+	in.drainQueuedEvents()
 	if !in.ip.running {
 		in.ip.exitInterpreter()
 	}
@@ -547,10 +553,9 @@ func (in *Instance) run() {
 		case reqActiveInvokes:
 			invokesOut = req.invokesOut
 		case reqReplayTimerFired:
-			if _, ok := in.ip.pending[req.entry.SendID]; ok {
+			if in.ip.replayTimerFire(req.entry.SendID, req.entry.Target, req.entry.Type, req.entry.Event) {
 				// This fire is already in the log, so bypass the live hook:
 				// replay must not append the same timer_fired entry again.
-				in.ip.fireTimer(req.entry.SendID)
 			} else {
 				// The log is authoritative even if a checkpoint or chart drift
 				// left no matching pending record to recompute the dispatch.
@@ -587,10 +592,15 @@ func (in *Instance) run() {
 	}
 }
 
-// Send enqueues ev (routed onto the internal or external queue based on
-// ev.Type) and blocks until the resulting macrostep(s) have been fully
-// processed and Configuration() reflects them, honoring ctx.
+// Send places ev on the external queue, regardless of its incoming Type, and
+// blocks until the resulting macrostep(s) have been fully processed and
+// Configuration() reflects them, honoring ctx.
 func (in *Instance) Send(ctx context.Context, ev Event) error {
+	ev.Type = EventExternal
+	return in.send(ctx, ev)
+}
+
+func (in *Instance) send(ctx context.Context, ev Event) error {
 	req := actorRequest{kind: reqSend, event: ev, reply: make(chan error, 1)}
 	if err := in.submit(ctx, req); err != nil {
 		return err
@@ -669,6 +679,24 @@ func (in *Instance) Wait(ctx context.Context) error {
 	}
 }
 
+// Result returns the data produced by the top-level final state. It is
+// available after the Instance has completed naturally; a stopped or still
+// running Instance has no final result.
+func (in *Instance) Result() (any, error) {
+	select {
+	case <-in.doneCh:
+		if err := in.Err(); err != nil {
+			return nil, err
+		}
+		if !in.ip.completed {
+			return nil, fmt.Errorf("statecharts: instance stopped without reaching a top-level final state")
+		}
+		return in.ip.result, nil
+	default:
+		return nil, fmt.Errorf("statecharts: instance is still running")
+	}
+}
+
 // Done returns a channel that's closed once the interpreter goroutine has
 // exited -- a top-level final state was reached, Stop was called, or a
 // fatal error occurred -- the same condition Wait blocks on. Unlike Wait,
@@ -739,5 +767,5 @@ func (in *Instance) publishConfig() {
 // events back into this Instance exactly as any other caller would via
 // Send.
 func (in *Instance) Deliver(ctx context.Context, ev Event) error {
-	return in.Send(ctx, ev)
+	return in.send(ctx, ev)
 }

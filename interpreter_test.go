@@ -2,6 +2,7 @@ package statecharts
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -505,5 +506,271 @@ func TestInterpreterActionErrorBecomesExecutionErrorEvent(t *testing.T) {
 	}
 	if gotErr != boom {
 		t.Fatalf("error.execution Data = %v, want %v", gotErr, boom)
+	}
+}
+
+func TestInterpreterDeduplicatesTargetlessAncestorTransitionAcrossParallelRegions(t *testing.T) {
+	count := 0
+	chart, err := Build(
+		Compound("root", "parallel",
+			Children(
+				Parallel("parallel",
+					Children(Atomic("left"), Atomic("right")),
+					On("tick", Then(func(ExecContext) error {
+						count++
+						return nil
+					})),
+				),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	ip.enqueue(Event{Name: "tick", Type: EventExternal})
+	ip.processNextExternal()
+
+	if count != 1 {
+		t.Fatalf("targetless ancestor transition action count = %d, want 1", count)
+	}
+}
+
+func TestInterpreterStopsOnlyTheFailingExecutableContentBlock(t *testing.T) {
+	var order []string
+	fail := func(ExecContext) error {
+		order = append(order, "fail")
+		return errors.New("boom")
+	}
+	skipped := func(ExecContext) error {
+		order = append(order, "skipped")
+		return nil
+	}
+	nextBlock := func(ExecContext) error {
+		order = append(order, "next-block")
+		return nil
+	}
+
+	chart, err := Build(
+		Compound("root", "active",
+			Children(
+				Atomic("active",
+					OnEntry(fail, skipped),
+					OnEntry(nextBlock),
+					On(string(ErrEventExecution), Target("recovered")),
+				),
+				Atomic("recovered"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+
+	want := []string{"fail", "next-block"}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Fatalf("action order = %v, want %v", order, want)
+	}
+	if !hasState(ip.activeStates(), "recovered") {
+		t.Fatalf("configuration = %v, want recovered", ip.activeStates())
+	}
+}
+
+func TestInterpreterActionPanicBecomesExecutionError(t *testing.T) {
+	chart, err := Build(
+		Compound("root", "active",
+			Children(
+				Atomic("active",
+					OnEntry(func(ExecContext) error { panic("boom") }),
+					On(string(ErrEventExecution), Target("recovered")),
+				),
+				Atomic("recovered"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	if !hasState(ip.activeStates(), "recovered") {
+		t.Fatalf("configuration = %v, want recovered after action panic", ip.activeStates())
+	}
+}
+
+func TestInterpreterConditionPanicBecomesExecutionError(t *testing.T) {
+	chart, err := Build(
+		Compound("root", "active",
+			Children(
+				Atomic("active",
+					On("go", If(func(ExecContext) bool { panic("boom") }), Target("wrong")),
+					On(string(ErrEventExecution), Target("recovered")),
+				),
+				Atomic("wrong"),
+				Atomic("recovered"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	ip.enqueue(Event{Name: "go", Type: EventExternal})
+	ip.processNextExternal()
+	if !hasState(ip.activeStates(), "recovered") {
+		t.Fatalf("configuration = %v, want recovered after condition panic", ip.activeStates())
+	}
+}
+
+func TestInterpreterDoneDataPanicBecomesExecutionError(t *testing.T) {
+	chart, err := Build(
+		Compound("root", "parent",
+			Children(
+				Compound("parent", "working", Children(
+					Atomic("working", On("finish", Target("done"))),
+					Final("done", WithDone(func(ExecContext) any { panic("boom") })),
+				)),
+				Atomic("recovered"),
+			),
+			On(string(ErrEventExecution), Target("recovered")),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	ip.enqueue(Event{Name: "finish", Type: EventExternal})
+	ip.processNextExternal()
+	if !hasState(ip.activeStates(), "recovered") {
+		t.Fatalf("configuration = %v, want recovered after done-data panic", ip.activeStates())
+	}
+}
+
+func TestInterpreterDoneStateEventIsPlatformEvent(t *testing.T) {
+	var got EventType
+	chart, err := Build(
+		Compound("root", "parent",
+			Children(
+				Compound("parent", "working", Children(
+					Atomic("working", On("finish", Target("done"))),
+					Final("done"),
+				)),
+				Atomic("finished"),
+			),
+			On("done.state.parent", Target("finished"), Then(func(ec ExecContext) error {
+				ev, _ := ec.Event()
+				got = ev.Type
+				return nil
+			})),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	ip.enqueue(Event{Name: "finish", Type: EventExternal})
+	ip.processNextExternal()
+	if got != EventPlatform {
+		t.Fatalf("done.state event type = %v, want platform", got)
+	}
+}
+
+func TestInterpreterGeneratedSendIDIsNotExposedOnDeliveredEvent(t *testing.T) {
+	var got Identifier
+	chart, err := Build(
+		Atomic("root",
+			OnEntry(func(ec ExecContext) error {
+				ec.Send("ping", SendOptions{Target: "#_internal"})
+				return nil
+			}),
+			On("ping", Then(func(ec ExecContext) error {
+				ev, _ := ec.Event()
+				got = ev.SendID
+				return nil
+			})),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	if got != "" {
+		t.Fatalf("generated send ID exposed as _event.sendid %q, want blank", got)
+	}
+}
+
+func TestExecContextRaiseNormalizesInternalEventMetadata(t *testing.T) {
+	var got Event
+	chart, err := Build(
+		Atomic("root",
+			OnEntry(func(ec ExecContext) error {
+				ec.Raise(Event{
+					Name:       "raised",
+					Type:       EventExternal,
+					SendID:     "send",
+					Origin:     "origin",
+					OriginType: "transport",
+					InvokeID:   "invoke",
+				})
+				return nil
+			}),
+			On("raised", Then(func(ec ExecContext) error {
+				got, _ = ec.Event()
+				return nil
+			})),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	if got.Type != EventInternal || got.SendID != "" || got.Origin != "" || got.OriginType != "" || got.InvokeID != "" {
+		t.Fatalf("raised event metadata = %+v, want internal with blank provenance fields", got)
+	}
+}
+
+func TestInterpreterResolvesHistoryDefaultChainsWithoutDepthTruncation(t *testing.T) {
+	exits := 0
+	children := []StateSpec{
+		Atomic("active",
+			OnExit(func(ExecContext) error { exits++; return nil }),
+			On("again", Target("h00")),
+		),
+	}
+	for i := 0; i < 40; i++ {
+		id := Identifier(fmt.Sprintf("h%02d", i))
+		target := Identifier("active")
+		if i < 39 {
+			target = Identifier(fmt.Sprintf("h%02d", i+1))
+		}
+		children = append(children, History(id, Shallow, target))
+	}
+	chart, err := Build(Compound("root", "active", Children(children...)))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	ip.enqueue(Event{Name: "again", Type: EventExternal})
+	ip.processNextExternal()
+	if exits != 1 {
+		t.Fatalf("active exit count = %d, want 1 after resolving a 40-history default chain", exits)
 	}
 }

@@ -43,6 +43,10 @@ func (ec ExecContext) Raise(ev Event) {
 		return
 	}
 	ev.Type = EventInternal
+	ev.SendID = ""
+	ev.Origin = ""
+	ev.OriginType = ""
+	ev.InvokeID = ""
 	ec.raise(ev)
 }
 
@@ -93,17 +97,17 @@ func (ec ExecContext) IOProcessorLocation(typ Identifier) (location Location, ok
 
 // Send schedules delivery of an event, mirroring <send>: immediately (if
 // opts.Delay is zero) or after opts.Delay elapses. Dispatch failures are
-// never returned here -- per SCXML, they are surfaced as an
-// error.communication event on the internal queue, exactly like any other
-// platform event, not as a Go error propagated to the caller.
+// never returned here -- per SCXML, invalid/unsupported requests become
+// error.execution and delivery failures become error.communication on the
+// internal queue, rather than Go errors propagated to the caller.
 func (ec ExecContext) Send(name Identifier, opts SendOptions) {
 	if ec.send != nil {
 		ec.send(name, opts)
 	}
 }
 
-// Cancel best-effort cancels a previously scheduled delayed Send, mirroring
-// <cancel>. An unknown or already-fired sendID is silently a no-op.
+// Cancel best-effort cancels every pending delayed Send with the author-given
+// sendID, mirroring <cancel>. An unknown or already-fired sendID is a no-op.
 func (ec ExecContext) Cancel(sendID Identifier) {
 	if ec.cancel != nil {
 		ec.cancel(sendID)
@@ -136,6 +140,11 @@ type CondFunc func(ExecContext) bool
 
 // DoneDataFunc produces the payload for a final state's done event.
 type DoneDataFunc func(ExecContext) any
+
+// actionBlock is one SCXML block of executable content. An error skips the
+// rest of this block without affecting later blocks (for example, a second
+// <onentry> handler on the same state).
+type actionBlock []ActionFunc
 
 // Action adapts a callback operating on the chart's concrete datamodel type
 // D into an ActionFunc. A chart is bound to exactly one D for its entire
