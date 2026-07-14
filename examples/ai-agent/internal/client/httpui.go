@@ -376,9 +376,14 @@ const pageCSS = `
 	--color-danger-conversation-fg: #ad1457;
 
 	/* Accent: the currently-selected conversation link and the user's own
-	   chat bubbles. */
+	   chat bubbles. -hover/-active are fixed, pre-mixed shades (rather than
+	   a runtime color-mix()) so a primary button's hover/press states stay
+	   token-driven instead of one-off hex, without depending on color-mix
+	   support. */
 	--color-accent-bg: #e8f0fe;
 	--color-accent-fg: #1a56db;
+	--color-accent-fg-hover: #164bc4;
+	--color-accent-fg-active: #123fa8;
 
 	/* One-off surfaces that don't fit a status/accent semantic. */
 	--color-bubble-assistant-bg: #f0f0f0;
@@ -412,6 +417,34 @@ const pageCSS = `
 	--space-4: 16px;
 	--space-5: 20px;
 	--space-6: 24px;
+
+	/* Radius scale: four steps from "barely rounded" (inputs/buttons) up to
+	   a true pill (badges). Bubbles and the sidebar dialog sit a notch
+	   above the button/input radius so the whole UI reads as soft-cornered
+	   without every element sharing the exact same curvature. */
+	--radius-sm: 6px;
+	--radius-md: 10px;
+	--radius-lg: 14px;
+	--radius-pill: 999px;
+
+	/* Elevation scale: subtle, restrained shadows -- reusing --color-shadow
+	   as the one shared shadow color rather than introducing new literals.
+	   --shadow-sm is for surfaces that sit just barely above the page
+	   (topbar, buttons, bubbles); --shadow-md is for genuinely floating
+	   surfaces (the sidebar dialog); --shadow-focus is the accent-colored
+	   ring used for :focus-visible everywhere, in place of the browser's
+	   default outline -- a fixed rgba() matching --color-accent-fg (#1a56db)
+	   at 22% opacity, since CSS custom properties can't derive an alpha
+	   variant of another property's color without color-mix(), which isn't
+	   worth the support risk here. */
+	--shadow-sm: 0 1px 2px var(--color-shadow);
+	--shadow-md: 0 12px 32px -8px var(--color-shadow);
+	--shadow-focus: 0 0 0 3px rgba(26, 86, 219, .22);
+
+	/* Transition timing: one shared duration/easing so every interactive
+	   element animates the same way instead of some snapping and some
+	   easing. */
+	--transition-fast: 150ms ease;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
@@ -421,12 +454,29 @@ body {
 	font-size: var(--font-size-base); line-height: var(--line-height-base);
 	color: var(--color-text); background: var(--color-bg);
 }
-.topbar { flex: none; padding: var(--space-2) var(--space-4); background: var(--color-surface); border-bottom: 1px solid var(--color-border); }
-.sidebar-toggle, .dialog-close {
-	padding: var(--space-1) var(--space-3); border-radius: 6px; border: 1px solid var(--color-border-input); background: var(--color-surface);
-	cursor: pointer; font-size: var(--font-size-sm);
+::selection { background: var(--color-accent-fg); color: #fff; }
+/* One shared focus treatment for every interactive element: a soft accent
+   ring via box-shadow rather than the browser's default outline, which
+   varies wildly between browsers and often gets clipped by overflow:hidden
+   ancestors. Applied via :focus-visible so mouse clicks don't show a ring,
+   only keyboard/AT focus does -- never removed without this replacement. */
+.sidebar-toggle:focus-visible, .dialog-close:focus-visible,
+.conv-link:focus-visible, .new-form button:focus-visible,
+.send-form button:focus-visible {
+	outline: none; box-shadow: var(--shadow-focus);
 }
-.sidebar-toggle:hover, .dialog-close:hover { background: var(--color-surface-hover); }
+.topbar {
+	flex: none; padding: var(--space-2) var(--space-4); background: var(--color-surface);
+	box-shadow: var(--shadow-sm); position: relative; z-index: 1;
+}
+.sidebar-toggle, .dialog-close {
+	padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); border: 1px solid var(--color-border-input); background: var(--color-surface);
+	cursor: pointer; font-size: var(--font-size-sm); color: var(--color-text-secondary);
+	box-shadow: var(--shadow-sm);
+	transition: background var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+.sidebar-toggle:hover, .dialog-close:hover { background: var(--color-surface-hover); border-color: var(--color-text-subtle); box-shadow: var(--shadow-md); }
+.sidebar-toggle:active, .dialog-close:active { transform: translateY(1px); box-shadow: none; }
 .link-banner {
 	flex: none; padding: var(--space-1) var(--space-4); font-size: var(--font-size-xs); font-weight: 600;
 	text-align: center; letter-spacing: .02em;
@@ -444,7 +494,7 @@ body {
    <dialog> element itself, so an open/closed dialog's own state survives
    every sidebar update untouched. */
 .sidebar-dialog {
-	padding: var(--space-4); border: none; border-radius: 10px; box-shadow: 0 8px 30px var(--color-shadow);
+	padding: var(--space-4); border: none; border-radius: var(--radius-lg); box-shadow: var(--shadow-md);
 	width: min(340px, 92vw); max-height: 80vh; margin: auto;
 }
 /* A <dialog> with no "open" attribute is display:none by the UA stylesheet
@@ -455,7 +505,14 @@ body {
 .sidebar-dialog::backdrop { background: var(--color-overlay); }
 .sidebar { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
 .sidebar h3 { margin: 0 0 var(--space-2); font-size: var(--font-size-sm); text-transform: uppercase; letter-spacing: .04em; color: var(--color-text-subtle); }
-.conv-filter { padding: var(--space-2); margin-bottom: var(--space-2); border: 1px solid var(--color-border-input); border-radius: 6px; flex: none; font-size: var(--font-size-base); }
+.conv-filter {
+	padding: var(--space-2); margin-bottom: var(--space-2); border: 1px solid var(--color-border-input); border-radius: var(--radius-sm);
+	flex: none; font-size: var(--font-size-base); background: var(--color-surface); color: var(--color-text);
+	transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+.conv-filter:focus, .conv-filter:focus-visible {
+	outline: none; border-color: var(--color-accent-fg); box-shadow: var(--shadow-focus);
+}
 .sidebar-list { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 /* .placeholder's own rule (below, shared with #message-list) only sets
    vertical padding; give it the same horizontal inset as .conv-link here so
@@ -463,16 +520,36 @@ body {
    instead of touching the sidebar's edges. */
 .sidebar-list .placeholder { padding: var(--space-2); }
 .conv-link {
-	display: block; padding: var(--space-2); border-radius: 6px; text-decoration: none;
+	display: block; padding: var(--space-2); border-radius: var(--radius-sm); text-decoration: none;
 	color: var(--color-text-secondary); margin-bottom: var(--space-1); overflow-wrap: anywhere;
+	border-left: 3px solid transparent;
+	transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
 }
-.conv-link.active { background: var(--color-accent-bg); color: var(--color-accent-fg); font-weight: 600; }
-.badge { display: inline-block; padding: var(--space-1) var(--space-2); border-radius: 10px; font-size: var(--font-size-xs); margin-left: var(--space-1); white-space: nowrap; }
+.conv-link:hover { background: var(--color-surface-hover); }
+.conv-link.active { background: var(--color-accent-bg); color: var(--color-accent-fg); font-weight: 600; border-left-color: var(--color-accent-fg); }
+.badge {
+	display: inline-block; padding: var(--space-1) var(--space-2); border-radius: var(--radius-pill); font-size: var(--font-size-xs);
+	margin-left: var(--space-1); white-space: nowrap; font-weight: 600; letter-spacing: .02em;
+}
 .badge-idle { background: var(--color-success-bg); color: var(--color-success-fg); }
 .badge-thinking { background: var(--color-warning-bg); color: var(--color-warning-fg); }
 .badge-awaiting_tool { background: var(--color-danger-conversation-bg); color: var(--color-danger-conversation-fg); }
-.new-form { margin-top: var(--space-3); display: flex; gap: var(--space-1); flex: none; }
-.new-form input { flex: 1; min-width: 0; padding: var(--space-1); font-size: var(--font-size-base); }
+.new-form { margin-top: var(--space-3); display: flex; gap: var(--space-2); flex: none; }
+.new-form input {
+	flex: 1; min-width: 0; padding: var(--space-2); font-size: var(--font-size-base);
+	border: 1px solid var(--color-border-input); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-text);
+	transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+.new-form input:focus, .new-form input:focus-visible {
+	outline: none; border-color: var(--color-accent-fg); box-shadow: var(--shadow-focus);
+}
+.new-form button {
+	flex: none; padding: var(--space-2) var(--space-3); border: none; border-radius: var(--radius-sm);
+	background: var(--color-accent-fg); color: #fff; font-weight: 600; box-shadow: var(--shadow-sm);
+	transition: background var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+.new-form button:hover { background: var(--color-accent-fg-hover); box-shadow: var(--shadow-md); }
+.new-form button:active { background: var(--color-accent-fg-active); transform: translateY(1px); box-shadow: none; }
 .dialog-close { margin-top: var(--space-3); flex: none; align-self: flex-end; }
 .layout { flex: 1; min-height: 0; display: flex; }
 /* .main is a full-height flex column (its own height comes from .layout's
@@ -487,18 +564,44 @@ body {
 .main { flex: 1; min-height: 0; max-width: 800px; margin: 0 auto; width: 100%; display: flex; flex-direction: column; }
 #message-list { flex: 1; min-height: 0; overflow-y: auto; overflow-wrap: break-word; padding: var(--space-5) var(--space-6); }
 .placeholder { color: var(--color-text-subtle); padding: var(--space-2) 0; }
-.bubble { margin: var(--space-2) 0; padding: var(--space-2) var(--space-3); border-radius: 10px; overflow-wrap: break-word; white-space: pre-wrap; }
+/* .bubble-user/.bubble-assistant are plain-language chat content, so they
+   get --radius-lg plus a barely-there lift (--shadow-sm) to read as
+   distinct surfaces rather than flat paint swatches. .bubble-tool and
+   .bubble-toolcall are conceptually code blocks -- monospace, structured
+   data -- so instead of (or in addition to) the shadow they get a thin
+   border, closer to how a code fence reads than a chat bubble. */
+.bubble { margin: var(--space-2) 0; padding: var(--space-2) var(--space-3); border-radius: var(--radius-lg); overflow-wrap: break-word; white-space: pre-wrap; }
 .bubble-role { font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .03em; opacity: .6; display: block; margin-bottom: var(--space-1); }
-.bubble-user { background: var(--color-accent-bg); }
-.bubble-assistant { background: var(--color-bubble-assistant-bg); }
-.bubble-tool { background: var(--color-bubble-tool-bg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: var(--font-size-sm); }
+.bubble-user { background: var(--color-accent-bg); box-shadow: var(--shadow-sm); }
+.bubble-assistant { background: var(--color-bubble-assistant-bg); box-shadow: var(--shadow-sm); }
+.bubble-tool {
+	background: var(--color-bubble-tool-bg); border: 1px solid var(--color-border);
+	font-family: ui-monospace, Menlo, Consolas, monospace; font-size: var(--font-size-sm);
+}
 .bubble-thinking { color: var(--color-text-subtle); font-style: italic; background: transparent; padding-left: 0; }
-.bubble-toolcall { background: var(--color-warning-bg); color: var(--color-warning-fg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: var(--font-size-sm); }
+.bubble-toolcall {
+	background: var(--color-warning-bg); color: var(--color-warning-fg); border: 1px solid var(--color-warning-fg);
+	font-family: ui-monospace, Menlo, Consolas, monospace; font-size: var(--font-size-sm);
+}
 /* flex: none (not a scrolling flow child of #message-list) plus its own
    background + border-top is what keeps the composer legible and pinned
    below the transcript instead of scrolling away with it. */
-.send-form { flex: none; display: flex; gap: var(--space-1); padding: var(--space-3) var(--space-6) var(--space-4); border-top: 1px solid var(--color-border); background: var(--color-bg); }
-.send-form input[type=text] { flex: 1; min-width: 0; padding: var(--space-2); font-size: var(--font-size-base); }
+.send-form { flex: none; display: flex; gap: var(--space-2); padding: var(--space-3) var(--space-6) var(--space-4); border-top: 1px solid var(--color-border); background: var(--color-bg); }
+.send-form input[type=text] {
+	flex: 1; min-width: 0; padding: var(--space-2); font-size: var(--font-size-base);
+	border: 1px solid var(--color-border-input); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-text);
+	transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+.send-form input[type=text]:focus, .send-form input[type=text]:focus-visible {
+	outline: none; border-color: var(--color-accent-fg); box-shadow: var(--shadow-focus);
+}
+.send-form button {
+	flex: none; padding: var(--space-2) var(--space-4); border: none; border-radius: var(--radius-sm);
+	background: var(--color-accent-fg); color: #fff; font-weight: 600; box-shadow: var(--shadow-sm);
+	transition: background var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+}
+.send-form button:hover { background: var(--color-accent-fg-hover); box-shadow: var(--shadow-md); }
+.send-form button:active { background: var(--color-accent-fg-active); transform: translateY(1px); box-shadow: none; }
 /* Form controls don't inherit body's font-size the way ordinary flow
    elements (like .bubble) do -- browsers give <button>/<input> their own
    UA-stylesheet default (commonly ~13.3px) that ignores the page's typeface
