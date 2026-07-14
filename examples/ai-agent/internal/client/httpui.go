@@ -301,31 +301,20 @@ func (h *uiHTTP) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, u.String(), strings.NewReader(string(body)))
-		if err != nil {
-			lastErr = err
-			break
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			lastErr = err
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode >= 300 {
-			lastErr = fmt.Errorf("client: POST %s: unexpected status %s", u, resp.Status)
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		lastErr = nil
-		break
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, u.String(), strings.NewReader(string(body)))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	if lastErr != nil {
-		http.Error(w, lastErr.Error(), http.StatusBadGateway)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		http.Error(w, fmt.Sprintf("client: POST %s: unexpected status %s", u, resp.Status), http.StatusBadGateway)
 		return
 	}
 
