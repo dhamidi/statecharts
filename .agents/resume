@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+go_version=$(awk '$1 == "go" { print $2; exit }' "$repo_root/go.mod")
+go_binary="$HOME/.local/share/go/$go_version/bin/go"
+
+if [[ ! -x "$go_binary" ]]; then
+  echo "Go $go_version is missing; rerun .agents/setup" >&2
+  exit 1
+fi
+
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$go_binary" "$HOME/.local/bin/go"

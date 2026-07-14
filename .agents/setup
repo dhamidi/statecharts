@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+go_version=$(awk '$1 == "go" { print $2; exit }' "$repo_root/go.mod")
+
+case "$(uname -m)" in
+  x86_64)
+    go_arch=amd64
+    go_sha256=031f088e5d955bab8657ede27ad4e3bc5b7c1ba281f05f245bcc304f327c987a
+    ;;
+  aarch64|arm64)
+    go_arch=arm64
+    go_sha256=a290581cfe4fe28ddd737dde3095f3dbeb7f2e4065cab4eae44dfc53b760c2f7
+    ;;
+  *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+install_root="$HOME/.local/share/go"
+install_dir="$install_root/$go_version"
+mkdir -p "$install_root" "$HOME/.local/bin"
+
+if [[ ! -x "$install_dir/bin/go" ]]; then
+  archive="go${go_version}.linux-${go_arch}.tar.gz"
+  temp_dir=$(mktemp -d)
+  trap 'rm -rf "$temp_dir"' EXIT
+
+  echo "Installing Go $go_version for linux/$go_arch"
+  curl -fsSL "https://go.dev/dl/$archive" -o "$temp_dir/$archive"
+  printf '%s  %s\n' "$go_sha256" "$temp_dir/$archive" | sha256sum --check --status
+
+  tar -C "$temp_dir" -xzf "$temp_dir/$archive"
+  rm -rf "$install_dir"
+  mv "$temp_dir/go" "$install_dir"
+fi
+
+ln -sfn "$install_dir/bin/go" "$HOME/.local/bin/go"
+export PATH="$HOME/.local/bin:$PATH"
+export GOTOOLCHAIN=local
+
+echo "Downloading root module dependencies"
+(cd "$repo_root" && go mod download)
+
+echo "Downloading examples/ai-agent module dependencies"
+(cd "$repo_root/examples/ai-agent" && go mod download)
+
+go version
