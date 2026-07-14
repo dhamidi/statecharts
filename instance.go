@@ -116,6 +116,7 @@ func WithIOProcessor(typ Identifier, p IOProcessor) Option {
 		if typ == "" || p == nil {
 			panic("statecharts: IOProcessor type and processor must be non-empty")
 		}
+		typ = canonicalIOProcessorType(typ)
 		if c.configuredProcessorTypes[typ] {
 			panic(fmt.Sprintf("statecharts: duplicate IOProcessor type %q", typ))
 		}

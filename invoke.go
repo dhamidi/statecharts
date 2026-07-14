@@ -210,7 +210,7 @@ func (p *parentIOProcessor) Send(ctx context.Context, req SendRequest) error {
 				break
 			}
 		}
-		p.deliver(Event{Name: req.Event, Data: req.Data, SendID: req.EventSendID, Origin: origin, OriginType: SCXMLEventProcessor})
+		p.deliver(Event{Name: req.Event, Data: req.Data, SendID: req.EventSendID, Origin: origin, OriginType: SCXMLEventProcessorAlias})
 		return nil
 	}
 	if p.next == nil {

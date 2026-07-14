@@ -43,6 +43,17 @@ type ReplayAwareIOProcessor interface {
 // the default for a send that does not specify a type.
 const SCXMLEventProcessor Identifier = "http://www.w3.org/TR/scxml/#SCXMLEventProcessor"
 
+// SCXMLEventProcessorAlias is the short SCXML processor name and the value
+// required for Event.OriginType by Appendix C.1.
+const SCXMLEventProcessorAlias Identifier = "scxml"
+
+func canonicalIOProcessorType(typ Identifier) Identifier {
+	if typ == "" || typ == SCXMLEventProcessorAlias {
+		return SCXMLEventProcessor
+	}
+	return typ
+}
+
 // Dispatcher lets an IOProcessor deliver events back into whichever
 // Instance attached it -- fired invoke results, responses, or messages from
 // other sessions. Instance implements Dispatcher.

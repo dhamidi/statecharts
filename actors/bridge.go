@@ -123,7 +123,7 @@ func (b *Bridge) send(ctx context.Context, req statecharts.SendRequest, complete
 		Data:       req.Data,
 		SendID:     req.EventSendID,
 		Origin:     origin,
-		OriginType: statecharts.SCXMLEventProcessor,
+		OriginType: statecharts.SCXMLEventProcessorAlias,
 		DeliveryID: req.DeliveryID,
 	}
 

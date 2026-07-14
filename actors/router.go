@@ -109,7 +109,7 @@ func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest
 		Data:       req.Data,
 		SendID:     req.EventSendID,
 		Origin:     p.self,
-		OriginType: statecharts.SCXMLEventProcessor,
+		OriginType: statecharts.SCXMLEventProcessorAlias,
 		DeliveryID: req.DeliveryID,
 	}
 
@@ -138,7 +138,7 @@ func (p *routingProcessor) SendWithAck(ctx context.Context, req statecharts.Send
 		complete(nil)
 		return nil
 	}
-	ev := statecharts.Event{Name: req.Event, Type: statecharts.EventExternal, Data: req.Data, SendID: req.EventSendID, Origin: p.self, OriginType: statecharts.SCXMLEventProcessor, DeliveryID: req.DeliveryID}
+	ev := statecharts.Event{Name: req.Event, Type: statecharts.EventExternal, Data: req.Data, SendID: req.EventSendID, Origin: p.self, OriginType: statecharts.SCXMLEventProcessorAlias, DeliveryID: req.DeliveryID}
 	return p.sys.enqueueDispatch(func() { complete(p.sys.deliver(context.Background(), target, ev)) })
 }
 

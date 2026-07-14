@@ -166,7 +166,7 @@ func WithSCXMLPeer(io statecharts.IOProcessor) Option {
 // binds the returned processor to that actor's Dispatcher.
 func WithIOProcessor(typ statecharts.Identifier, factory IOProcessorFactory) Option {
 	return func(c *systemConfig) {
-		if typ == "" || typ == statecharts.SCXMLEventProcessor || factory == nil {
+		if typ == "" || typ == statecharts.SCXMLEventProcessor || typ == statecharts.SCXMLEventProcessorAlias || factory == nil {
 			panic("actors: invalid custom IOProcessor registration")
 		}
 		for _, p := range c.processors {

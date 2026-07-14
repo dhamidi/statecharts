@@ -671,7 +671,7 @@ func TestInstanceSelfSendPopulatesSCXMLOriginMetadata(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer in.Stop(ctx)
-	if got.Origin != "#_scxml_session-1" || got.OriginType != SCXMLEventProcessor {
+	if got.Origin != "#_scxml_session-1" || got.OriginType != SCXMLEventProcessorAlias {
 		t.Fatalf("self-send origin = %q/%q, want standard SCXML metadata", got.Origin, got.OriginType)
 	}
 }
@@ -748,6 +748,79 @@ func TestInstanceSendUsesDefaultSCXMLEventProcessorType(t *testing.T) {
 	}
 	if got, want := processor.requests[0].Type, Identifier("http://www.w3.org/TR/scxml/#SCXMLEventProcessor"); got != want {
 		t.Fatalf("default send type = %q, want %q", got, want)
+	}
+}
+
+func TestInstanceCustomIOProcessorReceivesEmptyAndInternalTargets(t *testing.T) {
+	for _, target := range []Identifier{"", "#_internal"} {
+		t.Run(string(target), func(t *testing.T) {
+			processor := &captureIOProcessor{}
+			chart, err := Build(Atomic("root", OnEntry(SendEvent("outbound", SendOptions{Target: target, Type: "custom"}))))
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			in := New(chart, nil, WithIOProcessor("custom", processor))
+			ctx := context.Background()
+			if err := in.Start(ctx); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer in.Stop(ctx)
+			if len(processor.requests) != 1 || processor.requests[0].Target != target {
+				t.Fatalf("custom processor requests = %#v, want one request with target %q", processor.requests, target)
+			}
+		})
+	}
+}
+
+func TestInstanceSCXMLAliasUsesMandatoryProcessorAndCanonicalRequestType(t *testing.T) {
+	processor := &captureIOProcessor{}
+	chart, err := Build(Atomic("root", OnEntry(SendEvent("outbound", SendOptions{Target: "service", Type: SCXMLEventProcessorAlias}))))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, processor))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if len(processor.requests) != 1 || processor.requests[0].Type != SCXMLEventProcessor {
+		t.Fatalf("SCXML processor requests = %#v, want one request with canonical type %q", processor.requests, SCXMLEventProcessor)
+	}
+}
+
+func TestDelayedSCXMLSelfSendSnapshotsPayloadWhenEvaluated(t *testing.T) {
+	type payload struct{ Values map[string]int }
+	original := &payload{Values: map[string]int{"count": 1}}
+	var received *payload
+	clock := NewManualClock(time.Unix(0, 0))
+	chart, err := Build(Atomic("root",
+		OnEntry(SendEvent("later", SendOptions{Data: original, Delay: time.Second})),
+		On("later", Then(func(ec ExecContext) error {
+			ev, _ := ec.Event()
+			received = ev.Data.(*payload)
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	in := New(chart, nil, WithClock(clock))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	original.Values["count"] = 2
+	clock.Advance(time.Second)
+	// ManualClock fires the actor timer synchronously, but actorClock queues
+	// its callback on the instance. A synchronous Send is a deterministic
+	// FIFO barrier for that queued callback.
+	if err := in.Send(ctx, Event{Name: "barrier", Type: EventExternal}); err != nil {
+		t.Fatalf("barrier Send: %v", err)
+	}
+	if received == nil || received == original || received.Values["count"] != 1 {
+		t.Fatalf("received payload = %#v, want isolated evaluation-time snapshot with count 1", received)
 	}
 }
 

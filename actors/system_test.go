@@ -1167,6 +1167,58 @@ func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T
 	}
 }
 
+func TestActorDeliveryIsolatesMutablePayloadAndUsesSCXMLOriginType(t *testing.T) {
+	type payload struct{ Values map[string]int }
+	ctx := context.Background()
+	original := &payload{Values: map[string]int{"count": 1}}
+	received := make(chan statecharts.Event, 1)
+	receiver, err := statecharts.Build(
+		statecharts.Atomic("payload-receiver", statecharts.On("payload", statecharts.Then(func(ec statecharts.ExecContext) error {
+			ev, _ := ec.Event()
+			got := ev.Data.(*payload)
+			got.Values["count"] = 9
+			received <- ev
+			return nil
+		}))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+	if err != nil {
+		t.Fatalf("Build receiver: %v", err)
+	}
+	sender, err := statecharts.Build(
+		statecharts.Atomic("payload-sender", statecharts.OnEntry(statecharts.SendEvent("payload", statecharts.SendOptions{Target: "receiver", Data: original}))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+	if err != nil {
+		t.Fatalf("Build sender: %v", err)
+	}
+	sys := NewSystem()
+	if err := sys.Register(receiver); err != nil {
+		t.Fatalf("Register receiver: %v", err)
+	}
+	if err := sys.Register(sender); err != nil {
+		t.Fatalf("Register sender: %v", err)
+	}
+	if err := sys.Spawn(ctx, "receiver", receiver.ID()); err != nil {
+		t.Fatalf("Spawn receiver: %v", err)
+	}
+	if err := sys.Spawn(ctx, "sender", sender.ID()); err != nil {
+		t.Fatalf("Spawn sender: %v", err)
+	}
+	select {
+	case ev := <-received:
+		if ev.OriginType != statecharts.SCXMLEventProcessorAlias {
+			t.Fatalf("received OriginType = %q, want %q", ev.OriginType, statecharts.SCXMLEventProcessorAlias)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for actor payload")
+	}
+	if original.Values["count"] != 1 {
+		t.Fatalf("sender payload was mutated through receiver: %#v", original)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestFallbackAdvertisesRegisteredIOProcessor(t *testing.T) {
 	ctx := context.Background()
 	want, err := statecharts.NewLocation("browser://connection")

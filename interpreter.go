@@ -226,10 +226,17 @@ func (ip *interpretation) doSend(name Identifier, opts SendOptions) {
 		ip.sendSeq++
 		sendID = Identifier(fmt.Sprintf("send.%d", ip.sendSeq))
 	}
-	if opts.Type == "" {
-		opts.Type = SCXMLEventProcessor
+	opts.Type = canonicalIOProcessorType(opts.Type)
+	data := opts.Data
+	if opts.Type == SCXMLEventProcessor {
+		var err error
+		data, err = clonePayload(data)
+		if err != nil {
+			ip.reportSendError(sendID, sendPayloadCopyError{err})
+			return
+		}
 	}
-	ev := Event{Name: name, Data: opts.Data, SendID: opts.SendID}
+	ev := Event{Name: name, Data: data, SendID: opts.SendID}
 
 	if opts.Delay <= 0 {
 		ip.dispatchNow(sendID, opts.Target, opts.Type, ev)
@@ -252,13 +259,20 @@ func (ip *interpretation) doSend(name Identifier, opts SendOptions) {
 func (ip *interpretation) stampExternalEvent(ev Event) Event {
 	ev.Type = EventExternal
 	ev.Origin = Identifier("#_scxml_" + string(ip.sessionID))
-	ev.OriginType = SCXMLEventProcessor
+	ev.OriginType = SCXMLEventProcessorAlias
 	return ev
 }
 
 func (ip *interpretation) dispatchNow(sendID, target, typ Identifier, ev Event) {
-	if typ == "" {
-		typ = SCXMLEventProcessor
+	typ = canonicalIOProcessorType(typ)
+	processor := ip.ioProcessorsByType[typ]
+	if processor == nil {
+		ip.reportSendError(sendID, unknownIOProcessorError{typ})
+		return
+	}
+	if typ != SCXMLEventProcessor {
+		ip.dispatchToProcessor(sendID, target, typ, ev, processor)
+		return
 	}
 	switch {
 	case target == "#_internal":
@@ -289,18 +303,21 @@ func (ip *interpretation) dispatchNow(sendID, target, typ Identifier, ev Event) 
 		}
 		fallthrough
 	default:
-		processor := ip.ioProcessorsByType[typ]
-		if processor == nil {
-			ip.reportSendError(sendID, unknownIOProcessorError{typ})
-			return
-		}
-		ip.dispatchSeq++
-		req := SendRequest{DeliveryID: DeliveryID(fmt.Sprintf("%s:%d", ip.deliveryNamespace, ip.dispatchSeq)), SendID: sendID, EventSendID: ev.SendID, Target: target, Type: typ, Event: ev.Name, Data: ev.Data}
-		if err := processor.Send(context.Background(), req); err != nil {
-			ip.reportSendError(sendID, err)
-		}
+		ip.dispatchToProcessor(sendID, target, typ, ev, processor)
 	}
 }
+
+func (ip *interpretation) dispatchToProcessor(sendID, target, typ Identifier, ev Event, processor IOProcessor) {
+	ip.dispatchSeq++
+	req := SendRequest{DeliveryID: DeliveryID(fmt.Sprintf("%s:%d", ip.deliveryNamespace, ip.dispatchSeq)), SendID: sendID, EventSendID: ev.SendID, Target: target, Type: typ, Event: ev.Name, Data: ev.Data}
+	if err := processor.Send(context.Background(), req); err != nil {
+		ip.reportSendError(sendID, err)
+	}
+}
+
+type sendPayloadCopyError struct{ error }
+
+func (sendPayloadCopyError) SendExecutionError() {}
 
 // handleTimerFire is what a pending send's timer actually schedules. It
 // must only ever run on the goroutine that owns this interpretation (for a

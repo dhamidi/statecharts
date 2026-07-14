@@ -650,7 +650,7 @@ func TestInvokeChartRoundTripsThroughParentAndAutoForward(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if !strings.HasPrefix(string(childOrigin), "#_scxml_") || childOriginType != SCXMLEventProcessor {
+	if !strings.HasPrefix(string(childOrigin), "#_scxml_") || childOriginType != SCXMLEventProcessorAlias {
 		t.Fatalf("child #_parent event origin = %q/%q, want standard SCXML metadata", childOrigin, childOriginType)
 	}
 
