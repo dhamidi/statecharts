@@ -211,14 +211,17 @@ var applyDirectoryUpsert = statecharts.Action(func(d *uiModel, ec statecharts.Ex
 	return nil
 })
 
-var applySwitch = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
-	ev, _ := ec.Event()
-	id, ok := statecharts.Payload[protocol.ConversationID](ev)
-	if !ok {
-		return nil
-	}
-	if d.ConversationID == id {
-		return nil // already there (e.g. the HTTP handler's own direct Tell already applied this)
+// resetForSwitch is the actual "switch conversations" state change: cleared
+// exactly once per real switch, shared by applySwitch (driven by
+// LinkActor's own async "conversation_switched", see link.go's
+// handleSwitch) and switchAndReplySnapshot (driven synchronously by
+// httpui.go's handleIndex -- see that action's own doc comment for why
+// there are two entry points into the same reset). Idempotent: a no-op
+// once d is already showing id, so whichever of the two callers gets there
+// first "wins" and the other is harmless.
+func resetForSwitch(d *uiModel, id protocol.ConversationID) bool {
+	if id == "" || d.ConversationID == id {
+		return false
 	}
 	d.ConversationID = id
 	d.Messages = map[int]protocol.MessageFrame{}
@@ -228,6 +231,16 @@ var applySwitch = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext
 	d.PendingToolCall = nil
 	pushMain(d)
 	pushSidebar(d) // the sidebar's own "active" highlight tracks d.ConversationID
+	return true
+}
+
+var applySwitch = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+	ev, _ := ec.Event()
+	id, ok := statecharts.Payload[protocol.ConversationID](ev)
+	if !ok {
+		return nil
+	}
+	resetForSwitch(d, id) // no-op if httpui.go's own switch_and_snapshot already applied this
 	return nil
 })
 
@@ -299,6 +312,57 @@ func getUISnapshot(ctx context.Context, sys *actors.System) (uiSnapshot, error) 
 	}
 }
 
+// switchAndSnapshotRequest is "switch_and_snapshot"'s payload -> ui, from
+// httpui.go's handleIndex when a request names a conversation via
+// ?conversation=. It exists so handleIndex can ask "ui" -- and only "ui" --
+// to both apply the switch (if any) and hand back the resulting snapshot in
+// one atomic actor-message round trip, rather than handleIndex reaching
+// into LinkActor's own job of announcing "conversation_switched" itself
+// (that stays link.go's handleSwitch's alone, sent asynchronously once link
+// actually processes the "switch" this same request also Tells it -- see
+// applySwitch, which no-ops if switchAndReplySnapshot already got there
+// first).
+type switchAndSnapshotRequest struct {
+	ConversationID protocol.ConversationID
+	Reply          chan<- uiSnapshot
+}
+
+var switchAndReplySnapshot = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+	ev, _ := ec.Event()
+	req, ok := statecharts.Payload[switchAndSnapshotRequest](ev)
+	if !ok {
+		return nil
+	}
+	resetForSwitch(d, req.ConversationID)
+	req.Reply <- snapshotOf(d)
+	return nil
+})
+
+// getUISnapshotForSwitch is switch_and_snapshot's own request/reply-over-a-
+// channel helper -- the same idiom getUISnapshot above uses for
+// get_snapshot -- for httpui.go's handleIndex: it both makes sure "ui" is
+// already showing id (applying the same reset applySwitch would, exactly
+// once) and returns the fresh snapshot to render, atomically, so the page
+// rendered in response to a ?conversation= navigation never shows a stale
+// conversation for one request. Separately, and still, the caller must
+// Tell "link" to "switch" so it actually redials SSE for id -- this call
+// only concerns what "ui" shows.
+func getUISnapshotForSwitch(ctx context.Context, sys *actors.System, id protocol.ConversationID) (uiSnapshot, error) {
+	reply := make(chan uiSnapshot, 1)
+	if err := sys.Tell(ctx, "ui", statecharts.Event{
+		Name: "switch_and_snapshot", Type: statecharts.EventExternal,
+		Data: switchAndSnapshotRequest{ConversationID: id, Reply: reply},
+	}); err != nil {
+		return uiSnapshot{}, err
+	}
+	select {
+	case snap := <-reply:
+		return snap, nil
+	case <-ctx.Done():
+		return uiSnapshot{}, ctx.Err()
+	}
+}
+
 // UIKind is the chart kind name the client's singleton "ui" actor is
 // Registered and Spawned under.
 const UIKind statecharts.Identifier = "ui"
@@ -320,6 +384,7 @@ func BuildUIChart(sys *actors.System, serverAddr string) (*statecharts.Chart, er
 			statecharts.On("directory_upsert", statecharts.Then(applyDirectoryUpsert)),
 			statecharts.On("conversation_switched", statecharts.Then(applySwitch)),
 			statecharts.On("get_snapshot", statecharts.Then(replySnapshot)),
+			statecharts.On("switch_and_snapshot", statecharts.Then(switchAndReplySnapshot)),
 			statecharts.On("subscribe_browser", statecharts.Then(subscribeBrowser)),
 			statecharts.On("unsubscribe_browser", statecharts.Then(unsubscribeBrowser)),
 		),
