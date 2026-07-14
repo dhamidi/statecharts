@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -17,6 +18,7 @@ import (
 type Instance struct {
 	chart *Chart
 	ip    *interpretation
+	clock Clock
 
 	inbox   chan actorRequest
 	doneCh  chan struct{}
@@ -33,6 +35,12 @@ type Instance struct {
 	// never re-triggers a real-world <invoke> side effect a second time
 	// (see replay.go). Untouched (always false) outside Rehydrate.
 	suppressInvoke atomic.Bool
+
+	// deferTimerActivation keeps restored pending sends inert while
+	// Rehydrate replays the log after a checkpoint. Rehydrate activates
+	// whatever remains in one actor request after replay catches up; direct
+	// Restore users leave this false and Start activates timers normally.
+	deferTimerActivation atomic.Bool
 }
 
 type actorReqKind uint8
@@ -42,15 +50,20 @@ const (
 	reqStop
 	reqTimerFired
 	reqSnapshot
+	reqCheckpoint
 	reqActiveInvokes
-	reqResumeInvokes
+	reqReplayTimerFired
+	reqFinishReplay
 )
 
 type actorRequest struct {
 	kind       actorReqKind
 	event      Event
-	fn         func()        // reqTimerFired only
-	reply      chan error    // reqSend/reqStop/reqResumeInvokes
+	fn         func() // reqTimerFired only
+	checkpoint func(Snapshot) error
+	entry      LogEntry      // reqReplayTimerFired only
+	clock      Clock         // reqFinishReplay only
+	reply      chan error    // reqSend/reqStop/reqCheckpoint/reqReplayTimerFired/reqFinishReplay
 	snapOut    chan Snapshot // reqSnapshot only
 	invokesOut chan bool     // reqActiveInvokes only
 }
@@ -63,7 +76,7 @@ type instanceConfig struct {
 	clock          Clock
 	logger         Logger
 	inboxSize      int
-	timerFiredHook func(Identifier, Event) error
+	timerFiredHook func(Identifier, Identifier, Identifier, Event) error
 	idGen          IDGenerator
 	sessionID      SessionID
 }
@@ -103,6 +116,18 @@ func WithInboxSize(n int) Option {
 // Instance's fatal terminal error (surfaced via Err()/Wait()) rather than
 // silently letting the event through.
 func WithTimerFiredHook(fn func(sendID Identifier, ev Event) error) Option {
+	return func(c *instanceConfig) {
+		c.timerFiredHook = func(sendID, target, typ Identifier, ev Event) error {
+			return fn(sendID, ev)
+		}
+	}
+}
+
+// WithTimerFiredDetailsHook is WithTimerFiredHook's metadata-preserving
+// counterpart. In addition to the generated send ID and event, fn receives
+// the original send target and I/O processor type so a durable log can
+// reconstruct the dispatch even if its pending-send record is unavailable.
+func WithTimerFiredDetailsHook(fn func(sendID, target, typ Identifier, ev Event) error) Option {
 	return func(c *instanceConfig) { c.timerFiredHook = fn }
 }
 
@@ -152,6 +177,7 @@ func New(chart *Chart, datamodel any, opts ...Option) *Instance {
 func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id SessionID) *Instance {
 	in := &Instance{
 		chart:   chart,
+		clock:   cfg.clock,
 		inbox:   make(chan actorRequest, cfg.inboxSize),
 		doneCh:  make(chan struct{}),
 		readyCh: make(chan struct{}),
@@ -223,8 +249,8 @@ func (in *Instance) resumeInvoke(id Identifier, spec *compiledInvoke, params any
 	})
 }
 
-// resumeInvokesAfterReplay is reqResumeInvokes's handler, run on the actor's
-// own goroutine by Rehydrate once replay has caught up (see replay.go): for
+// resumeInvokesAfterReplay runs on the actor's own goroutine as the second
+// half of reqFinishReplay once replay has caught up (see replay.go): for
 // every invocation ip.invokesByID still holds, in the same deterministic
 // order applyInvokeSideEffects already uses, it either reports
 // error.communication (no Resume configured) or calls resumeInvoke and
@@ -357,6 +383,101 @@ func (c *actorClock) AfterFunc(d time.Duration, f func()) func() bool {
 	})
 }
 
+// activatePendingTimers switches the interpreter to clock, then either fires
+// each overdue pending send or arms it for its remaining delay. It runs only
+// on the actor goroutine. Processing each overdue send to stability before
+// considering the next preserves normal timer ordering: an earlier timer's
+// transition can still cancel a later one before that later send fires.
+func (in *Instance) activatePendingTimers(clock Clock) error {
+	in.clock = clock
+	in.ip.clock = &actorClock{real: clock, inbox: in.inbox, done: in.doneCh}
+
+	records := make([]*pendingSendRecord, 0, len(in.ip.pending))
+	for _, rec := range in.ip.pending {
+		records = append(records, rec)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].fireAt.Equal(records[j].fireAt) {
+			return records[i].sendID < records[j].sendID
+		}
+		return records[i].fireAt.Before(records[j].fireAt)
+	})
+
+	for _, rec := range records {
+		if current, ok := in.ip.pending[rec.sendID]; !ok || current != rec {
+			continue // an earlier overdue send cancelled or replaced it
+		}
+		if rec.stop != nil {
+			rec.stop()
+			rec.stop = nil
+		}
+
+		delay := rec.fireAt.Sub(clock.Now())
+		if delay > 0 {
+			sendID := rec.sendID
+			rec.stop = in.ip.clock.AfterFunc(delay, func() { in.ip.handleTimerFire(sendID) })
+			continue
+		}
+
+		in.ip.handleTimerFire(rec.sendID)
+		if err := in.takeTimerHookError(); err != nil {
+			return err
+		}
+		in.drainQueuedEvents()
+		if !in.ip.running {
+			break
+		}
+	}
+	return nil
+}
+
+// Checkpoint calls save with a stable Snapshot on the Instance's own
+// goroutine. No event or timer can be applied until save returns, allowing a
+// durable runtime to pair the Snapshot atomically with its current Log
+// sequence. A successful save stops the Instance at that exact boundary; a
+// failed save leaves it running so checkpointing can be retried. Because save
+// runs on the actor goroutine, it must not call back into this Instance.
+func (in *Instance) Checkpoint(ctx context.Context, save func(Snapshot) error) error {
+	req := actorRequest{kind: reqCheckpoint, checkpoint: save, reply: make(chan error, 1)}
+	if err := in.submit(ctx, req); err != nil {
+		return err
+	}
+	return in.awaitReply(ctx, req.reply)
+}
+
+func (in *Instance) takeTimerHookError() error {
+	if in.ip.hookErr == nil {
+		return nil
+	}
+	err := in.ip.hookErr
+	in.ip.hookErr = nil
+	in.setTerminalErr(err)
+	in.ip.running = false
+	return err
+}
+
+func (in *Instance) drainQueuedEvents() {
+	for in.ip.running && in.ip.processNextExternal() {
+	}
+	if in.ip.running {
+		in.ip.runToStable()
+	}
+}
+
+// finishReplay atomically makes delayed sends live and reconciles invocations.
+// An overdue timer may exit an invoking state or finish the whole chart, so
+// both steps belong to one actor request and invocation resumption runs only
+// if the chart remains active afterward.
+func (in *Instance) finishReplay(clock Clock) error {
+	if err := in.activatePendingTimers(clock); err != nil {
+		return err
+	}
+	if in.ip.running {
+		in.resumeInvokesAfterReplay()
+	}
+	return nil
+}
+
 // Start spawns the interpreter goroutine, enters the chart's initial
 // configuration, and drains to the first stable point before returning.
 // ctx bounds only this handshake, not the goroutine's subsequent lifetime.
@@ -385,6 +506,12 @@ func (in *Instance) run() {
 
 	if !in.ip.restored {
 		in.ip.start()
+	} else if !in.deferTimerActivation.Load() {
+		if err := in.activatePendingTimers(in.clock); err != nil {
+			in.ip.exitInterpreter()
+			in.publishConfig()
+			return
+		}
 	}
 	if !in.ip.running {
 		in.ip.exitInterpreter()
@@ -401,6 +528,7 @@ func (in *Instance) run() {
 
 		var snapOut chan Snapshot
 		var invokesOut chan bool
+		var reqErr error
 		switch req.kind {
 		case reqStop:
 			in.ip.running = false
@@ -408,23 +536,30 @@ func (in *Instance) run() {
 			in.ip.enqueue(req.event)
 		case reqTimerFired:
 			req.fn()
-			if in.ip.hookErr != nil {
-				in.setTerminalErr(in.ip.hookErr)
-				in.ip.hookErr = nil
-				in.ip.running = false
-			}
+			reqErr = in.takeTimerHookError()
 		case reqSnapshot:
 			snapOut = req.snapOut
+		case reqCheckpoint:
+			reqErr = req.checkpoint(in.buildSnapshot())
+			if reqErr == nil {
+				in.ip.running = false
+			}
 		case reqActiveInvokes:
 			invokesOut = req.invokesOut
-		case reqResumeInvokes:
-			in.resumeInvokesAfterReplay()
+		case reqReplayTimerFired:
+			if _, ok := in.ip.pending[req.entry.SendID]; ok {
+				// This fire is already in the log, so bypass the live hook:
+				// replay must not append the same timer_fired entry again.
+				in.ip.fireTimer(req.entry.SendID)
+			} else {
+				// The log is authoritative even if a checkpoint or chart drift
+				// left no matching pending record to recompute the dispatch.
+				in.ip.dispatchNow(req.entry.SendID, req.entry.Target, req.entry.Type, req.entry.Event)
+			}
+		case reqFinishReplay:
+			reqErr = in.finishReplay(req.clock)
 		}
-		for in.ip.running && in.ip.processNextExternal() {
-		}
-		if in.ip.running {
-			in.ip.runToStable()
-		}
+		in.drainQueuedEvents()
 		if !in.ip.running {
 			in.ip.exitInterpreter()
 		}
@@ -447,7 +582,7 @@ func (in *Instance) run() {
 		// cross-session IOProcessor dispatch is genuinely asynchronous
 		// here).
 		if req.reply != nil {
-			req.reply <- nil
+			req.reply <- reqErr
 		}
 	}
 }

@@ -35,6 +35,7 @@ if [[ ! -x "$install_dir/bin/go" ]]; then
 fi
 
 ln -sfn "$install_dir/bin/go" "$HOME/.local/bin/go"
+ln -sfn "$install_dir/bin/gofmt" "$HOME/.local/bin/gofmt"
 export PATH="$HOME/.local/bin:$PATH"
 export GOTOOLCHAIN=local
 

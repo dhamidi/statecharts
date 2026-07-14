@@ -35,7 +35,31 @@ func New(db *sql.DB, dialect Dialect) (*Log, error) {
 			return nil, fmt.Errorf("sqllog: create schema: %w", err)
 		}
 	}
+	if err := migrateSchema(db, dialect); err != nil {
+		return nil, err
+	}
 	return &Log{db: db, dialect: dialect}, nil
+}
+
+func migrateSchema(db *sql.DB, dialect Dialect) error {
+	if dialect != SQLite {
+		return nil
+	}
+	const probe = `SELECT entry_type FROM statechart_log LIMIT 0`
+	if rows, err := db.Query(probe); err == nil {
+		rows.Close()
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE statechart_log ADD COLUMN entry_type TEXT NOT NULL DEFAULT ''`); err != nil {
+		// Another concurrent New may have completed the same migration after
+		// the probe. Re-probe before reporting its duplicate-column error.
+		if rows, probeErr := db.Query(probe); probeErr == nil {
+			rows.Close()
+			return nil
+		}
+		return fmt.Errorf("sqllog: migrate schema: add statechart_log.entry_type: %w", err)
+	}
+	return nil
 }
 
 // Append implements statecharts.Log.
@@ -59,7 +83,7 @@ func (l *Log) Append(ctx context.Context, entry statecharts.LogEntry) (uint64, e
 
 	_, err = tx.ExecContext(ctx, insertLogSQL[l.dialect],
 		entry.SessionID, seq, string(entry.Kind), entry.Timestamp.UTC(),
-		string(entry.SendID), string(entry.Target),
+		string(entry.SendID), string(entry.Target), string(entry.Type),
 		string(enc.Name), int(enc.Type), string(enc.SendID), string(enc.Origin), string(enc.OriginType), string(enc.InvokeID),
 		enc.DataType, enc.DataPayload,
 	)
@@ -88,14 +112,14 @@ func (l *Log) Read(ctx context.Context, sessionID statecharts.SessionID, from ui
 				seq                                                      uint64
 				kind                                                     string
 				ts                                                       time.Time
-				entrySendID, entryTarget                                 string
+				entrySendID, entryTarget, entryType                      string
 				eventName                                                string
 				eventType                                                int
 				eventSendID, eventOrigin, eventOriginType, eventInvokeID string
 				dataType                                                 string
 				dataPayload                                              []byte
 			)
-			if err := rows.Scan(&seq, &kind, &ts, &entrySendID, &entryTarget,
+			if err := rows.Scan(&seq, &kind, &ts, &entrySendID, &entryTarget, &entryType,
 				&eventName, &eventType, &eventSendID, &eventOrigin, &eventOriginType, &eventInvokeID,
 				&dataType, &dataPayload); err != nil {
 				yield(statecharts.LogEntry{}, fmt.Errorf("sqllog: scan: %w", err))
@@ -125,6 +149,7 @@ func (l *Log) Read(ctx context.Context, sessionID statecharts.SessionID, from ui
 				Event:     ev,
 				SendID:    statecharts.Identifier(entrySendID),
 				Target:    statecharts.Identifier(entryTarget),
+				Type:      statecharts.Identifier(entryType),
 			}
 			if !yield(entry, nil) {
 				return

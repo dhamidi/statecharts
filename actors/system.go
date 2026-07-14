@@ -412,16 +412,16 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 	var inst *statecharts.Instance
 	var err error
 	if entry.durable {
-		// WithTimerFiredHook write-ahead-logs a chart's own internally
-		// delayed <send>s the moment their timer fires (LoggingTimerFiredHook,
-		// log.go) -- the counterpart, for timer-originated messages, to the
-		// explicit Log.Append System.deliver performs before every
+		// WithTimerFiredDetailsHook write-ahead-logs a chart's own internally
+		// delayed <send>s the moment their timer fires
+		// (LoggingTimerFiredDetailsHook, log.go) -- the timer-originated
+		// counterpart to System.deliver's explicit Log.Append before each
 		// externally-originated message (Tell, peer Send). Without this, a
 		// durable actor's self-scheduled sends would never be durable.
 		inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.log, s.cfg.snapshots, statecharts.SessionID(entry.name), proc,
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger),
-			statecharts.WithTimerFiredHook(statecharts.LoggingTimerFiredHook(s.cfg.log, statecharts.SessionID(entry.name))),
+			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.log, statecharts.SessionID(entry.name), s.cfg.clock)),
 		)
 	} else {
 		inst = statecharts.New(chart, dm, statecharts.WithIOProcessor(proc), statecharts.WithClock(s.cfg.clock), statecharts.WithLogger(s.cfg.logger), statecharts.WithSessionID(statecharts.SessionID(entry.name)))
@@ -569,13 +569,12 @@ func (s *System) pickEvictionVictim(ctx context.Context, exclude *actorEntry) *a
 	return nil
 }
 
-// evictLocked checkpoints and stops entry's live Instance: Snapshot, pair
-// with the Log's current LastSeq into a Checkpoint, SnapshotStore.Save,
-// then Instance.Stop -- in that order, so a crash between any two steps
-// still leaves a durable, replayable record, and so Snapshot is never
-// called on an already-stopped Instance (which would return
-// statecharts.ErrInstanceStopped). Callers must hold entry.mu; for a
-// still-running entry, callers must also know entry.durable is true (the
+// evictLocked checkpoints and stops entry's live Instance by calling
+// Instance.Checkpoint. Its persistence callback runs while the actor is
+// paused, so LastSeq and SnapshotStore.Save see the exact same boundary and
+// no timer can append between snapshot capture and sequence capture. A
+// failed callback leaves the Instance running. Callers must hold entry.mu;
+// for a still-running entry, callers must also know entry.durable is true (the
 // snapshot/log path below has no meaning for a non-durable actor, which
 // has no Log to check it against). An entry whose Instance has already
 // finished on its own (instanceFinished) is freed the same way regardless
@@ -593,19 +592,18 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 		entry.instance.Store(nil)
 		return nil
 	}
-	snap, err := inst.Snapshot(ctx)
+	err := inst.Checkpoint(ctx, func(snap statecharts.Snapshot) error {
+		seq, err := s.cfg.log.LastSeq(ctx, statecharts.SessionID(entry.name))
+		if err != nil {
+			return fmt.Errorf("actors: last seq %q: %w", entry.name, err)
+		}
+		if err := s.cfg.snapshots.Save(ctx, statecharts.SessionID(entry.name), statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
+			return fmt.Errorf("actors: save checkpoint %q: %w", entry.name, err)
+		}
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("actors: snapshot %q: %w", entry.name, err)
-	}
-	seq, err := s.cfg.log.LastSeq(ctx, statecharts.SessionID(entry.name))
-	if err != nil {
-		return fmt.Errorf("actors: last seq %q: %w", entry.name, err)
-	}
-	if err := s.cfg.snapshots.Save(ctx, statecharts.SessionID(entry.name), statecharts.Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
-		return fmt.Errorf("actors: save checkpoint %q: %w", entry.name, err)
-	}
-	if err := inst.Stop(ctx); err != nil {
-		return fmt.Errorf("actors: stop %q: %w", entry.name, err)
+		return fmt.Errorf("actors: checkpoint %q: %w", entry.name, err)
 	}
 	entry.instance.Store(nil)
 	return nil
@@ -675,7 +673,7 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 		if _, err := s.cfg.log.Append(ctx, statecharts.LogEntry{
 			SessionID: statecharts.SessionID(name),
 			Kind:      statecharts.KindExternalEvent,
-			Timestamp: time.Now().UTC(),
+			Timestamp: s.cfg.clock.Now().UTC(),
 			Event:     ev,
 		}); err != nil {
 			return fmt.Errorf("actors: append %q: %w", name, err)
@@ -814,11 +812,12 @@ func (s *System) runSweep() {
 }
 
 // Stop stops the entire system. Every durable resident actor is
-// checkpointed and stopped (Instance.Snapshot, SnapshotStore.Save,
-// Instance.Stop, exactly as idle-timeout eviction does it). Every
+// checkpointed and stopped (Instance.Checkpoint and SnapshotStore.Save,
+// exactly as idle-timeout eviction does it). Every
 // non-durable resident actor is simply stopped, its state lost, since it
 // has no Log to rebuild itself from. The idle-timeout sweep is cancelled.
-// Stop is idempotent: calling it again is a no-op.
+// Stop is idempotent after successful cleanup. If a call's context expires,
+// a later call retries any entries that remain resident.
 //
 // Stop returns every actor's teardown error via errors.Join, not just
 // whichever one happened to finish first -- one wedged or misbehaving actor
@@ -850,21 +849,20 @@ func (s *System) runSweep() {
 // make a best effort" contract as the final asyncWG wait.
 func (s *System) Stop(ctx context.Context) error {
 	s.tableMu.Lock()
-	if !s.stopped.CompareAndSwap(false, true) {
-		s.tableMu.Unlock()
-		return nil
-	}
+	firstStop := s.stopped.CompareAndSwap(false, true)
 	entries := make([]*actorEntry, 0, len(s.table))
 	for _, e := range s.table {
 		entries = append(entries, e)
 	}
 	s.tableMu.Unlock()
 
-	s.sweepMu.Lock()
-	if s.sweepCancel != nil {
-		s.sweepCancel()
+	if firstStop {
+		s.sweepMu.Lock()
+		if s.sweepCancel != nil {
+			s.sweepCancel()
+		}
+		s.sweepMu.Unlock()
 	}
-	s.sweepMu.Unlock()
 
 	var errMu sync.Mutex
 	var errs []error

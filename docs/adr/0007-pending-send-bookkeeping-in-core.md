@@ -37,11 +37,11 @@ complete and correct regardless of which `IOProcessor` implementation is in
 use (constraint 5), since the pending-send table it reads from is always
 the interpreter's own.
 
-A useful consequence discovered later (see ADR 0006): because real-world
-dispatch is entirely gated at the `IOProcessor.Send`/`Cancel` boundary
-(`replayGate` in replay.go), and delay timing never touches `IOProcessor` at
-all, suppressing replay side effects requires gating only `IOProcessor` —
-no separate `Clock` swap is needed on a replaying `Instance`.
+A useful consequence discovered later (see ADR 0006): real-world dispatch is
+gated at the `IOProcessor.Send`/`Cancel` boundary (`replayGate` in replay.go),
+while delay timing is independently gated by a non-firing replay `Clock`.
+Keeping both gates active until log replay catches up prevents either external
+dispatch or a recomputed historical timer from repeating real-world work.
 
 ## Consequences
 
@@ -53,8 +53,16 @@ no separate `Clock` swap is needed on a replaying `Instance`.
   HTTP-backed processor might support); it is not involved in cancelling a
   still-pending local timer, which the interpreter core handles by calling
   the `Clock.AfterFunc` stop-function directly.
-- `Restore` (snapshot.go) re-arms real timers for every `PendingSend` still
-  outstanding at snapshot time, relative to `time.Until(FireAt)` (firing
-  immediately if already overdue) — the same mechanism regardless of
-  whether the `Instance` arrived there via `Restore` alone or via
-  `Rehydrate`'s log replay.
+- `Restore` (snapshot.go) reconstructs every `PendingSend` as an inert record.
+  A direct `Start` arms those records relative to the configured `Clock.Now`
+  and synchronously applies overdue sends before returning. `Rehydrate`
+  defers the same activation until all post-checkpoint log entries have
+  replayed, since one of those entries may fire or cancel a checkpointed
+  timer.
+- `Snapshot` also preserves the high-water marks used for anonymous send and
+  invoke IDs. Restoring the visible pending/active records without those
+  counters could reuse an old `send.<n>` or `<state>.invoke<n>` identity and
+  misattribute a later callback.
+- Interpreter exit cancels and forgets every pending timer. A stopped or
+  terminal instance must not retain callbacks that can outlive it and race a
+  separately restored copy.

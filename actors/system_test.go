@@ -509,6 +509,63 @@ func TestStopHonorsContextDeadline(t *testing.T) {
 	}
 }
 
+func TestStopCanRetryCleanupAfterDeadline(t *testing.T) {
+	ctx := context.Background()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	wedge := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+		close(entered)
+		<-release
+		return nil
+	})
+	chart, err := statecharts.Build(
+		statecharts.Atomic("wedged-retry", statecharts.On("go", statecharts.Then(wedge))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	sys := NewSystem()
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "wedged-retry-1", chart.ID()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	tellDone := make(chan error, 1)
+	go func() {
+		tellDone <- sys.Tell(ctx, "wedged-retry-1", statecharts.Event{Name: "go", Type: statecharts.EventExternal})
+	}()
+	<-entered
+
+	stopCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	err = sys.Stop(stopCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		close(release)
+		t.Fatalf("first Stop error = %v, want context.DeadlineExceeded", err)
+	}
+
+	retryDone := make(chan error, 1)
+	go func() { retryDone <- sys.Stop(ctx) }()
+	select {
+	case err := <-retryDone:
+		close(release)
+		t.Fatalf("retry Stop returned %v before the wedged actor was released; it did not retry cleanup", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-tellDone; err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+	if err := <-retryDone; err != nil {
+		t.Fatalf("retry Stop: %v", err)
+	}
+	if testResident(sys, "wedged-retry-1") {
+		t.Fatalf("actor remained resident after successful retry Stop")
+	}
+}
+
 // TestWithOnSweepErrorObservesEvictionFailures is finding #6: a
 // persistently failing SnapshotStore.Save during an idle-timeout sweep
 // must be observable by an operator, not silently swallowed forever, and

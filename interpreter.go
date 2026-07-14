@@ -64,7 +64,7 @@ type interpretation struct {
 	// site for an application to hook itself (see log.go,
 	// LoggingTimerFiredHook). A non-nil error aborts the instance; the
 	// error is picked up via hookErr by Instance.run.
-	timerFiredHook func(sendID Identifier, ev Event) error
+	timerFiredHook func(sendID, target, typ Identifier, ev Event) error
 	hookErr        error
 }
 
@@ -275,7 +275,7 @@ func (ip *interpretation) handleTimerFire(sendID Identifier) {
 		return // already cancelled
 	}
 	if ip.timerFiredHook != nil {
-		if err := ip.timerFiredHook(sendID, rec.event); err != nil {
+		if err := ip.timerFiredHook(sendID, rec.target, rec.typ, rec.event); err != nil {
 			ip.hookErr = err
 			ip.running = false
 			return
@@ -745,6 +745,15 @@ func sortedInvokeIDs(m map[Identifier]*runningInvoke) []Identifier {
 func (ip *interpretation) exitInterpreter() {
 	for _, s := range sortDesc(ip.configuration) {
 		ip.exitState(s)
+	}
+	// Pending delayed sends belong to this interpreter's lifetime. Leaving
+	// their callbacks armed after terminal exit retains the whole Instance
+	// until their deadlines and can race a separately restored copy.
+	for id, rec := range ip.pending {
+		delete(ip.pending, id)
+		if rec.stop != nil {
+			rec.stop()
+		}
 	}
 }
 

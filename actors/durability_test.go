@@ -372,6 +372,299 @@ func TestIdleTimeoutPagesOutAndTransparentlyPagesBackIn(t *testing.T) {
 	}
 }
 
+func TestOverdueDelayedSendFiresDuringPageIn(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	clock := statecharts.NewManualClock(time.Unix(0, 0))
+	abortChart := buildInitAbortChart()
+	otherChart := buildFinishingChart()
+
+	sys := NewSystem(
+		WithLog(log), WithSnapshotStore(log),
+		WithClock(clock),
+		WithIdleTimeout(0),
+		WithMaxResident(1),
+	)
+	if err := sys.Register(abortChart); err != nil {
+		t.Fatalf("Register abort chart: %v", err)
+	}
+	if err := sys.Register(otherChart); err != nil {
+		t.Fatalf("Register other chart: %v", err)
+	}
+	if err := sys.Spawn(ctx, "operation-1", abortChart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn operation: %v", err)
+	}
+	if err := sys.Tell(ctx, "operation-1", statecharts.Event{Name: "init", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell init: %v", err)
+	}
+	if inst := testInstanceFor(sys, "operation-1"); inst == nil || !hasStateID(inst.Configuration(), "running") {
+		var cfg []statecharts.Identifier
+		if inst != nil {
+			cfg = inst.Configuration()
+		}
+		t.Fatalf("configuration after init = %v, want 'running'", cfg)
+	}
+
+	// Admitting the only other actor checkpoints and evicts operation-1.
+	if err := sys.Spawn(ctx, "other", otherChart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn other: %v", err)
+	}
+	if testResident(sys, "operation-1") {
+		t.Fatalf("expected operation-1 to be paged out")
+	}
+
+	clock.Advance(5 * time.Second)
+
+	// Page operation-1 back in without delivering another chart event. Its
+	// persisted abort deadline is already past, so hydration itself must
+	// apply the delayed self-send before Spawn returns.
+	if err := sys.Spawn(ctx, "operation-1", abortChart.ID(), Durable()); err != nil {
+		t.Fatalf("page operation back in: %v", err)
+	}
+	inst := testInstanceFor(sys, "operation-1")
+	if inst == nil || !hasStateID(inst.Configuration(), "aborted") {
+		var cfg []statecharts.Identifier
+		if inst != nil {
+			cfg = inst.Configuration()
+		}
+		t.Fatalf("configuration after page-in = %v, want 'aborted'", cfg)
+	}
+	seq, err := log.LastSeq(ctx, "operation-1")
+	if err != nil {
+		t.Fatalf("LastSeq after overdue timer fired: %v", err)
+	}
+	if seq != 2 {
+		t.Fatalf("LastSeq after overdue timer fired = %d, want 2 (init plus timer_fired)", seq)
+	}
+
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+type timerBetweenSnapshotAndSeqLog struct {
+	*sqllog.Log
+	clock *statecharts.ManualClock
+	once  sync.Once
+	fired chan struct{}
+}
+
+func (l *timerBetweenSnapshotAndSeqLog) Append(ctx context.Context, entry statecharts.LogEntry) (uint64, error) {
+	seq, err := l.Log.Append(ctx, entry)
+	if err == nil && entry.Kind == statecharts.KindTimerFired {
+		select {
+		case <-l.fired:
+		default:
+			close(l.fired)
+		}
+	}
+	return seq, err
+}
+
+func (l *timerBetweenSnapshotAndSeqLog) LastSeq(ctx context.Context, sessionID statecharts.SessionID) (uint64, error) {
+	l.once.Do(func() {
+		l.clock.Advance(5 * time.Second)
+		// In the broken implementation LastSeq runs after Snapshot while the
+		// actor is free to process the timer, so wait long enough for its
+		// append to land before returning the sequence. In the fixed
+		// implementation LastSeq runs inside Instance.Checkpoint on the actor
+		// goroutine itself; the timer can enqueue but cannot append until the
+		// checkpoint boundary has committed and stopped the actor.
+		select {
+		case <-l.fired:
+		case <-ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+	return l.Log.LastSeq(ctx, sessionID)
+}
+
+func TestCheckpointCannotClaimTimerFireMissingFromSnapshot(t *testing.T) {
+	ctx := context.Background()
+	baseLog := openTestLog(t)
+	clock := statecharts.NewManualClock(time.Unix(0, 0))
+	log := &timerBetweenSnapshotAndSeqLog{Log: baseLog, clock: clock, fired: make(chan struct{})}
+	abortChart := buildInitAbortChart()
+	otherChart := buildFinishingChart()
+
+	sys := NewSystem(
+		WithLog(log), WithSnapshotStore(log),
+		WithClock(clock), WithIdleTimeout(0), WithMaxResident(1),
+	)
+	if err := sys.Register(abortChart); err != nil {
+		t.Fatalf("Register abort chart: %v", err)
+	}
+	if err := sys.Register(otherChart); err != nil {
+		t.Fatalf("Register other chart: %v", err)
+	}
+	if err := sys.Spawn(ctx, "operation-race", abortChart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn operation: %v", err)
+	}
+	if err := sys.Tell(ctx, "operation-race", statecharts.Event{Name: "init", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell init: %v", err)
+	}
+
+	// LastSeq advances the timer while eviction is checkpointing. The saved
+	// checkpoint must either include both the timer's state change and seq,
+	// or neither; it must never skip the log entry while retaining the timer.
+	if err := sys.Spawn(ctx, "other-race", otherChart.ID(), Durable()); err != nil {
+		t.Fatalf("evict operation: %v", err)
+	}
+	if err := sys.Spawn(ctx, "operation-race", abortChart.ID(), Durable()); err != nil {
+		t.Fatalf("page operation back in: %v", err)
+	}
+	inst := testInstanceFor(sys, "operation-race")
+	if inst == nil || !hasStateID(inst.Configuration(), "aborted") {
+		var cfg []statecharts.Identifier
+		if inst != nil {
+			cfg = inst.Configuration()
+		}
+		t.Fatalf("configuration after page-in = %v, want 'aborted'", cfg)
+	}
+	seq, err := log.LastSeq(ctx, "operation-race")
+	if err != nil {
+		t.Fatalf("LastSeq: %v", err)
+	}
+	if seq != 2 {
+		t.Fatalf("LastSeq after page-in = %d, want 2; a third entry means the checkpoint skipped and re-fired timer_fired", seq)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestLogOnlyRecoveryUsesSystemClockTimestamps(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	liveClock := statecharts.NewManualClock(time.Unix(0, 0))
+	chart := buildInitAbortChart()
+
+	sys1 := NewSystem(
+		WithLog(log), WithSnapshotStore(log),
+		WithClock(liveClock), WithIdleTimeout(0),
+	)
+	if err := sys1.Register(chart); err != nil {
+		t.Fatalf("Register sys1: %v", err)
+	}
+	if err := sys1.Spawn(ctx, "operation-clock", chart.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn sys1: %v", err)
+	}
+	if err := sys1.Tell(ctx, "operation-clock", statecharts.Event{Name: "init", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell init: %v", err)
+	}
+
+	// Simulate a crash: stop the live instance without creating a checkpoint.
+	entry, _ := sys1.resolve("operation-clock")
+	if err := entry.instance.Load().Stop(ctx); err != nil {
+		t.Fatalf("stop crashed instance: %v", err)
+	}
+	entry.instance.Store(nil)
+
+	recoveryClock := statecharts.NewManualClock(time.Unix(5, 0))
+	sys2 := NewSystem(
+		WithLog(log), WithSnapshotStore(log),
+		WithClock(recoveryClock), WithIdleTimeout(0),
+	)
+	if err := sys2.Register(chart); err != nil {
+		t.Fatalf("Register sys2: %v", err)
+	}
+	if err := sys2.Spawn(ctx, "operation-clock", chart.ID(), Durable()); err != nil {
+		t.Fatalf("rehydrate sys2: %v", err)
+	}
+	inst := testInstanceFor(sys2, "operation-clock")
+	if inst == nil || !hasStateID(inst.Configuration(), "aborted") {
+		var cfg []statecharts.Identifier
+		if inst != nil {
+			cfg = inst.Configuration()
+		}
+		t.Fatalf("configuration after log-only recovery = %v, want 'aborted' from the clock-relative overdue timer", cfg)
+	}
+	if err := sys2.Stop(ctx); err != nil {
+		t.Fatalf("Stop sys2: %v", err)
+	}
+}
+
+func TestTimerFireLogPreservesDispatchMetadata(t *testing.T) {
+	ctx := context.Background()
+	log := openTestLog(t)
+	startedAt := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
+	clock := statecharts.NewManualClock(startedAt)
+	sender, err := statecharts.Build(
+		statecharts.Compound("metadata-sender", "idle",
+			statecharts.Children(
+				statecharts.Atomic("idle", statecharts.On("go", statecharts.Then(
+					statecharts.SendEvent("work.abort", statecharts.SendOptions{
+						SendID: "abort-work", Target: "metadata-receiver", Type: "actors", Delay: 2 * time.Second,
+					}),
+				))),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build sender: %v", err)
+	}
+	receiver, err := statecharts.Build(
+		statecharts.Compound("metadata-receiver-chart", "waiting",
+			statecharts.Children(
+				statecharts.Atomic("waiting", statecharts.On("work.abort", statecharts.Target("aborted"))),
+				statecharts.Atomic("aborted"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build receiver: %v", err)
+	}
+
+	sys := NewSystem(WithLog(log), WithSnapshotStore(log), WithClock(clock), WithIdleTimeout(0))
+	if err := sys.Register(sender); err != nil {
+		t.Fatalf("Register sender: %v", err)
+	}
+	if err := sys.Register(receiver); err != nil {
+		t.Fatalf("Register receiver: %v", err)
+	}
+	if err := sys.Spawn(ctx, "metadata-sender", sender.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn sender: %v", err)
+	}
+	if err := sys.Spawn(ctx, "metadata-receiver", receiver.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn receiver: %v", err)
+	}
+	if err := sys.Tell(ctx, "metadata-sender", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell go: %v", err)
+	}
+	clock.Advance(2 * time.Second)
+	waitFor(t, 2*time.Second, func() bool {
+		inst := testInstanceFor(sys, "metadata-receiver")
+		return inst != nil && hasStateID(inst.Configuration(), "aborted")
+	})
+
+	var timerEntry statecharts.LogEntry
+	for entry, err := range log.Read(ctx, "metadata-sender", 1) {
+		if err != nil {
+			t.Fatalf("Read sender log: %v", err)
+		}
+		if entry.Kind == statecharts.KindTimerFired {
+			timerEntry = entry
+		}
+	}
+	if timerEntry.Kind == "" {
+		t.Fatalf("sender log has no timer_fired entry")
+	}
+	if timerEntry.Target != "metadata-receiver" {
+		t.Fatalf("timer_fired Target = %q, want metadata-receiver", timerEntry.Target)
+	}
+	if timerEntry.Type != "actors" {
+		t.Fatalf("timer_fired Type = %q, want actors", timerEntry.Type)
+	}
+	if want := startedAt.Add(2 * time.Second); !timerEntry.Timestamp.Equal(want) {
+		t.Fatalf("timer_fired Timestamp = %s, want configured-clock time %s", timerEntry.Timestamp, want)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestResidencyLimitEvictsLeastRecentlyActive(t *testing.T) {
 	ctx := context.Background()
 	log := openTestLog(t)

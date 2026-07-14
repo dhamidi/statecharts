@@ -23,6 +23,7 @@ var createTableDDL = map[Dialect][]string{
 			ts                TIMESTAMP NOT NULL,
 			entry_send_id     TEXT    NOT NULL DEFAULT '',
 			entry_target      TEXT    NOT NULL DEFAULT '',
+			entry_type        TEXT    NOT NULL DEFAULT '',
 			event_name        TEXT    NOT NULL,
 			event_type        INTEGER NOT NULL,
 			event_send_id     TEXT    NOT NULL DEFAULT '',
@@ -43,15 +44,15 @@ var createTableDDL = map[Dialect][]string{
 
 var insertLogSQL = map[Dialect]string{
 	SQLite: `INSERT INTO statechart_log (
-		session_id, seq, kind, ts, entry_send_id, entry_target,
+		session_id, seq, kind, ts, entry_send_id, entry_target, entry_type,
 		event_name, event_type, event_send_id, event_origin, event_origin_type, event_invoke_id,
 		data_type, data_payload
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 var selectLogSQL = map[Dialect]string{
 	SQLite: `SELECT
-		seq, kind, ts, entry_send_id, entry_target,
+		seq, kind, ts, entry_send_id, entry_target, entry_type,
 		event_name, event_type, event_send_id, event_origin, event_origin_type, event_invoke_id,
 		data_type, data_payload
 	FROM statechart_log WHERE session_id = ? AND seq >= ? ORDER BY seq`,

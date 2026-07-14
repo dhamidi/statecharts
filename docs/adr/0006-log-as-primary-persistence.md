@@ -41,24 +41,32 @@ Seq}` is the pairing type used only by the log-integration flow
 log-free backup/restore use cases that don't need a meaningless
 always-zero `Seq` field.
 
-`Rehydrate` (replay.go) drives cold-start recovery with no special replay
-code path: it loads the latest `Checkpoint` if one exists (to avoid
-replaying from sequence 0 every time), `Restore`s from it, then feeds every
-subsequent `LogEntry.Event` through the exact same `Instance.Send` any live
-caller would use. This works because `Instance.Send` routes onto the
-internal or external queue based on `Event.Type` — the same call handles
-both an explicit external event and a re-delivered timer-fire.
+`Rehydrate` (replay.go) drives cold-start recovery by loading the latest
+`Checkpoint` if one exists (to avoid replaying from sequence 0 every time),
+`Restore`ing from it, then applying each subsequent entry on the Instance's
+own actor goroutine. External entries use the same `Instance.Send` path as a
+live caller. A timer-fire entry instead consumes the recomputed pending send
+by `SendID` and dispatches it without invoking the live timer hook again —
+the fire is already durably represented by that log entry.
 
 Explicit application `Send`s are the application's own responsibility to
 log (`log.Append` before `Instance.Send`, satisfying the write-ahead
 ordering) — there is no wrapper needed since the application already
 controls that call site. Timer-fired events originate inside `Instance`
-itself with no such call site, so `WithTimerFiredHook` (instance.go) gives a
-`Log` implementation a synchronous, on-the-actor's-own-goroutine seam to
-append before the event is allowed to apply (`LoggingTimerFiredHook` in
-log.go is the ready-made adapter). A non-nil error from this hook is
-treated as the `Instance`'s fatal terminal error, since a failed log append
-must not silently let the event through.
+itself with no such call site, so `WithTimerFiredDetailsHook` (instance.go)
+gives a `Log` implementation a synchronous, on-the-actor's-own-goroutine
+seam to append the send ID, target, I/O processor type, and event before the
+event is allowed to apply (`LoggingTimerFiredDetailsHook` in log.go is the
+ready-made adapter).
+A non-nil error from this hook is treated as the `Instance`'s fatal terminal
+error, since a failed log append must not silently let the event through.
+
+An actor-system checkpoint uses `Instance.Checkpoint`, whose persistence
+callback runs while the actor goroutine is paused. Reading `Log.LastSeq` and
+saving `Checkpoint{Snapshot, Seq}` inside that callback makes the pair one
+logical boundary: a timer cannot append after the snapshot was captured but
+before `Seq` was read. A failed callback leaves the same instance running so
+checkpointing remains retryable.
 
 ## Consequences
 
@@ -72,4 +80,8 @@ must not silently let the event through.
   callbacks rebuild it) or serialized separately if needed.
 - `LogEntry.Timestamp` doubles as the "logical now" used during replay to
   recompute `FireAt` for any newly-scheduled delayed send discovered while
-  replaying — replay never consults the real clock.
+  replaying — a non-firing replay clock prevents those timers from elapsing
+  again. Once replay catches up, remaining timers are armed against the live
+  configured `Clock`, and overdue sends fire before `Rehydrate` returns. Live
+  log entries use that same configured clock, not an independent call to the
+  process wall clock.

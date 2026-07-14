@@ -257,6 +257,29 @@ func buildDelayedFinishingChart(delay time.Duration) *statecharts.Chart {
 	return chart
 }
 
+// buildInitAbortChart returns a durable-timer test chart whose "init" event
+// enters running and schedules a two-second self-send to enter aborted.
+func buildInitAbortChart() *statecharts.Chart {
+	chart, err := statecharts.Build(
+		statecharts.Compound("operation", "idle",
+			statecharts.Children(
+				statecharts.Atomic("idle", statecharts.On("init", statecharts.Target("running"),
+					statecharts.Then(statecharts.SendEvent("abort", statecharts.SendOptions{
+						SendID: "abort-operation",
+						Delay:  2 * time.Second,
+					})))),
+				statecharts.Atomic("running", statecharts.On("abort", statecharts.Target("aborted"))),
+				statecharts.Atomic("aborted"),
+			),
+		),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return chart
+}
+
 // buildCommTestChart returns a chart that sends to an unaddressable target
 // on "go" and reacts to the resulting error.communication with an
 // observable state transition, for tests that need to see a dispatch

@@ -32,8 +32,9 @@ type LogEntry struct {
 	Seq       uint64
 	Kind      EntryKind
 
-	// Timestamp is when this entry was durably appended (UTC). It is used
-	// as "now" during replay when recomputing a new pending send's FireAt
+	// Timestamp is the entry's logical append time (UTC), obtained from the
+	// same configured Clock that drives the live Instance. It is used as
+	// "now" during replay when recomputing a new pending send's FireAt
 	// (FireAt = Timestamp + delay) -- replay never consults the real clock.
 	Timestamp time.Time
 
@@ -41,6 +42,7 @@ type LogEntry struct {
 
 	SendID Identifier // KindTimerFired only
 	Target Identifier // KindTimerFired only
+	Type   Identifier // KindTimerFired only; original I/O processor selector
 }
 
 // Log is the primary persistence mechanism for a chart: recording every
@@ -79,14 +81,40 @@ type SnapshotStore interface {
 // for an application to log itself. Explicit application Sends must
 // separately call log.Append(ctx, LogEntry{Kind: KindExternalEvent, ...})
 // before calling Instance.Send; that ordinary call site needs no hook.
-func LoggingTimerFiredHook(log Log, sessionID SessionID) func(Identifier, Event) error {
+func LoggingTimerFiredHook(log Log, sessionID SessionID, clocks ...Clock) func(Identifier, Event) error {
+	clock := Clock(NewRealClock())
+	if len(clocks) > 0 && clocks[0] != nil {
+		clock = clocks[0]
+	}
 	return func(sendID Identifier, ev Event) error {
 		_, err := log.Append(context.Background(), LogEntry{
 			SessionID: sessionID,
 			Kind:      KindTimerFired,
-			Timestamp: time.Now().UTC(),
+			Timestamp: clock.Now().UTC(),
 			Event:     ev,
 			SendID:    sendID,
+		})
+		return err
+	}
+}
+
+// LoggingTimerFiredDetailsHook returns a callback for
+// WithTimerFiredDetailsHook. It persists the original target and I/O
+// processor type as well as the event, and uses clock for the entry's logical
+// timestamp.
+func LoggingTimerFiredDetailsHook(log Log, sessionID SessionID, clock Clock) func(Identifier, Identifier, Identifier, Event) error {
+	if clock == nil {
+		clock = NewRealClock()
+	}
+	return func(sendID, target, typ Identifier, ev Event) error {
+		_, err := log.Append(context.Background(), LogEntry{
+			SessionID: sessionID,
+			Kind:      KindTimerFired,
+			Timestamp: clock.Now().UTC(),
+			Event:     ev,
+			SendID:    sendID,
+			Target:    target,
+			Type:      typ,
 		})
 		return err
 	}

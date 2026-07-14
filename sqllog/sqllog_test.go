@@ -18,6 +18,7 @@ func openTestLog(t *testing.T) *sqllog.Log {
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
+	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { db.Close() })
 
 	log, err := sqllog.New(db, sqllog.SQLite)
@@ -143,6 +144,69 @@ func TestAppendReadRoundTripsEventDataPayload(t *testing.T) {
 	}
 	if decoded.Value.Amount != 42 {
 		t.Fatalf("decoded amount = %d, want 42", decoded.Value.Amount)
+	}
+}
+
+func TestAppendReadRoundTripsTimerDispatchMetadata(t *testing.T) {
+	log := openTestLog(t)
+	ctx := context.Background()
+	_, err := log.Append(ctx, statecharts.LogEntry{
+		SessionID: "timer-metadata", Kind: statecharts.KindTimerFired,
+		Timestamp: time.Unix(10, 0),
+		SendID:    "send-1", Target: "worker-1", Type: "custom-io",
+		Event: statecharts.Event{Name: "work", Type: statecharts.EventExternal},
+	})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	var got statecharts.LogEntry
+	for entry, err := range log.Read(ctx, "timer-metadata", 1) {
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		got = entry
+	}
+	if got.SendID != "send-1" || got.Target != "worker-1" || got.Type != "custom-io" {
+		t.Fatalf("timer metadata = {SendID:%q Target:%q Type:%q}, want send-1/worker-1/custom-io", got.SendID, got.Target, got.Type)
+	}
+}
+
+func TestNewMigratesLegacyLogForTimerType(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
+	_, err = db.Exec(`CREATE TABLE statechart_log (
+		session_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, ts TIMESTAMP NOT NULL,
+		entry_send_id TEXT NOT NULL DEFAULT '', entry_target TEXT NOT NULL DEFAULT '',
+		event_name TEXT NOT NULL, event_type INTEGER NOT NULL, event_send_id TEXT NOT NULL DEFAULT '',
+		event_origin TEXT NOT NULL DEFAULT '', event_origin_type TEXT NOT NULL DEFAULT '',
+		event_invoke_id TEXT NOT NULL DEFAULT '', data_type TEXT NOT NULL DEFAULT '', data_payload BLOB,
+		PRIMARY KEY (session_id, seq)
+	)`)
+	if err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	log, err := sqllog.New(db, sqllog.SQLite)
+	if err != nil {
+		t.Fatalf("New with legacy schema: %v", err)
+	}
+	if _, err := log.Append(context.Background(), statecharts.LogEntry{
+		SessionID: "legacy", Kind: statecharts.KindTimerFired, Timestamp: time.Unix(1, 0),
+		Type: "custom-io", Event: statecharts.Event{Name: "work"},
+	}); err != nil {
+		t.Fatalf("Append after migration: %v", err)
+	}
+	for entry, err := range log.Read(context.Background(), "legacy", 1) {
+		if err != nil {
+			t.Fatalf("Read after migration: %v", err)
+		}
+		if entry.Type != "custom-io" {
+			t.Fatalf("Type after migration = %q, want custom-io", entry.Type)
+		}
 	}
 }
 

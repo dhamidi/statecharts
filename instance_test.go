@@ -552,3 +552,32 @@ func TestInstanceCancelledSendNeverFires(t *testing.T) {
 		t.Fatalf("configuration = %v, want still 'waiting' (send was cancelled)", in.Configuration())
 	}
 }
+
+func TestInstanceStopCancelsAndForgetsPendingSends(t *testing.T) {
+	clock := NewManualClock(time.Unix(0, 0))
+	chart, err := Build(
+		Atomic("waiting", OnEntry(SendEvent("timeout", SendOptions{Delay: 24 * time.Hour}))),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	in := New(chart, nil, WithClock(clock))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := in.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := in.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if len(in.ip.pending) != 0 {
+		t.Fatalf("pending sends after Stop = %d, want 0", len(in.ip.pending))
+	}
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	if len(clock.timers) != 1 || !clock.timers[0].stopped {
+		t.Fatalf("manual timers after Stop = %+v, want the pending timer stopped", clock.timers)
+	}
+}

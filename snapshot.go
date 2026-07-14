@@ -27,13 +27,15 @@ type Snapshot struct {
 	InternalQueue []Event
 	ExternalQueue []Event
 	Running       bool
+	SendSeq       int // high-water mark for auto-generated send.<n> IDs
+	InvokeSeq     int // high-water mark for auto-generated <state>.invoke<n> IDs
 	PendingSends  []PendingSend
 	ActiveInvokes []ActiveInvoke
 }
 
 // PendingSend describes one delayed <send> that has not yet fired or been
-// cancelled. FireAt is absolute so Restore can re-arm a real timer relative
-// to time.Until(FireAt), firing immediately if already overdue.
+// cancelled. FireAt is absolute so a restored Instance can re-arm it against
+// its configured Clock, firing it during Start if it is already overdue.
 type PendingSend struct {
 	SendID Identifier
 	Target Identifier
@@ -57,7 +59,7 @@ type Checkpoint struct {
 	Seq      uint64
 }
 
-const snapshotVersion = 1
+const snapshotVersion = 2
 
 // Snapshot captures this Instance's current state (safely, by running on
 // the interpreter's own goroutine), suitable for persisting and later
@@ -92,6 +94,8 @@ func (in *Instance) buildSnapshot() Snapshot {
 		InternalQueue: append([]Event(nil), ip.internalQueue...),
 		ExternalQueue: append([]Event(nil), ip.externalQueue...),
 		Running:       ip.running,
+		SendSeq:       ip.sendSeq,
+		InvokeSeq:     ip.invokeSeq,
 	}
 	for hs, states := range ip.historyValue {
 		ids := make([]Identifier, len(states))
@@ -132,15 +136,18 @@ func (in *Instance) buildSnapshot() Snapshot {
 // already ran historically). Its session id follows the same precedence as
 // Instance.ID: an explicit WithSessionID, then snap.ID, then the configured
 // IDGenerator. It validates that every state ID mentioned in snap still
-// exists in chart, returning an error on drift. Pending sends are
-// re-armed as real timers relative to time.Until(FireAt) (firing
-// immediately if already overdue). ActiveInvokes are reconstructed as
-// bookkeeping only -- routing a <finalize> or a "#_<invokeid>" send still
-// works, but no invocation goroutine is started; Rehydrate is what decides
-// whether each one gets error.communication or a real InvokeResumeFunc
-// call. The Instance is constructed but not started; call Start to spawn
-// its goroutine.
+// exists in chart, returning an error on drift. Pending sends are rebuilt as
+// inert records, then armed against the configured Clock by Start (or, for
+// Rehydrate, only after log replay catches up); Start fires already-overdue
+// sends before returning. ActiveInvokes are reconstructed as bookkeeping
+// only -- routing a <finalize> or a "#_<invokeid>" send still works, but no
+// invocation goroutine is started; Rehydrate is what decides whether each
+// one gets error.communication or a real InvokeResumeFunc call. The Instance
+// is constructed but not started; call Start to spawn its goroutine.
 func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Instance, error) {
+	if snap.Version != snapshotVersion {
+		return nil, fmt.Errorf("statecharts: restore: unsupported snapshot version %d (want %d)", snap.Version, snapshotVersion)
+	}
 	cfg := defaultInstanceConfig()
 	for _, opt := range opts {
 		opt(&cfg)
@@ -196,6 +203,8 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 	ip.internalQueue = append([]Event(nil), snap.InternalQueue...)
 	ip.externalQueue = append([]Event(nil), snap.ExternalQueue...)
 	ip.running = snap.Running
+	ip.sendSeq = snap.SendSeq
+	ip.invokeSeq = snap.InvokeSeq
 
 	ip.pending = map[Identifier]*pendingSendRecord{}
 	for _, ps := range snap.PendingSends {
@@ -208,11 +217,6 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 			fireAt: ps.FireAt,
 		}
 		ip.pending[sendID] = rec
-		delay := time.Until(ps.FireAt)
-		if delay < 0 {
-			delay = 0
-		}
-		rec.stop = ip.clock.AfterFunc(delay, func() { ip.handleTimerFire(sendID) })
 	}
 
 	// Reconstructed as bookkeeping, not as a running invocation: cancel and
@@ -266,6 +270,8 @@ type snapshotWire struct {
 	InternalQueue []EncodedEvent              `json:"internal_queue,omitempty"`
 	ExternalQueue []EncodedEvent              `json:"external_queue,omitempty"`
 	Running       bool                        `json:"running"`
+	SendSeq       int                         `json:"send_seq,omitempty"`
+	InvokeSeq     int                         `json:"invoke_seq,omitempty"`
 	PendingSends  []pendingSendWire           `json:"pending_sends,omitempty"`
 	ActiveInvokes []ActiveInvoke              `json:"active_invokes,omitempty"`
 }
@@ -286,6 +292,8 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 		Configuration: s.Configuration,
 		HistoryValue:  s.HistoryValue,
 		Running:       s.Running,
+		SendSeq:       s.SendSeq,
+		InvokeSeq:     s.InvokeSeq,
 		ActiveInvokes: s.ActiveInvokes,
 	}
 	for _, ev := range s.InternalQueue {
@@ -325,6 +333,8 @@ func (s *Snapshot) UnmarshalJSON(b []byte) error {
 	s.Configuration = wire.Configuration
 	s.HistoryValue = wire.HistoryValue
 	s.Running = wire.Running
+	s.SendSeq = wire.SendSeq
+	s.InvokeSeq = wire.InvokeSeq
 	s.ActiveInvokes = wire.ActiveInvokes
 
 	s.InternalQueue = nil
