@@ -340,26 +340,70 @@ func (h *uiHTTP) handleSend(w http.ResponseWriter, r *http.Request) {
 // this example's no-build-step approach otherwise (see internal/htmlutil,
 // and the Datastar vendoring above).
 const pageCSS = `
+:root {
+	/* Base text/surface colors. */
+	--color-text: #1a1a1a;
+	--color-text-secondary: #333;
+	--color-text-subtle: #888;
+	--color-bg: #fafafa;
+	--color-surface: #fff;
+	--color-surface-hover: #f3f3f3;
+	--color-border: #e0e0e0;
+	--color-border-input: #ccc;
+	--color-overlay: rgba(0, 0, 0, .35);
+	--color-shadow: rgba(0, 0, 0, .25);
+
+	/* Semantic status colors, each an -fg/-bg pair. --color-success is used
+	   for both the network link's "connected" state and a conversation's
+	   "idle" badge -- deliberately the same color, since both mean "all
+	   good" and never appear together in a way that would confuse the two.
+	   --color-danger, by contrast, is split into a "network" and a
+	   "conversation" variant: LinkActor's own reconnect banner and a
+	   conversation's awaiting-tool badge are both "something's blocked"
+	   reds that CAN be on screen at the same time (banner up top, badge in
+	   the sidebar), so they get distinct hues -- an orange-red for the link
+	   and a magenta-red for the conversation -- rather than the one literal
+	   hex both used to share. */
+	--color-success-bg: #e6f4ea;
+	--color-success-fg: #1e7e34;
+	--color-warning-bg: #fff4e5;
+	--color-warning-fg: #a5600a;
+	--color-info-bg: #eee;
+	--color-info-fg: #666;
+	--color-danger-network-bg: #fde8e8;
+	--color-danger-network-fg: #c0392b;
+	--color-danger-conversation-bg: #fce4ec;
+	--color-danger-conversation-fg: #ad1457;
+
+	/* Accent: the currently-selected conversation link and the user's own
+	   chat bubbles. */
+	--color-accent-bg: #e8f0fe;
+	--color-accent-fg: #1a56db;
+
+	/* One-off surfaces that don't fit a status/accent semantic. */
+	--color-bubble-assistant-bg: #f0f0f0;
+	--color-bubble-tool-bg: #fff8e1;
+}
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
 	margin: 0; display: flex; flex-direction: column;
 	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-	color: #1a1a1a; background: #fafafa;
+	color: var(--color-text); background: var(--color-bg);
 }
-.topbar { flex: none; padding: 8px 16px; background: #fff; border-bottom: 1px solid #e0e0e0; }
+.topbar { flex: none; padding: 8px 16px; background: var(--color-surface); border-bottom: 1px solid var(--color-border); }
 .sidebar-toggle, .dialog-close {
-	padding: 6px 12px; border-radius: 6px; border: 1px solid #ccc; background: #fff;
+	padding: 6px 12px; border-radius: 6px; border: 1px solid var(--color-border-input); background: var(--color-surface);
 	cursor: pointer; font-size: 14px;
 }
-.sidebar-toggle:hover, .dialog-close:hover { background: #f3f3f3; }
+.sidebar-toggle:hover, .dialog-close:hover { background: var(--color-surface-hover); }
 .link-banner {
 	flex: none; padding: 6px 16px; font-size: 12px; font-weight: 600;
 	text-align: center; letter-spacing: .02em;
 }
-.link-connected { background: #e6f4ea; color: #1e7e34; }
-.link-connecting, .link-idle { background: #eee; color: #666; }
-.link-reconnecting { background: #fde8e8; color: #c0392b; animation: pulse 1s ease-in-out infinite; }
+.link-connected { background: var(--color-success-bg); color: var(--color-success-fg); }
+.link-connecting, .link-idle { background: var(--color-info-bg); color: var(--color-info-fg); }
+.link-reconnecting { background: var(--color-danger-network-bg); color: var(--color-danger-network-fg); animation: pulse 1s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
 
 /* The conversation list lives behind .sidebar-toggle, in this native
@@ -370,7 +414,7 @@ body {
    <dialog> element itself, so an open/closed dialog's own state survives
    every sidebar update untouched. */
 .sidebar-dialog {
-	padding: 16px; border: none; border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.25);
+	padding: 16px; border: none; border-radius: 10px; box-shadow: 0 8px 30px var(--color-shadow);
 	width: min(340px, 92vw); max-height: 80vh; margin: auto;
 }
 /* A <dialog> with no "open" attribute is display:none by the UA stylesheet
@@ -378,10 +422,10 @@ body {
    would override that default and the dialog would render permanently
    visible regardless of open/closed state. */
 .sidebar-dialog[open] { display: flex; flex-direction: column; }
-.sidebar-dialog::backdrop { background: rgba(0,0,0,.35); }
+.sidebar-dialog::backdrop { background: var(--color-overlay); }
 .sidebar { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
-.sidebar h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #888; }
-.conv-filter { padding: 7px 9px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 6px; flex: none; }
+.sidebar h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--color-text-subtle); }
+.conv-filter { padding: 7px 9px; margin-bottom: 10px; border: 1px solid var(--color-border-input); border-radius: 6px; flex: none; }
 .sidebar-list { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 /* .placeholder's own rule (below, shared with #message-list) only sets
    vertical padding; give it the same horizontal inset as .conv-link here so
@@ -390,13 +434,13 @@ body {
 .sidebar-list .placeholder { padding: 8px 10px; }
 .conv-link {
 	display: block; padding: 8px 10px; border-radius: 6px; text-decoration: none;
-	color: #333; margin-bottom: 2px; overflow-wrap: anywhere;
+	color: var(--color-text-secondary); margin-bottom: 2px; overflow-wrap: anywhere;
 }
-.conv-link.active { background: #e8f0fe; color: #1a56db; font-weight: 600; }
+.conv-link.active { background: var(--color-accent-bg); color: var(--color-accent-fg); font-weight: 600; }
 .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; margin-left: 4px; white-space: nowrap; }
-.badge-idle { background: #e6f4ea; color: #1e7e34; }
-.badge-thinking { background: #fff4e5; color: #a5600a; }
-.badge-awaiting_tool { background: #fde8e8; color: #c0392b; }
+.badge-idle { background: var(--color-success-bg); color: var(--color-success-fg); }
+.badge-thinking { background: var(--color-warning-bg); color: var(--color-warning-fg); }
+.badge-awaiting_tool { background: var(--color-danger-conversation-bg); color: var(--color-danger-conversation-fg); }
 .new-form { margin-top: 12px; display: flex; gap: 4px; flex: none; }
 .new-form input { flex: 1; min-width: 0; padding: 6px; }
 .dialog-close { margin-top: 12px; flex: none; align-self: flex-end; }
@@ -412,18 +456,18 @@ body {
    older flat list of bubbles-then-form as direct children of #main. */
 .main { flex: 1; min-height: 0; max-width: 800px; margin: 0 auto; width: 100%; display: flex; flex-direction: column; }
 #message-list { flex: 1; min-height: 0; overflow-y: auto; overflow-wrap: break-word; padding: 20px 24px; }
-.placeholder { color: #888; padding: 8px 0; }
+.placeholder { color: var(--color-text-subtle); padding: 8px 0; }
 .bubble { margin: 8px 0; padding: 8px 12px; border-radius: 10px; overflow-wrap: break-word; white-space: pre-wrap; }
 .bubble-role { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; opacity: .6; display: block; margin-bottom: 2px; }
-.bubble-user { background: #e8f0fe; }
-.bubble-assistant { background: #f0f0f0; }
-.bubble-tool { background: #fff8e1; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
-.bubble-thinking { color: #888; font-style: italic; background: transparent; padding-left: 0; }
-.bubble-toolcall { background: #fff4e5; color: #a5600a; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+.bubble-user { background: var(--color-accent-bg); }
+.bubble-assistant { background: var(--color-bubble-assistant-bg); }
+.bubble-tool { background: var(--color-bubble-tool-bg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+.bubble-thinking { color: var(--color-text-subtle); font-style: italic; background: transparent; padding-left: 0; }
+.bubble-toolcall { background: var(--color-warning-bg); color: var(--color-warning-fg); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
 /* flex: none (not a scrolling flow child of #message-list) plus its own
    background + border-top is what keeps the composer legible and pinned
    below the transcript instead of scrolling away with it. */
-.send-form { flex: none; display: flex; gap: 6px; padding: 12px 24px 18px; border-top: 1px solid #e0e0e0; background: #fafafa; }
+.send-form { flex: none; display: flex; gap: 6px; padding: 12px 24px 18px; border-top: 1px solid var(--color-border); background: var(--color-bg); }
 .send-form input[type=text] { flex: 1; min-width: 0; padding: 8px; }
 button { cursor: pointer; }
 
