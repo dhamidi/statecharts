@@ -16,9 +16,20 @@ durable actors.
 Run those commands in three terminals, then open the server in a browser. Its
 main UI shows all seven counters, labels each `resident` or `paged out`, and
 increments a counter when its card is selected. Activating a fourth color
-visibly evicts one of the previous three while all seven remain addressable.
-The UI is server-rendered and live-patched over SSE. Its vendored Datastar
-bundle is embedded in the binary, so it has no browser-time CDN dependency.
+shows the actor as `hydrating` while its durable log is replayed, then visibly
+evicts one of the previous three while all seven remain addressable. The count
+changes only after that increment has entered the durable log and reached the
+server projection. The UI is server-rendered and live-patched over SSE. Its
+vendored Datastar bundle is embedded in the binary, so it has no browser-time
+CDN dependency.
+
+The server runs durable counters in a `counters` actor system and the
+projection hub plus one ephemeral actor per SSE connection in an isolated
+`ui` system. Counter projections reach the hub through an `actors.Bridge`;
+the hub actively sends snapshots to the connection actors; and connection
+actors emit bytes through the custom `"sse"` IOProcessor type. HTTP handlers
+only attach and drain transport channels rather than reading shared actor
+state to manufacture updates.
 
 Positional color names select the counters exercised by `writer` or observed
 by `reader`; omitting them selects all seven. The writer terminal shows

@@ -55,17 +55,15 @@ func actorRouteFrom(ctx context.Context) (actorRouteContext, bool) {
 // (self) and the System, and is the only mechanism through which a chart
 // running inside a System can address another actor by name.
 //
-// Send resolves only whether the target name is known to sys, which is
-// cheap and synchronous; an unknown name is returned as an ordinary error,
-// which the interpreter core turns into an error.communication event on
-// the sender's own queue automatically -- unless sys has a fallback
-// configured (see WithFallback), in which case the request is handed to it
-// instead of failing outright. Actually acquiring the target -- paging it
-// in if necessary, possibly evicting another resident actor first to stay
-// within the residency limit -- and delivering the event is handed off to
-// the System's ordered dispatcher, so Send never blocks on the target's own
-// processing. Two actors sending to each other at the same instant would
-// otherwise be able to deadlock each other's Send call.
+// Send routes the SCXML and "actors" processor types by actor name. A
+// different processor type selects the configured fallback directly; for a
+// locally routed type, an unknown actor name also falls back before failing.
+// Actually acquiring a local target -- paging it in if necessary, possibly
+// evicting another resident actor first to stay within the residency limit --
+// and delivering the event is handed off to the System's ordered dispatcher,
+// so Send never blocks on the target's own processing. Two actors sending to
+// each other at the same instant would otherwise be able to deadlock each
+// other's Send call.
 type routingProcessor struct {
 	sys  *System
 	self statecharts.Identifier
@@ -89,23 +87,26 @@ func (p *routingProcessor) Attach(d statecharts.Dispatcher) {
 // Send implements statecharts.IOProcessor. See routingProcessor's own doc
 // comment for the synchronous/asynchronous split this relies on.
 func (p *routingProcessor) Send(ctx context.Context, req statecharts.SendRequest) error {
-	if req.Type != statecharts.SCXMLEventProcessor && req.Type != originTypeActors {
-		return unsupportedPeerTypeError{typ: req.Type}
-	}
+	localType := req.Type == statecharts.SCXMLEventProcessor || req.Type == originTypeActors
 	_, target, ok := p.sys.resolveTarget(req.Target)
-	if !ok {
-		if p.sys.cfg.fallback == nil {
+	if !localType || !ok {
+		if p.sys.cfg.fallback != nil {
+			// self rides along on ctx, not on req: SendRequest has no field for
+			// who is calling (an IOProcessor is shared machinery with no notion
+			// of "which actor" built into its own signature), and a fallback is
+			// one value shared by every actor in sys, so there is nowhere else
+			// to attach it without racing concurrent Send calls from different
+			// actors against each other. actorRouteFrom recovers it.
+			return p.sys.cfg.fallback.Send(withActorOrigin(ctx, actorRouteContext{
+				address: p.self, system: p.sys, dispatcher: p.disp, sendID: req.SendID,
+			}), req)
+		}
+		if !localType {
+			return unsupportedPeerTypeError{typ: req.Type}
+		}
+		if !ok {
 			return fmt.Errorf("actors: unknown actor %q", req.Target)
 		}
-		// self rides along on ctx, not on req: SendRequest has no field for
-		// who is calling (an IOProcessor is shared machinery with no notion
-		// of "which actor" built into its own signature), and a fallback is
-		// one value shared by every actor in sys, so there is nowhere else
-		// to attach it without racing concurrent Send calls from different
-		// actors against each other. actorOriginFrom recovers it.
-		return p.sys.cfg.fallback.Send(withActorOrigin(ctx, actorRouteContext{
-			address: p.self, system: p.sys, dispatcher: p.disp, sendID: req.SendID,
-		}), req)
 	}
 
 	ev := statecharts.Event{
@@ -142,10 +143,15 @@ func (p *routingProcessor) Cancel(ctx context.Context, sendID statecharts.Identi
 
 // IOProcessors implements statecharts.IOProcessorDescriber. self is the
 // actor's routable ID@node key when the System has a node name, or its local
-// actor ID otherwise.
+// actor ID otherwise. Any processors advertised by the fallback remain
+// visible through the System's routing composite.
 func (p *routingProcessor) IOProcessors() []statecharts.IOProcessorInfo {
-	return []statecharts.IOProcessorInfo{
+	infos := []statecharts.IOProcessorInfo{
 		{Type: originTypeActors, Location: statecharts.LocationFromIdentifier(p.self)},
 		{Type: statecharts.SCXMLEventProcessor, Location: statecharts.LocationFromIdentifier(p.self)},
 	}
+	if describer, ok := p.sys.cfg.fallback.(statecharts.IOProcessorDescriber); ok {
+		infos = append(infos, describer.IOProcessors()...)
+	}
+	return infos
 }

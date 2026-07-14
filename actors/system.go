@@ -25,6 +25,7 @@ type systemConfig struct {
 	clock          statecharts.Clock
 	logger         statecharts.Logger
 	onSweepError   func(name statecharts.Identifier, err error)
+	onResidency    func(ResidencyChange)
 	fallback       statecharts.IOProcessor
 }
 
@@ -33,6 +34,23 @@ type systemConfig struct {
 // "accounts.invoice-42") and use the same validation and comparison APIs.
 // A node name is not part of an ActorID; routing appends it with "@".
 type ActorID = statecharts.Identifier
+
+// ResidencyState describes whether an actor is loaded, being reconstructed,
+// or available only from durable storage.
+type ResidencyState string
+
+const (
+	ResidencyPagedOut  ResidencyState = "paged out"
+	ResidencyHydrating ResidencyState = "hydrating"
+	ResidencyResident  ResidencyState = "resident"
+)
+
+// ResidencyChange is emitted when an actor crosses a residency lifecycle
+// boundary. ActorID is the stable identity and never includes a node suffix.
+type ResidencyChange struct {
+	ActorID ActorID
+	State   ResidencyState
+}
 
 // WithNodeName sets this System's routing location. An actor with ID
 // "accounts.invoice-42" on node "host-a" has routing key
@@ -84,6 +102,15 @@ func WithMaxResident(n int) Option {
 	return WithResidencyLimit(func(resident int) bool { return resident >= n })
 }
 
+// WithResidencyObserver registers a synchronous observer for actor residency
+// transitions. A paged-in actor reports hydrating before replay begins and
+// resident after its Instance is ready; eviction reports paged out. The
+// callback must return promptly and must not call methods that activate,
+// evict, or stop actors in this System.
+func WithResidencyObserver(fn func(ResidencyChange)) Option {
+	return func(c *systemConfig) { c.onResidency = fn }
+}
+
 // WithDispatchLimit bounds the number of accepted peer deliveries waiting
 // for the System's ordered dispatcher. IOProcessor.Send never blocks; once
 // the queue is full it returns an error.communication to the sender instead
@@ -120,12 +147,12 @@ func WithOnSweepError(fn func(name statecharts.Identifier, err error)) Option {
 	return func(c *systemConfig) { c.onSweepError = fn }
 }
 
-// WithFallback gives a System an IOProcessor to try for a Send target that
-// isn't a name the System itself has spawned. A name the System already
-// knows -- resident or not -- is always resolved locally first; the
-// fallback is only consulted once that lookup misses, and only for that one
-// Send call. Without WithFallback, a Send to an unrecognized name is an
-// ordinary "unknown actor" error, exactly as if no fallback existed.
+// WithFallback adds an IOProcessor behind the System's actor router. A Send
+// with a custom processor type is routed directly to it. For the SCXML and
+// "actors" types, a name the System already knows -- resident or not -- is
+// resolved locally first and the fallback is consulted only when lookup
+// misses. Without WithFallback, a custom type is unsupported and an
+// unrecognized actor name is an ordinary "unknown actor" error.
 //
 // This is what lets two independent Systems address each other: an actor in
 // one addresses a name that belongs to the other, the local System's own
@@ -458,7 +485,7 @@ func (s *System) IsResident(target statecharts.Identifier) bool {
 // still-in-flight activation: either this check observes stopped and
 // refuses, or it doesn't and Stop's per-entry lock acquisition blocks
 // until activation finishes and then finds (and stops) the result.
-func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
+func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err error) {
 	if entry.instance.Load() != nil {
 		return nil
 	}
@@ -473,6 +500,12 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 	if s.stopped.Load() {
 		return fmt.Errorf("actors: activate %q: %w", entry.name, ErrSystemStopped)
 	}
+	s.notifyResidency(entry, ResidencyHydrating)
+	defer func() {
+		if err != nil {
+			s.notifyResidency(entry, ResidencyPagedOut)
+		}
+	}()
 	if err := s.admit(ctx, entry); err != nil {
 		return err
 	}
@@ -502,7 +535,6 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 	}
 
 	var inst *statecharts.Instance
-	var err error
 	if entry.durable {
 		// WithTimerFiredDetailsHook write-ahead-logs a chart's own internally
 		// delayed <send>s the moment their timer fires
@@ -562,7 +594,14 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) error {
 
 	entry.instance.Store(inst)
 	entry.lastActive.Store(s.cfg.clock.Now().UnixNano())
+	s.notifyResidency(entry, ResidencyResident)
 	return nil
+}
+
+func (s *System) notifyResidency(entry *actorEntry, state ResidencyState) {
+	if s.cfg.onResidency != nil {
+		s.cfg.onResidency(ResidencyChange{ActorID: entry.name, State: state})
+	}
 }
 
 // admit makes room for one more resident actor, if the configured residency
@@ -719,6 +758,7 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 	if instanceFinished(inst) {
 		_ = inst.Stop(ctx)
 		entry.instance.Store(nil)
+		s.notifyResidency(entry, ResidencyPagedOut)
 		return nil
 	}
 	err := inst.Checkpoint(ctx, func(snap statecharts.Snapshot) error {
@@ -736,6 +776,7 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 		return fmt.Errorf("actors: checkpoint %q: %w", entry.name, err)
 	}
 	entry.instance.Store(nil)
+	s.notifyResidency(entry, ResidencyPagedOut)
 	return nil
 }
 
@@ -1075,6 +1116,7 @@ func (s *System) Stop(ctx context.Context) error {
 				// gone, and nothing would ever try to stop it again.
 				if err == nil {
 					e.instance.Store(nil)
+					s.notifyResidency(e, ResidencyPagedOut)
 				}
 			}
 			recordErr(err)

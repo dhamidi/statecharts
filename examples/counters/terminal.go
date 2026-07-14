@@ -175,9 +175,12 @@ func readerTerminalFrame(status string, selected []string, projections []project
 			fmt.Fprintf(&b, "%-10s %12s  waiting\n", color, "—")
 			continue
 		}
-		residency := "paged out"
-		if p.Resident {
-			residency = "resident"
+		residency := p.ActorState
+		if residency == "" {
+			residency = actorStatePagedOut
+			if p.Resident {
+				residency = actorStateResident
+			}
 		}
 		fmt.Fprintf(&b, "%-10s %12d  %s\n", color, p.Value, residency)
 	}

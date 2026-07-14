@@ -1,11 +1,13 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"sync"
+	"time"
 
 	"github.com/dhamidi/statecharts"
+	"github.com/dhamidi/statecharts/actors"
 )
 
 var colors = []string{"red", "orange", "yellow", "green", "blue", "indigo", "violet"}
@@ -62,15 +64,22 @@ func incrementEvent(writeID statecharts.Identifier) statecharts.Event {
 }
 
 type projection struct {
-	Name     string `json:"name"`
-	Color    string `json:"color"`
-	Value    int    `json:"value"`
-	Resident bool   `json:"resident"`
+	Name       string `json:"name"`
+	Color      string `json:"color"`
+	Value      int    `json:"value"`
+	Resident   bool   `json:"resident"`
+	ActorState string `json:"actor_state"`
 }
+
+const (
+	actorStateResident  = string(actors.ResidencyResident)
+	actorStatePagedOut  = string(actors.ResidencyPagedOut)
+	actorStateHydrating = string(actors.ResidencyHydrating)
+)
 
 func buildCounterChart() (*statecharts.Chart, error) {
 	publish := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
-		ec.Send("projection", statecharts.SendOptions{Target: "hub", Data: projection{Name: ec.SessionID(), Color: ec.SessionID(), Value: d.Value}})
+		ec.Send("projection", statecharts.SendOptions{Target: "hub@ui", Data: projection{Name: ec.SessionID(), Color: ec.SessionID(), Value: d.Value}})
 		return nil
 	})
 	increment := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
@@ -99,67 +108,139 @@ func buildCounterChart() (*statecharts.Chart, error) {
 		statecharts.WithNewDatamodel(func() any { return &counterModel{Processed: make(map[statecharts.Identifier]bool)} }))
 }
 
-type projectionHub struct {
-	mu     sync.RWMutex
-	values map[string]projection
-	subs   map[chan struct{}]struct{}
+const hubKind statecharts.Identifier = "projection-hub"
+const streamKind statecharts.Identifier = "sse-connection"
+const streamIOProcessor statecharts.Identifier = "sse"
+
+type hubModel struct {
+	Values      map[string]projection
+	Residencies map[string]string
+	Subscribers map[statecharts.Identifier][]string
+}
+type hubSubscription struct {
+	Target statecharts.Identifier
+	Colors []string
+}
+type hubQuery struct {
+	Colors []string
+	Reply  chan []projection
 }
 
-func newProjectionHub() *projectionHub {
-	return &projectionHub{values: make(map[string]projection), subs: make(map[chan struct{}]struct{})}
-}
-func (h *projectionHub) Attach(statecharts.Dispatcher)                        {}
-func (h *projectionHub) Cancel(context.Context, statecharts.Identifier) error { return nil }
-func (h *projectionHub) Send(ctx context.Context, req statecharts.SendRequest) error {
-	if req.Target != "hub" {
-		return fmt.Errorf("counters: unsupported target %q", req.Target)
-	}
-	p, ok := req.Data.(projection)
-	if !ok {
-		return fmt.Errorf("counters: invalid hub payload %T", req.Data)
-	}
-	if err := ctx.Err(); err != nil {
-		return ctx.Err()
-	}
-	h.mu.Lock()
-	h.values[p.Name] = p
-	for ch := range h.subs {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	}
-	h.mu.Unlock()
-	return nil
-}
-func (h *projectionHub) snapshot(n int) []projection {
-	return h.snapshotColors(colors[:n])
-}
-func (h *projectionHub) snapshotColors(selected []string) []projection {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+func hubSnapshot(d *hubModel, selected []string) []projection {
 	out := make([]projection, 0, len(selected))
 	for _, name := range selected {
-		if p, ok := h.values[name]; ok {
+		if p, ok := d.Values[name]; ok {
+			p.ActorState = d.Residencies[name]
+			if p.ActorState == "" {
+				p.ActorState = actorStatePagedOut
+			}
+			p.Resident = p.ActorState == actorStateResident
 			out = append(out, p)
 		}
 	}
 	return out
 }
-func (h *projectionHub) subscribe() (chan struct{}, func()) {
-	ch := make(chan struct{}, 1)
-	h.mu.Lock()
-	h.subs[ch] = struct{}{}
-	h.mu.Unlock()
-	return ch, func() { h.mu.Lock(); delete(h.subs, ch); h.mu.Unlock() }
-}
-func (h *projectionHub) changed() {
-	h.mu.Lock()
-	for ch := range h.subs {
-		select {
-		case ch <- struct{}{}:
-		default:
+
+func buildHubChart() (*statecharts.Chart, error) {
+	notify := func(d *hubModel, ec statecharts.ExecContext) {
+		for target, selected := range d.Subscribers {
+			ec.Send("snapshot", statecharts.SendOptions{Target: target, Data: hubSnapshot(d, selected)})
 		}
 	}
-	h.mu.Unlock()
+	return statecharts.Build(statecharts.Atomic(hubKind,
+		statecharts.On("projection", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
+			ev, _ := ec.Event()
+			p, ok := ev.Data.(projection)
+			if !ok {
+				return fmt.Errorf("projection payload %T", ev.Data)
+			}
+			d.Values[p.Name] = p
+			notify(d, ec)
+			return nil
+		}))),
+		statecharts.On("residency", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
+			ev, _ := ec.Event()
+			change, ok := ev.Data.(actors.ResidencyChange)
+			if !ok {
+				return fmt.Errorf("residency payload %T", ev.Data)
+			}
+			d.Residencies[string(change.ActorID)] = string(change.State)
+			notify(d, ec)
+			return nil
+		}))),
+		statecharts.On("subscribe", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
+			ev, _ := ec.Event()
+			sub := ev.Data.(hubSubscription)
+			d.Subscribers[sub.Target] = append([]string(nil), sub.Colors...)
+			ec.Send("snapshot", statecharts.SendOptions{Target: sub.Target, Data: hubSnapshot(d, sub.Colors)})
+			return nil
+		}))),
+		statecharts.On("unsubscribe", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
+			ev, _ := ec.Event()
+			delete(d.Subscribers, ev.Data.(statecharts.Identifier))
+			return nil
+		}))),
+		statecharts.On("query", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
+			ev, _ := ec.Event()
+			q := ev.Data.(hubQuery)
+			q.Reply <- hubSnapshot(d, q.Colors)
+			return nil
+		}))),
+	), statecharts.WithNewDatamodel(func() any {
+		return &hubModel{Values: map[string]projection{}, Residencies: map[string]string{}, Subscribers: map[statecharts.Identifier][]string{}}
+	}))
+}
+
+type streamStart struct {
+	Mode   string
+	Colors []string
+	Output statecharts.Identifier
+}
+type streamModel struct {
+	Mode   string
+	Colors []string
+	Output statecharts.Identifier
+	Last   []byte
+}
+
+func buildStreamChart() (*statecharts.Chart, error) {
+	start := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		s := ev.Data.(streamStart)
+		d.Mode, d.Colors, d.Output = s.Mode, s.Colors, s.Output
+		ec.Send("subscribe", statecharts.SendOptions{Target: "hub", Data: hubSubscription{Target: statecharts.Identifier(ec.SessionID()), Colors: s.Colors}})
+		ec.Send("keepalive", statecharts.SendOptions{Delay: 15 * time.Second})
+		return nil
+	})
+	emit := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		ps := ev.Data.([]projection)
+		var frame []byte
+		if d.Mode == "browser" {
+			frame = []byte(datastarPatch(renderString(renderDashboard("online", ps))))
+		} else {
+			b, _ := json.Marshal(ps)
+			frame = []byte("event: snapshot\ndata: " + string(b) + "\n\n")
+		}
+		if bytes.Equal(frame, d.Last) {
+			return nil
+		}
+		d.Last = append(d.Last[:0], frame...)
+		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: frame})
+		return nil
+	})
+	keepalive := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
+		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: ": keepalive\n\n"})
+		ec.Send("keepalive", statecharts.SendOptions{Delay: 15 * time.Second})
+		return nil
+	})
+	closeStream := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
+		ec.Send("unsubscribe", statecharts.SendOptions{Target: "hub", Data: statecharts.Identifier(ec.SessionID())})
+		return nil
+	})
+	return statecharts.Build(statecharts.Compound(streamKind, "open", statecharts.Children(
+		statecharts.Atomic("open", statecharts.On("start", statecharts.Then(start)), statecharts.On("snapshot", statecharts.Then(emit)), statecharts.On("keepalive", statecharts.Then(keepalive)), statecharts.On("close", statecharts.Target("closed"), statecharts.Then(closeStream))),
+		statecharts.Final("closed"),
+	),
+	), statecharts.WithNewDatamodel(func() any { return &streamModel{} }))
 }

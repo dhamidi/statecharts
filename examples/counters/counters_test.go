@@ -15,18 +15,27 @@ import (
 	"github.com/dhamidi/statecharts"
 )
 
-func waitValue(t *testing.T, h *projectionHub, name string, want int) {
+func mustQuery(t *testing.T, rt *counterRuntime, selected []string) []projection {
+	t.Helper()
+	ps, err := rt.query(context.Background(), selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ps
+}
+
+func waitValue(t *testing.T, rt *counterRuntime, name string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, p := range h.snapshot(7) {
+		for _, p := range mustQuery(t, rt, colors) {
 			if p.Name == name && p.Value == want {
 				return
 			}
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("%s never reached %d: %#v", name, want, h.snapshot(7))
+	t.Fatalf("%s never reached %d: %#v", name, want, mustQuery(t, rt, colors))
 }
 
 func TestDurableIdempotenceAndRecovery(t *testing.T) {
@@ -36,8 +45,8 @@ func TestDurableIdempotenceAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hub1 := newProjectionHub()
-	sys1, err := setupCounters(ctx1, store1, hub1)
+	rt1, err := setupCounters(ctx1, store1)
+	sys1 := rt1.counters
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +55,7 @@ func TestDurableIdempotenceAndRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	waitValue(t, hub1, "red", 1)
+	waitValue(t, rt1, "red", 1)
 	if err := sys1.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -60,17 +69,17 @@ func TestDurableIdempotenceAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db2.Close()
-	hub2 := newProjectionHub()
-	sys2, err := setupCounters(ctx2, store2, hub2)
+	rt2, err := setupCounters(ctx2, store2)
+	sys2 := rt2.counters
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sys2.Stop(context.Background())
-	waitValue(t, hub2, "red", 1)
+	defer rt2.stop(context.Background())
+	waitValue(t, rt2, "red", 1)
 	if err := sys2.Tell(ctx2, "red", incrementEvent("same-write")); err != nil {
 		t.Fatal(err)
 	}
-	waitValue(t, hub2, "red", 1)
+	waitValue(t, rt2, "red", 1)
 }
 
 func TestFourthActivationUpdatesResidencyProjection(t *testing.T) {
@@ -81,21 +90,20 @@ func TestFourthActivationUpdatesResidencyProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	hub := newProjectionHub()
-	sys, err := setupCounters(ctx, store, hub)
+	rt, err := setupCounters(ctx, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sys.Stop(context.Background())
+	defer rt.stop(context.Background())
 
-	before := residentSnapshot(sys, hub.snapshot(7))
+	before := mustQuery(t, rt, colors)
 	if got := residentCount(before); got != 3 {
 		t.Fatalf("initial resident count = %d, want 3: %#v", got, before)
 	}
-	if err := sys.Tell(ctx, "red", incrementEvent("activate-red")); err != nil {
+	if err := rt.counters.Tell(ctx, "red", incrementEvent("activate-red")); err != nil {
 		t.Fatal(err)
 	}
-	after := residentSnapshot(sys, hub.snapshot(7))
+	after := mustQuery(t, rt, colors)
 	if got := residentCount(after); got != 3 {
 		t.Fatalf("resident count after fourth activation = %d, want 3: %#v", got, after)
 	}
@@ -169,7 +177,7 @@ func TestSnapshotParserAndRendering(t *testing.T) {
 
 func TestServerPageStartsDatastarEventStreamAndCountersAreClickable(t *testing.T) {
 	recorder := httptest.NewRecorder()
-	pageHandler(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	pageHandler(func() []projection { return nil })(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	page := recorder.Body.String()
 
 	if recorder.Header().Get("Content-Type") != "text/html; charset=utf-8" {
@@ -178,8 +186,11 @@ func TestServerPageStartsDatastarEventStreamAndCountersAreClickable(t *testing.T
 	if !strings.Contains(page, `src="/datastar.js"`) || strings.Contains(page, "cdn.jsdelivr") || len(datastarJS) == 0 {
 		t.Fatalf("page does not load the Datastar v1.0.2 browser bundle: %s", page)
 	}
-	if !strings.Contains(page, `data-init="@get(&#39;/ui/events&#39;)"`) {
+	if !strings.Contains(page, `data-init="@get(&#39;/ui/events&#39;,`) {
 		t.Fatalf("page does not start its Datastar event stream: %s", page)
+	}
+	if !strings.Contains(page, "retryMaxCount") {
+		t.Fatalf("page event stream does not keep retrying after an outage: %s", page)
 	}
 	if strings.Contains(page, `\"`) {
 		t.Fatalf("page contains backslash-escaped HTML attributes: %s", page)
@@ -187,6 +198,14 @@ func TestServerPageStartsDatastarEventStreamAndCountersAreClickable(t *testing.T
 	card := renderString(renderCounterBox(projection{Name: "red", Color: "red", Value: 12, Resident: true}))
 	if !strings.Contains(card, `<button`) || !strings.Contains(card, `data-on:click="@post(&#39;/counters/red/increment&#39;)"`) {
 		t.Fatalf("counter is not an increment control: %s", card)
+	}
+	pagedOut := renderString(renderCounterBox(projection{Name: "blue", Color: "blue", Value: 9}))
+	if !strings.Contains(pagedOut, "is-hydrating") || strings.Contains(pagedOut, "querySelector(&#39;data&#39;)") {
+		t.Fatalf("paged-out tap must show hydration without changing the projected count: %s", pagedOut)
+	}
+	hydrating := renderString(renderCounterBox(projection{Name: "blue", Color: "blue", Value: 9, ActorState: actorStateHydrating}))
+	if !strings.Contains(hydrating, `class="counter is-hydrating"`) || !strings.Contains(hydrating, `>hydrating</span>`) || !strings.Contains(hydrating, `>9</data>`) {
+		t.Fatalf("hydrating actor state is not rendered independently of its durable count: %s", hydrating)
 	}
 }
 
@@ -198,20 +217,38 @@ func TestServerUIIncrementEndpointUpdatesCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	hub := newProjectionHub()
-	sys, err := setupCounters(ctx, store, hub)
+	rt, err := setupCounters(ctx, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sys.Stop(context.Background())
-	before := projectionFor(t, hub.snapshot(7), "red").Value
+	defer rt.stop(context.Background())
+	before := projectionFor(t, mustQuery(t, rt, colors), "red").Value
+	server := counterHandler(rt)
+
+	page := httptest.NewRecorder()
+	server.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got := strings.Count(page.Body.String(), "<button"); got != len(colors) {
+		t.Fatalf("server-rendered counter cards = %d, want %d: %s", got, len(colors), page.Body.String())
+	}
 
 	recorder := httptest.NewRecorder()
-	counterHandler(sys, hub).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/counters/red/increment", nil))
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/counters/red/increment", nil))
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("increment status = %d, body %q", recorder.Code, recorder.Body.String())
 	}
-	waitValue(t, hub, "red", before+1)
+	waitValue(t, rt, "red", before+1)
+
+	datastarRequest := httptest.NewRequest(http.MethodPost, "/counters/red/increment", nil)
+	datastarRequest.Header.Set("Datastar-Request", "true")
+	datastarResponse := httptest.NewRecorder()
+	server.ServeHTTP(datastarResponse, datastarRequest)
+	if datastarResponse.Code != http.StatusOK || datastarResponse.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("Datastar increment response = %d %q, want 200 text/html", datastarResponse.Code, datastarResponse.Header().Get("Content-Type"))
+	}
+	if body := datastarResponse.Body.String(); !strings.Contains(body, `id="dashboard"`) || !strings.Contains(body, fmt.Sprintf(">%d</data>", before+2)) {
+		t.Fatalf("Datastar increment response does not contain the updated dashboard: %s", body)
+	}
+	waitValue(t, rt, "red", before+2)
 }
 
 func TestEventStreamColorSelection(t *testing.T) {
@@ -233,13 +270,12 @@ func TestEventStreamDoesNotRepeatUnchangedSelectedCounters(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	hub := newProjectionHub()
-	sys, err := setupCounters(ctx, store, hub)
+	rt, err := setupCounters(ctx, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sys.Stop(context.Background())
-	server := httptest.NewServer(counterHandler(sys, hub))
+	defer rt.stop(context.Background())
+	server := httptest.NewServer(counterHandler(rt))
 	defer server.Close()
 
 	streamCtx, stopStream := context.WithCancel(ctx)
@@ -264,9 +300,11 @@ func TestEventStreamDoesNotRepeatUnchangedSelectedCounters(t *testing.T) {
 		}
 	}
 
-	red := projectionFor(t, hub.snapshot(7), "red")
-	red.Value++
-	if err := hub.Send(ctx, statecharts.SendRequest{Target: "hub", Data: red}); err != nil {
+	// This projection can only reach hub@ui through the counter System's
+	// Bridge; the HTTP/service side never writes hub projection state.
+	// Indigo is among the initially resident actors, so this changes no blue
+	// value or residency state.
+	if err := rt.counters.Tell(ctx, "indigo", incrementEvent("unrelated-indigo")); err != nil {
 		t.Fatal(err)
 	}
 	read := make(chan string, 1)

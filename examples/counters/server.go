@@ -1,18 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dhamidi/statecharts"
@@ -38,51 +37,129 @@ func openLog(path string) (*sqllog.Log, *sql.DB, error) {
 	return l, db, nil
 }
 
-func setupCounters(ctx context.Context, store *sqllog.Log, hub *projectionHub) (*actors.System, error) {
+type streamTransport struct {
+	mu      sync.RWMutex
+	outputs map[statecharts.Identifier]chan []byte
+}
+
+func newStreamTransport() *streamTransport {
+	return &streamTransport{outputs: map[statecharts.Identifier]chan []byte{}}
+}
+func (t *streamTransport) Attach(statecharts.Dispatcher)                        {}
+func (t *streamTransport) Cancel(context.Context, statecharts.Identifier) error { return nil }
+func (t *streamTransport) register(id statecharts.Identifier) <-chan []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ch := make(chan []byte, 32)
+	t.outputs[id] = ch
+	return ch
+}
+func (t *streamTransport) unregister(id statecharts.Identifier) {
+	t.mu.Lock()
+	delete(t.outputs, id)
+	t.mu.Unlock()
+}
+func (t *streamTransport) Send(ctx context.Context, req statecharts.SendRequest) error {
+	if req.Type != streamIOProcessor {
+		return fmt.Errorf("unsupported UI transport type %q", req.Type)
+	}
+	t.mu.RLock()
+	ch := t.outputs[req.Target]
+	t.mu.RUnlock()
+	if ch == nil {
+		return fmt.Errorf("closed UI transport target %q", req.Target)
+	}
+	var frame []byte
+	switch v := req.Data.(type) {
+	case string:
+		frame = []byte(v)
+	case []byte:
+		frame = append([]byte(nil), v...)
+	default:
+		return fmt.Errorf("invalid stream frame %T", req.Data)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case ch <- frame:
+		return nil
+	default:
+		return fmt.Errorf("UI transport buffer full")
+	}
+}
+
+type counterRuntime struct {
+	counters, ui *actors.System
+	streams      *streamTransport
+}
+
+func setupCounters(ctx context.Context, store *sqllog.Log) (*counterRuntime, error) {
 	registerCounterDataTypes()
-	chart, err := buildCounterChart()
+	hubChart, err := buildHubChart()
 	if err != nil {
 		return nil, err
 	}
-	// Snapshot currently excludes an application's Go datamodel. Retain the
-	// configuration checkpoint but replay the complete short counter log so
-	// Value and Processed are always reconstructed as well.
-	snapshots := fullReplaySnapshots{SnapshotStore: store}
-	sys := actors.NewSystem(actors.WithLog(store), actors.WithSnapshotStore(snapshots), actors.WithMaxResident(3), actors.WithIdleTimeout(time.Minute), actors.WithFallback(hub))
-	ready := false
-	defer func() {
-		if !ready {
-			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = sys.Stop(stopCtx)
-		}
-	}()
-	if err := sys.Register(chart); err != nil {
+	streamChart, err := buildStreamChart()
+	if err != nil {
 		return nil, err
 	}
-	for _, name := range colors {
-		if err := sys.Spawn(ctx, statecharts.Identifier(name), counterKind, actors.Durable()); err != nil {
-			return nil, err
-		}
+	transport := newStreamTransport()
+	ui := actors.NewSystem(actors.WithNodeName("ui"), actors.WithFallback(transport))
+	cleanup := func() { _ = ui.Stop(context.Background()) }
+	if err = ui.Register(hubChart); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if err = ui.Register(streamChart); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if err = ui.Spawn(ctx, "hub", hubKind); err != nil {
+		cleanup()
+		return nil, err
+	}
+	bridge := actors.NewBridge("ui", nil, "counters")
+	chart, err := buildCounterChart()
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	snapshots := fullReplaySnapshots{SnapshotStore: store}
+	counters := actors.NewSystem(actors.WithNodeName("counters"), actors.WithLog(store), actors.WithSnapshotStore(snapshots), actors.WithMaxResident(3), actors.WithIdleTimeout(time.Minute), actors.WithFallback(bridge), actors.WithResidencyObserver(func(change actors.ResidencyChange) {
+		_ = ui.Tell(context.Background(), "hub", statecharts.Event{Name: "residency", Type: statecharts.EventExternal, Data: change})
+	}))
+	fail := func(e error) (*counterRuntime, error) {
+		_ = counters.Stop(context.Background())
+		cleanup()
+		return nil, e
+	}
+	bridge.SetTarget(ui)
+	if err = counters.Register(chart); err != nil {
+		return fail(err)
 	}
 	for _, name := range colors {
-		if err := sys.Tell(ctx, statecharts.Identifier(name), statecharts.Event{Name: "publish", Type: statecharts.EventExternal}); err != nil {
-			return nil, err
+		if err = counters.Spawn(ctx, statecharts.Identifier(name), counterKind, actors.Durable()); err != nil {
+			return fail(err)
 		}
 	}
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	for len(hub.snapshot(7)) < 7 {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-deadline.C:
-			return nil, fmt.Errorf("timed out rebuilding projection")
-		case <-time.After(time.Millisecond):
+	for _, name := range colors {
+		if err = counters.Tell(ctx, statecharts.Identifier(name), statecharts.Event{Name: "publish", Type: statecharts.EventExternal}); err != nil {
+			return fail(err)
 		}
 	}
-	ready = true
-	return sys, nil
+	rt := &counterRuntime{counters: counters, ui: ui, streams: transport}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ps, e := rt.query(ctx, colors)
+		if e == nil && len(ps) == len(colors) {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fail(fmt.Errorf("timed out rebuilding projection"))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return rt, nil
 }
 
 type fullReplaySnapshots struct{ statecharts.SnapshotStore }
@@ -92,23 +169,43 @@ func (s fullReplaySnapshots) Save(ctx context.Context, id statecharts.SessionID,
 	return s.SnapshotStore.Save(ctx, id, cp)
 }
 
-func counterHandler(sys *actors.System, hub *projectionHub) http.Handler {
+func (rt *counterRuntime) query(ctx context.Context, selected []string) ([]projection, error) {
+	reply := make(chan []projection, 1)
+	if err := rt.ui.Tell(ctx, "hub", statecharts.Event{Name: "query", Type: statecharts.EventExternal, Data: hubQuery{Colors: append([]string(nil), selected...), Reply: reply}}); err != nil {
+		return nil, err
+	}
+	select {
+	case p := <-reply:
+		return p, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (rt *counterRuntime) stop(ctx context.Context) error {
+	if err := rt.counters.Stop(ctx); err != nil {
+		return err
+	}
+	return rt.ui.Stop(ctx)
+}
+
+func counterHandler(rt *counterRuntime) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", pageHandler)
+	mux.HandleFunc("GET /", pageHandler(func() []projection { p, _ := rt.query(context.Background(), colors); return p }))
 	mux.HandleFunc("GET /datastar.js", datastarHandler)
-	mux.HandleFunc("GET /ui/events", serverBrowserEvents(sys, hub))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	mux.HandleFunc("GET /ui/events", rt.streamHandler("browser", func(*http.Request) ([]string, error) { return append([]string(nil), colors...), nil }))
+	mux.HandleFunc("GET /events", rt.streamHandler("terminal", eventStreamColors))
 	mux.HandleFunc("POST /counters/{color}/writes/{writeID}", func(w http.ResponseWriter, r *http.Request) {
-		color, writeID := r.PathValue("color"), r.PathValue("writeID")
+		color, id := r.PathValue("color"), r.PathValue("writeID")
 		if _, ok := colorValues[color]; !ok {
 			http.Error(w, "unknown color", 404)
 			return
 		}
-		if _, err := statecharts.NewIdentifier(writeID); err != nil || strings.Contains(writeID, ".") {
+		if _, err := statecharts.NewIdentifier(id); err != nil || strings.Contains(id, ".") {
 			http.Error(w, "invalid write ID", 400)
 			return
 		}
-		if err := tellIncrement(r.Context(), sys, hub, color, statecharts.Identifier(writeID)); err != nil {
+		if err := rt.counters.Tell(r.Context(), statecharts.Identifier(color), incrementEvent(statecharts.Identifier(id))); err != nil {
 			http.Error(w, err.Error(), 503)
 			return
 		}
@@ -117,24 +214,55 @@ func counterHandler(sys *actors.System, hub *projectionHub) http.Handler {
 	mux.HandleFunc("POST /counters/{color}/increment", func(w http.ResponseWriter, r *http.Request) {
 		color := r.PathValue("color")
 		if _, ok := colorValues[color]; !ok {
-			http.Error(w, "unknown color", http.StatusNotFound)
+			http.Error(w, "unknown color", 404)
 			return
 		}
-		writeID, err := randomWriteID("ui")
+		datastar := strings.EqualFold(r.Header.Get("Datastar-Request"), "true")
+		before := -1
+		if datastar {
+			if p, queryErr := rt.query(r.Context(), []string{color}); queryErr == nil && len(p) == 1 {
+				before = p[0].Value
+			}
+		}
+		id, err := randomWriteID("ui")
+		if err == nil {
+			err = rt.counters.Tell(r.Context(), statecharts.Identifier(color), incrementEvent(id))
+		}
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, err.Error(), 503)
 			return
 		}
-		if err := tellIncrement(r.Context(), sys, hub, color, writeID); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		if datastar {
+			var p []projection
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				p, _ = rt.query(r.Context(), colors)
+				for _, item := range p {
+					if item.Name == color && item.Value > before {
+						goto ready
+					}
+				}
+				if time.Now().After(deadline) {
+					http.Error(w, "timed out waiting for projection", http.StatusGatewayTimeout)
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		ready:
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_ = renderDashboard("online", p).WriteHTML(w)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
-		selected, err := eventStreamColors(r)
+	return mux
+}
+
+func (rt *counterRuntime) streamHandler(mode string, choose func(*http.Request) ([]string, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		selected, err := choose(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), 400)
 			return
 		}
 		f, ok := w.(http.Flusher)
@@ -142,52 +270,38 @@ func counterHandler(sys *actors.System, hub *projectionHub) http.Handler {
 			http.Error(w, "streaming unsupported", 500)
 			return
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		changes, unsubscribe := hub.subscribe()
-		defer unsubscribe()
-		tick := time.NewTicker(15 * time.Second)
-		defer tick.Stop()
-		var last []byte
-		write := func() bool {
-			b, _ := json.Marshal(residentSnapshot(sys, hub.snapshotColors(selected)))
-			if bytes.Equal(b, last) {
-				return true
-			}
-			_, err := fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", b)
-			f.Flush()
-			last = b
-			return err == nil
-		}
-		if !write() {
+		idraw, err := randomWriteID("out")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
 			return
 		}
+		actorID := statecharts.Identifier("sse-" + string(idraw))
+		output := idraw
+		frames := rt.streams.register(output)
+		defer rt.streams.unregister(output)
+		if err = rt.ui.Spawn(r.Context(), actorID, streamKind); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if err = rt.ui.Tell(r.Context(), actorID, statecharts.Event{Name: "start", Type: statecharts.EventExternal, Data: streamStart{Mode: mode, Colors: selected, Output: output}}); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer rt.ui.Tell(context.Background(), actorID, statecharts.Event{Name: "close", Type: statecharts.EventExternal})
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
 		for {
 			select {
 			case <-r.Context().Done():
 				return
-			case <-changes:
-				if !write() {
+			case frame := <-frames:
+				if _, err = w.Write(frame); err != nil {
 					return
 				}
-			case <-tick.C:
-				fmt.Fprint(w, ": keepalive\n\n")
 				f.Flush()
 			}
 		}
-	})
-	return mux
-}
-
-func tellIncrement(ctx context.Context, sys *actors.System, hub *projectionHub, color string, writeID statecharts.Identifier) error {
-	if err := sys.Tell(ctx, statecharts.Identifier(color), incrementEvent(writeID)); err != nil {
-		return err
 	}
-	// The actor's projection already announces its value. This second,
-	// coalesced notification ensures subscribers also observe any different
-	// actor evicted while the target was paged in.
-	hub.changed()
-	return nil
 }
 
 func randomWriteID(prefix string) (statecharts.Identifier, error) {
@@ -197,7 +311,6 @@ func randomWriteID(prefix string) (statecharts.Identifier, error) {
 	}
 	return statecharts.Identifier(prefix + "-" + hex.EncodeToString(value[:])), nil
 }
-
 func eventStreamColors(r *http.Request) ([]string, error) {
 	if raw := r.URL.Query().Get("colors"); raw != "" {
 		return selectColors(strings.Split(raw, ","), len(colors))
@@ -207,11 +320,4 @@ func eventStreamColors(r *http.Request) ([]string, error) {
 		return nil, fmt.Errorf("provide colors or n=1..%d", len(colors))
 	}
 	return selectColors(nil, n)
-}
-
-func residentSnapshot(sys *actors.System, ps []projection) []projection {
-	for i := range ps {
-		ps[i].Resident = sys.IsResident(statecharts.Identifier(ps[i].Name))
-	}
-	return ps
 }

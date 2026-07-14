@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -802,6 +803,55 @@ func TestIsResidentAcceptsLocalIDAndRoutingKeyWithoutPagingIn(t *testing.T) {
 	}
 }
 
+func TestResidencyObserverReportsHydrationAndEviction(t *testing.T) {
+	ctx := context.Background()
+	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := openTestLog(t)
+	var mu sync.Mutex
+	var changes []ResidencyChange
+	sys := NewSystem(
+		WithLog(log), WithSnapshotStore(log), WithMaxResident(1),
+		WithResidencyObserver(func(change ResidencyChange) {
+			mu.Lock()
+			changes = append(changes, change)
+			mu.Unlock()
+		}),
+	)
+	if err := sys.Register(chart); err != nil {
+		t.Fatal(err)
+	}
+	if err := sys.Spawn(ctx, "one", chart.ID(), Durable()); err != nil {
+		t.Fatal(err)
+	}
+	if err := sys.Spawn(ctx, "two", chart.ID(), Durable()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	changes = nil
+	mu.Unlock()
+
+	if err := sys.Tell(ctx, "one", statecharts.Event{Name: "wake", Type: statecharts.EventExternal}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := append([]ResidencyChange(nil), changes...)
+	mu.Unlock()
+	want := []ResidencyChange{
+		{ActorID: "one", State: ResidencyHydrating},
+		{ActorID: "two", State: ResidencyPagedOut},
+		{ActorID: "one", State: ResidencyResident},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("residency changes = %#v, want %#v", got, want)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNodeNameQualifiesAdvertisedIOProcessorLocation(t *testing.T) {
 	ctx := context.Background()
 	var dms []*locationModel
@@ -1037,6 +1087,122 @@ func TestPeerDispatchQueueOverflowRaisesCommunicationError(t *testing.T) {
 		t.Fatalf("sender configuration = %v, want failed after dispatch queue overflow", inst.Configuration())
 	}
 	close(release)
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+type registeredIOProcessor struct {
+	requests []statecharts.SendRequest
+	infos    []statecharts.IOProcessorInfo
+}
+
+func (*registeredIOProcessor) Attach(statecharts.Dispatcher) {}
+
+func (p *registeredIOProcessor) Send(_ context.Context, req statecharts.SendRequest) error {
+	p.requests = append(p.requests, req)
+	return nil
+}
+
+func (*registeredIOProcessor) Cancel(context.Context, statecharts.Identifier) error { return nil }
+
+func (p *registeredIOProcessor) IOProcessors() []statecharts.IOProcessorInfo {
+	return append([]statecharts.IOProcessorInfo(nil), p.infos...)
+}
+
+func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T) {
+	ctx := context.Background()
+	var localDeliveries int
+	receiver, err := statecharts.Build(
+		statecharts.Atomic("typed-receiver", statecharts.On("frame", statecharts.Then(
+			statecharts.Action(func(_ *struct{}, _ statecharts.ExecContext) error {
+				localDeliveries++
+				return nil
+			}),
+		))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build receiver: %v", err)
+	}
+	sender, err := statecharts.Build(
+		statecharts.Atomic("typed-sender", statecharts.On("go", statecharts.Then(
+			statecharts.SendEvent("frame", statecharts.SendOptions{Target: "output", Type: "browser", Data: "hello"}),
+		))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build sender: %v", err)
+	}
+
+	processor := &registeredIOProcessor{}
+	sys := NewSystem(WithFallback(processor))
+	if err := sys.Register(receiver); err != nil {
+		t.Fatalf("Register receiver: %v", err)
+	}
+	if err := sys.Register(sender); err != nil {
+		t.Fatalf("Register sender: %v", err)
+	}
+	if err := sys.Spawn(ctx, "output", receiver.ID()); err != nil {
+		t.Fatalf("Spawn receiver: %v", err)
+	}
+	if err := sys.Spawn(ctx, "source", sender.ID()); err != nil {
+		t.Fatalf("Spawn sender: %v", err)
+	}
+	if err := sys.Tell(ctx, "source", statecharts.Event{Name: "go", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+
+	if len(processor.requests) != 1 {
+		t.Fatalf("registered IOProcessor received %d requests, want 1", len(processor.requests))
+	}
+	if got := processor.requests[0]; got.Type != "browser" || got.Target != "output" || got.Event != "frame" || got.Data != "hello" {
+		t.Fatalf("registered IOProcessor request = %#v, want browser frame to output", got)
+	}
+	if localDeliveries != 0 {
+		t.Fatalf("custom-typed send reached local actor %d times, want 0", localDeliveries)
+	}
+	if err := sys.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestFallbackAdvertisesRegisteredIOProcessor(t *testing.T) {
+	ctx := context.Background()
+	want, err := statecharts.NewLocation("browser://connection")
+	if err != nil {
+		t.Fatalf("NewLocation: %v", err)
+	}
+	processor := &registeredIOProcessor{infos: []statecharts.IOProcessorInfo{{Type: "browser", Location: want}}}
+	var got statecharts.Location
+	var ok bool
+	chart, err := statecharts.Build(
+		statecharts.Atomic("describer", statecharts.On("check", statecharts.Then(
+			statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+				got, ok = ec.IOProcessorLocation("browser")
+				return nil
+			}),
+		))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	sys := NewSystem(WithFallback(processor))
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(ctx, "source", chart.ID()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := sys.Tell(ctx, "source", statecharts.Event{Name: "check", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell: %v", err)
+	}
+
+	if !ok || got.String() != want.String() {
+		t.Fatalf("IOProcessorLocation(browser) = (%q, %v), want (%q, true)", got, ok, want)
+	}
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}

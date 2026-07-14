@@ -53,19 +53,18 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 	defer db.Close()
-	hub := newProjectionHub()
-	sys, err := setupCounters(ctx, store, hub)
+	runtime, err := setupCounters(ctx, store)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = sys.Stop(stopCtx)
+		_ = runtime.stop(stopCtx)
 	}()
 	server := &http.Server{
 		Addr:        *addr,
-		Handler:     counterHandler(sys, hub),
+		Handler:     counterHandler(runtime),
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	ln, err := net.Listen("tcp", *addr)

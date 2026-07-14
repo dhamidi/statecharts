@@ -1074,6 +1074,11 @@ whether it happened to already be resident.
 operational tooling. It accepts either a stable actor ID or this system's
 qualified `ID@node` routing key, and never activates a paged-out actor.
 
+`WithResidencyObserver` reports each actor's `hydrating`, `resident`, and
+`paged out` lifecycle transitions. Observers receive the stable actor ID and
+run synchronously, making them suitable for lightweight projections and
+operational UIs that need to distinguish replay from ordinary residency.
+
 Idle timeouts alone don't protect a node from holding more resident
 actors than it has room for -- a system under heavy, broad traffic may
 never see any one actor go idle. `WithResidencyLimit` gives the system a
@@ -1334,13 +1339,18 @@ name it never spawned is unknown to it, full stop -- there is no way for an
 actor in one `System` to reach a name that belongs to a different `System`,
 unless that `System` is built with `WithFallback`.
 
-`WithFallback` gives a `System` an `IOProcessor` to try once its own
-routing table comes up empty for a `Send`'s target. A name the `System`
-already knows -- spawned there, resident or not -- is always resolved
-locally first; the fallback only ever sees a `Send` for a name outside that
-table. It's the same seam every actor already sends through,
-`IOProcessor`, doing the same job one level up: routing between Systems
-instead of between actors inside one.
+`WithFallback` adds an `IOProcessor` behind the actor router. For the
+default SCXML and `"actors"` processor types, a name the `System` already
+knows -- spawned there, resident or not -- is resolved locally first; the
+fallback only sees a `Send` when that lookup misses. A custom
+`SendOptions.Type` selects the fallback directly instead, even if its target
+happens to match a local actor ID. If the fallback implements
+`IOProcessorDescriber`, its entries are also included in the actor's
+`ExecContext.IOProcessors()` list.
+
+It's the same seam every actor already sends through, `IOProcessor`, doing
+the same job one level up: routing between Systems or reaching another
+application transport instead of routing between actors inside one.
 
 `Bridge` is a ready-made fallback `IOProcessor` for connecting two
 `System`s. It separates the actor ID from its node at `@` and delivers the
