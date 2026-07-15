@@ -167,6 +167,45 @@ single registration can be reused at many definition sites without captured
 parameter closures. `GoLiteral` supplies canonical constants and `GoData`
 addresses declared definition data.
 
+### Optional ECMAScript datamodel
+
+Applications that need runtime-editable source expressions can opt into the
+pure-Go ModernC QuickJS integration without changing the interpreter:
+
+```go
+model, err := ecmascript.New(
+	ecmascript.WithEvaluationTimeout(100 * time.Millisecond),
+	ecmascript.WithMemoryLimit(64 << 20),
+)
+initial, err := ecmascript.Source("0")
+condition, err := ecmascript.Source("count < 3")
+
+chart, err := statecharts.Build(
+	statecharts.Compound("root", "working", statecharts.Children(
+		statecharts.Atomic("working", statecharts.Eventless(
+			statecharts.If(condition), statecharts.Target("done"),
+		)),
+		statecharts.Final("done"),
+	)),
+	model,
+	statecharts.WithData(statecharts.DataDefinition{ID: "count", Expr: &initial}),
+)
+```
+
+Each instance owns an isolated VM. System bindings such as `_event`,
+`_sessionid`, `_name`, `_ioprocessors`, `_x`, and `In()` are refreshed for
+each evaluation and cannot be overwritten. Synchronously queued Promise jobs
+drain within the same interpreter turn; no browser, filesystem, timer, or
+network APIs are installed.
+
+Declared data is the only VM state stored in snapshots. Cycles, functions,
+accessors, unsupported objects, and undeclared global mutations make the
+snapshot cache unavailable instead of being silently discarded; durable log
+replay remains authoritative. Exact integers outside JavaScript's safe range
+cross as `BigInt`. Decimal values that cannot round-trip through an ECMAScript
+`Number` are rejected rather than rounded. Configure finite evaluation,
+memory, and stack limits for runtime-edited or otherwise untrusted source.
+
 ### Canonical values
 
 Events and definition operands carry `Value`, a closed, deterministic value
