@@ -85,6 +85,25 @@ func (g *replayGate) recover(ctx context.Context) error {
 // including synchronously applying overdue sends -- and active invocations
 // are reconciled before the returned Instance is considered live.
 func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapshots SnapshotStore, sessionID SessionID, realIO IOProcessor, opts ...Option) (*Instance, error) {
+	return rehydrateInstanceFromFactory(ctx, chart, func() (DatamodelSession, error) {
+		return newLegacyDatamodelSession(datamodel), nil
+	}, log, snapshots, sessionID, realIO, opts...)
+}
+
+// Rehydrate reconstructs a running Instance using fresh sessions from the
+// chart's DatamodelProgram. Snapshot model state is decoded into one fresh
+// session; an incompatible cache is discarded before replay starts with
+// another fresh session.
+func (c *Chart) Rehydrate(ctx context.Context, log Log, snapshots SnapshotStore, sessionID SessionID, realIO IOProcessor, opts ...Option) (*Instance, error) {
+	if c.program == nil {
+		return nil, fmt.Errorf("statecharts: chart has no datamodel program")
+	}
+	return rehydrateInstanceFromFactory(ctx, c, func() (DatamodelSession, error) {
+		return c.program.NewSession(SessionOptions{})
+	}, log, snapshots, sessionID, realIO, opts...)
+}
+
+func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFactory datamodelSessionFactory, log Log, snapshots SnapshotStore, sessionID SessionID, realIO IOProcessor, opts ...Option) (*Instance, error) {
 	// Logger and Clock, unlike IOProcessor, have no explicit Rehydrate
 	// parameters -- they only arrive via opts. Apply opts to a throwaway
 	// config so replay can gate the real Logger and defer the real Clock;
@@ -161,7 +180,7 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 
 	var in *Instance
 	if hasCheckpoint {
-		in, err = Restore(chart, datamodel, cp.Snapshot, allOpts...)
+		in, err = restoreInstanceFromFactory(chart, cp.Snapshot, sessionFactory, allOpts...)
 		if err != nil {
 			if !errors.Is(err, ErrInvalidSnapshot) {
 				return nil, fmt.Errorf("statecharts: Rehydrate: restore checkpoint: %w", err)
@@ -182,7 +201,10 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 		}
 	}
 	if !hasCheckpoint {
-		in = New(chart, datamodel, allOpts...)
+		in, err = newInstanceFromFactory(chart, sessionFactory, allOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("statecharts: Rehydrate: create instance: %w", err)
+		}
 	}
 
 	// Reconstruct deterministic bookkeeping during bootstrap and replay, but
@@ -192,7 +214,14 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 	keepInstance := false
 	defer func() {
 		if !keepInstance {
-			_ = in.Stop(ctx)
+			if ctx.Err() != nil {
+				// A model callback may still be unwinding after Start's caller
+				// deadline. Request cleanup without making Rehydrate ignore that
+				// deadline; the actor closes its session once it can safely stop.
+				go func() { _ = in.Stop(context.Background()) }()
+			} else {
+				_ = in.Stop(ctx)
+			}
 		}
 	}()
 	if err := in.Start(ctx); err != nil {

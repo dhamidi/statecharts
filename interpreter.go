@@ -12,7 +12,7 @@ import (
 // interpretation is the mutable, single-goroutine-owned state of one running
 // chart: the active configuration, recorded history, both event queues, and
 // the running flag -- exactly the SCXML "global" algorithm state (Appendix
-// D), minus the datamodel (owned opaquely by the caller). interpretation
+// D). Mutable model state is owned by one DatamodelSession. interpretation
 // has no goroutines or channels of its own; Instance is the actor wrapper
 // that drives it from a single goroutine, and is also what actually starts
 // <invoke>'s external services (see invoke.go's invokeRunnerFunc) for the
@@ -21,6 +21,7 @@ import (
 type interpretation struct {
 	chart             *Chart
 	datamodel         any
+	session           DatamodelSession
 	sessionID         SessionID // SCXML 5.10's _sessionid, bound for this session's lifetime
 	name              string    // SCXML 5.10's _name
 	platformVariables map[string]any
@@ -493,10 +494,16 @@ func (ip *interpretation) runActions(actions actionBlock) {
 
 func (ip *interpretation) runActionsWithContext(actions actionBlock, ec ExecContext) {
 	for _, a := range actions {
-		if a == nil {
+		if !a.useModel && a.callback == nil {
 			continue
 		}
-		if err := callAction(a, ec); err != nil {
+		var err error
+		if a.useModel {
+			err = ip.executeModel(ec, a.model)
+		} else {
+			err = callAction(a.callback, ec)
+		}
+		if err != nil {
 			ip.reportError(err)
 			break
 		}
@@ -549,6 +556,81 @@ func (ip *interpretation) evaluateDone(done DoneDataFunc) (data Value) {
 		}
 	}()
 	return done(ip.execContext())
+}
+
+func (ip *interpretation) evaluateStateDone(state *compiledState) Value {
+	if !state.hasModelDone {
+		return ip.evaluateDone(state.done)
+	}
+	value, err := ip.evaluateModelValue(ip.execContext(), state.modelDone)
+	if err != nil {
+		ip.reportError(err)
+		return Value{}
+	}
+	return value
+}
+
+func (ip *interpretation) evaluateModelBoolean(ec ExecContext, expression CompiledExpression) (result bool, err error) {
+	if ip.session == nil {
+		return false, fmt.Errorf("statecharts: datamodel session is unavailable")
+	}
+	defer func() {
+		if value := recover(); value != nil {
+			result = false
+			err = fmt.Errorf("statecharts: datamodel boolean evaluation panicked: %v", value)
+		}
+	}()
+	return ip.session.EvaluateBoolean(ec, expression)
+}
+
+func (ip *interpretation) evaluateModelValue(ec ExecContext, expression CompiledExpression) (result Value, err error) {
+	if ip.session == nil {
+		return Value{}, fmt.Errorf("statecharts: datamodel session is unavailable")
+	}
+	defer func() {
+		if value := recover(); value != nil {
+			result = Value{}
+			err = fmt.Errorf("statecharts: datamodel value evaluation panicked: %v", value)
+		}
+	}()
+	result, err = ip.session.EvaluateValue(ec, expression)
+	return result.Clone(), err
+}
+
+func (ip *interpretation) assignModel(ec ExecContext, location CompiledExpression, value Value) (err error) {
+	if ip.session == nil {
+		return fmt.Errorf("statecharts: datamodel session is unavailable")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("statecharts: datamodel assignment panicked: %v", recovered)
+		}
+	}()
+	return ip.session.Assign(ec, location, value.Clone())
+}
+
+func (ip *interpretation) executeModel(ec ExecContext, expression CompiledExpression) (err error) {
+	if ip.session == nil {
+		return fmt.Errorf("statecharts: datamodel session is unavailable")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("statecharts: datamodel execution panicked: %v", recovered)
+		}
+	}()
+	return ip.session.Execute(ec, expression)
+}
+
+func (ip *interpretation) forEachModel(ec ExecContext, expression CompiledExpression, bindings IterationBindings, body func() error) (err error) {
+	if ip.session == nil {
+		return fmt.Errorf("statecharts: datamodel session is unavailable")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("statecharts: datamodel iteration panicked: %v", recovered)
+		}
+	}()
+	return ip.session.ForEach(ec, expression, bindings, body)
 }
 
 // activeStates returns the current configuration's state IDs in document order.
@@ -799,8 +881,8 @@ func (ip *interpretation) enterState(s *compiledState, defaults []actionBlock) {
 	if s.parent == nil || s.parent == ip.chart.root {
 		// a top-level final state (root itself is Final, or its direct
 		// parent is the chart root) ends the machine.
-		if s.done != nil {
-			ip.result = ip.evaluateDone(s.done)
+		if s.done != nil || s.hasModelDone {
+			ip.result = ip.evaluateStateDone(s)
 		}
 		ip.completed = true
 		ip.running = false
@@ -809,8 +891,8 @@ func (ip *interpretation) enterState(s *compiledState, defaults []actionBlock) {
 	parent := s.parent
 
 	var data Value
-	if s.done != nil {
-		data = ip.evaluateDone(s.done)
+	if s.done != nil || s.hasModelDone {
+		data = ip.evaluateStateDone(s)
 	}
 	ip.enqueueInternal(Event{
 		Name: Identifier("done.state." + string(parent.id)),
@@ -1075,6 +1157,14 @@ func (ip *interpretation) eventMatches(t *compiledTransition, name Identifier) b
 }
 
 func (ip *interpretation) condMatches(t *compiledTransition) bool {
+	if t.hasModelCondition {
+		matched, err := ip.evaluateModelBoolean(ip.execContext(), t.modelCondition)
+		if err != nil {
+			ip.reportError(err)
+			return false
+		}
+		return matched
+	}
 	if t.cond == nil {
 		return true
 	}

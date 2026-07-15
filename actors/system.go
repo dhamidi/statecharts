@@ -262,13 +262,11 @@ func NewSystem(opts ...Option) *System {
 // names it: paging an actor back in reconstructs its Instance from the
 // registered Chart, since the Go value itself is never persisted.
 //
-// Register fails if chart has no datamodel factory (see
-// statecharts.WithNewDatamodel) -- it could never be paged in without a
-// caller present to supply one -- or if a chart with the same ID is already
-// registered.
+// Register fails if chart has no datamodel program -- it could never be paged
+// in without one -- or if a chart with the same ID is already registered.
 func (s *System) Register(chart *statecharts.Chart) error {
-	if _, ok := chart.NewDatamodel(); !ok {
-		return fmt.Errorf("actors: Register: chart %q has no datamodel factory (statecharts.WithNewDatamodel)", chart.ID())
+	if chart.DatamodelProgram() == nil {
+		return fmt.Errorf("actors: Register: chart %q has no datamodel program", chart.ID())
 	}
 	s.chartsMu.Lock()
 	defer s.chartsMu.Unlock()
@@ -543,7 +541,6 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 	if !ok {
 		return fmt.Errorf("actors: activate %q: kind %q is not registered: %w", entry.name, entry.kind, ErrKindNotRegistered)
 	}
-	dm, _ := chart.NewDatamodel()
 	address := s.address(entry.name)
 	sessionID := statecharts.SessionID(entry.name)
 	proc := newRoutingProcessor(s, address)
@@ -645,20 +642,24 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			liveOpts = append(liveOpts,
 				statecharts.WithSessionID(sessionID),
 			)
-			inst = statecharts.New(chart, dm, liveOpts...)
-			err = inst.Start(ctx)
+			inst, err = chart.NewInstance(liveOpts...)
+			if err == nil {
+				err = inst.Start(ctx)
+			}
 		} else {
 			// Rehydrate's explicit SCXML processor is the already-wrapped first
 			// registration; remaining registrations arrive through options.
-			inst, err = statecharts.Rehydrate(ctx, chart, dm, s.cfg.storage, s.cfg.storage, sessionID, processorValues[0], append(instanceOpts, processorOpts[1:]...)...)
+			inst, err = chart.Rehydrate(ctx, s.cfg.storage, s.cfg.storage, sessionID, processorValues[0], append(instanceOpts, processorOpts[1:]...)...)
 		}
 	} else {
 		opts := append(processorOpts,
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger), statecharts.WithIngressHook(ingressHook),
 			statecharts.WithSessionID(sessionID))
-		inst = statecharts.New(chart, dm, opts...)
-		err = inst.Start(ctx)
+		inst, err = chart.NewInstance(opts...)
+		if err == nil {
+			err = inst.Start(ctx)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("actors: activate %q: %w", entry.name, err)

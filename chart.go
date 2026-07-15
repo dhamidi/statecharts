@@ -1,9 +1,7 @@
 package statecharts
 
 import (
-	"encoding/json"
 	"fmt"
-	"reflect"
 )
 
 // Chart is an immutable, validated, indexed chart definition produced by
@@ -14,40 +12,8 @@ type Chart struct {
 	byID         map[Identifier]*compiledState
 	order        []*compiledState // document order (pre-order traversal of the state tree)
 	newDatamodel func() any
+	program      DatamodelProgram
 	version      string
-	codec        DatamodelCodec
-}
-
-// DatamodelCodec serializes the opaque chart datamodel. Decode must return a
-// fresh value shaped like prototype and must not mutate prototype.
-type DatamodelCodec interface {
-	Encode(any) ([]byte, error)
-	Decode([]byte, any) (any, error)
-}
-
-type jsonDatamodelCodec struct{}
-
-func (jsonDatamodelCodec) Encode(v any) ([]byte, error) { return json.Marshal(v) }
-func (jsonDatamodelCodec) Decode(b []byte, prototype any) (any, error) {
-	if prototype == nil {
-		var v any
-		err := json.Unmarshal(b, &v)
-		return v, err
-	}
-	t := reflect.TypeOf(prototype)
-	var v any
-	if t.Kind() == reflect.Pointer {
-		v = reflect.New(t.Elem()).Interface()
-	} else {
-		v = reflect.New(t).Interface()
-	}
-	if err := json.Unmarshal(b, v); err != nil {
-		return nil, err
-	}
-	if t.Kind() != reflect.Pointer {
-		v = reflect.ValueOf(v).Elem().Interface()
-	}
-	return v, nil
 }
 
 // BuildOption configures a Chart being built by Build.
@@ -63,7 +29,24 @@ func WithName(name string) BuildOption { return func(c *Chart) { c.name = name }
 // chart's instances into and out of memory on demand, reconstructing each
 // one's datamodel from scratch as it pages back in.
 func WithNewDatamodel(fn func() any) BuildOption {
-	return func(c *Chart) { c.newDatamodel = fn }
+	return func(c *Chart) {
+		c.newDatamodel = fn
+		c.program = &legacyDatamodelProgram{factory: fn}
+	}
+}
+
+// WithDatamodelProgram binds an immutable compiled model program to all
+// instances of the chart. Each instance, restore, or rehydration creates its
+// own fresh DatamodelSession from program.
+//
+// Most callers obtain a program by compiling a Definition with a Datamodel.
+// Build accepts the program directly while the callback builder remains as a
+// temporary authoring path.
+func WithDatamodelProgram(program DatamodelProgram) BuildOption {
+	return func(c *Chart) {
+		c.newDatamodel = nil
+		c.program = program
+	}
 }
 
 // WithVersion assigns the opaque application version used to validate
@@ -71,10 +54,6 @@ func WithNewDatamodel(fn func() any) BuildOption {
 // compatibility changes; Rehydrate then ignores the old snapshot and
 // rebuilds state from the authoritative Log.
 func WithVersion(version string) BuildOption { return func(c *Chart) { c.version = version } }
-
-// WithDatamodelCodec overrides the default JSON datamodel codec used only
-// for transparent snapshot caches. The Log remains the source of truth.
-func WithDatamodelCodec(codec DatamodelCodec) BuildOption { return func(c *Chart) { c.codec = codec } }
 
 // Version returns the chart's opaque application version.
 func (c *Chart) Version() string { return c.version }
@@ -98,42 +77,36 @@ func (c *Chart) NewDatamodel() (v any, ok bool) {
 	return c.newDatamodel(), true
 }
 
-func (c *Chart) freshDatamodel(prototype any) any {
-	if v, ok := c.NewDatamodel(); ok {
-		return v
-	}
-	if prototype == nil {
-		return nil
-	}
-	t := reflect.TypeOf(prototype)
-	if t.Kind() == reflect.Pointer {
-		return reflect.New(t.Elem()).Interface()
-	}
-	return reflect.New(t).Elem().Interface()
-}
+// DatamodelProgram returns the immutable model program shared by this chart's
+// instances, or nil when no model factory was configured.
+func (c *Chart) DatamodelProgram() DatamodelProgram { return c.program }
 
 type compiledState struct {
-	id          Identifier
-	kind        StateKind
-	historyKind HistoryKind
-	initial     *compiledTransition // compound initial or history default transition
-	parent      *compiledState
-	children    []*compiledState // document order
-	onEntry     []actionBlock
-	onExit      []actionBlock
-	transitions []*compiledTransition
-	invokes     []*compiledInvoke
-	done        DoneDataFunc
-	docOrder    int
+	id           Identifier
+	kind         StateKind
+	historyKind  HistoryKind
+	initial      *compiledTransition // compound initial or history default transition
+	parent       *compiledState
+	children     []*compiledState // document order
+	onEntry      []actionBlock
+	onExit       []actionBlock
+	transitions  []*compiledTransition
+	invokes      []*compiledInvoke
+	done         DoneDataFunc
+	modelDone    CompiledExpression
+	hasModelDone bool
+	docOrder     int
 }
 
 type compiledTransition struct {
-	events   []Identifier
-	target   []Identifier
-	cond     CondFunc
-	actions  []actionBlock
-	internal bool
-	source   *compiledState
+	events            []Identifier
+	target            []Identifier
+	cond              CondFunc
+	modelCondition    CompiledExpression
+	hasModelCondition bool
+	actions           []actionBlock
+	internal          bool
+	source            *compiledState
 }
 
 // States returns every state's ID in document order.
@@ -149,7 +122,7 @@ func (c *Chart) States() []Identifier {
 // validating every Initial/Target/history-default Identifier reference.
 // Errors are static, discovered here rather than at interpretation time.
 func Build(root StateSpec, opts ...BuildOption) (*Chart, error) {
-	c := &Chart{byID: make(map[Identifier]*compiledState), codec: jsonDatamodelCodec{}}
+	c := &Chart{byID: make(map[Identifier]*compiledState)}
 	explicit := make(map[Identifier]bool)
 	var collect func(StateSpec)
 	collect = func(s StateSpec) {
@@ -308,7 +281,7 @@ func reconcileActionBlocks(actions []ActionFunc, recorded []actionBlock) ([]acti
 		if len(actions) == 0 {
 			return nil, nil
 		}
-		return []actionBlock{append(actionBlock(nil), actions...)}, nil
+		return []actionBlock{legacyActionBlock(actions)}, nil
 	}
 	blocks := make([]actionBlock, 0, len(recorded)+1)
 	offset := 0
@@ -317,11 +290,11 @@ func reconcileActionBlocks(actions []ActionFunc, recorded []actionBlock) ([]acti
 		if end > len(actions) {
 			return nil, fmt.Errorf("public action list was shortened after builder options recorded its block boundaries")
 		}
-		blocks = append(blocks, append(actionBlock(nil), actions[offset:end]...))
+		blocks = append(blocks, legacyActionBlock(actions[offset:end]))
 		offset = end
 	}
 	if offset < len(actions) {
-		blocks = append(blocks, append(actionBlock(nil), actions[offset:]...))
+		blocks = append(blocks, legacyActionBlock(actions[offset:]))
 	}
 	return blocks, nil
 }
@@ -343,7 +316,7 @@ func validateEventDescriptor(id Identifier) error {
 func (c *Chart) validateReferences() error {
 	explicitInvokeIDs := map[Identifier]Identifier{}
 	for _, cs := range c.order {
-		if cs.kind != KindFinal && cs.done != nil {
+		if cs.kind != KindFinal && (cs.done != nil || cs.hasModelDone) {
 			return fmt.Errorf("statecharts: non-final state %q must not have done data", cs.id)
 		}
 		if cs == c.root && (cs.kind == KindCompound || cs.kind == KindParallel) {
@@ -435,7 +408,7 @@ func (c *Chart) validateReferences() error {
 		}
 
 		for _, t := range cs.transitions {
-			if len(t.events) == 0 && t.cond == nil && len(t.target) == 0 {
+			if len(t.events) == 0 && t.cond == nil && !t.hasModelCondition && len(t.target) == 0 {
 				return fmt.Errorf("statecharts: state %q has transition without event, condition, or target", cs.id)
 			}
 			for _, event := range t.events {
@@ -475,7 +448,7 @@ func (c *Chart) validateReferences() error {
 }
 
 func validateDefaultTransition(s *compiledState) error {
-	if len(s.initial.events) != 0 || s.initial.cond != nil {
+	if len(s.initial.events) != 0 || s.initial.cond != nil || s.initial.hasModelCondition {
 		return fmt.Errorf("statecharts: state %q default transition must be eventless and unconditional", s.id)
 	}
 	return nil

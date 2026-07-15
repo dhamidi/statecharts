@@ -112,7 +112,7 @@ func WithInvokeParams(fn func(ExecContext) Value) InvokeOption {
 func WithFinalize(actions ...ActionFunc) InvokeOption {
 	return func(s *InvokeSpec) {
 		s.Finalize = append(s.Finalize, actions...)
-		s.finalizeBlocks = append(s.finalizeBlocks, append(actionBlock(nil), actions...))
+		s.finalizeBlocks = append(s.finalizeBlocks, legacyActionBlock(actions))
 	}
 }
 

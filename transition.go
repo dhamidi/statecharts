@@ -29,7 +29,7 @@ func If(cond CondFunc) TransitionOption {
 func Then(actions ...ActionFunc) TransitionOption {
 	return func(t *TransitionSpec) {
 		t.Actions = append(t.Actions, actions...)
-		t.actionBlocks = append(t.actionBlocks, append(actionBlock(nil), actions...))
+		t.actionBlocks = append(t.actionBlocks, legacyActionBlock(actions))
 	}
 }
 

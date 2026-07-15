@@ -159,10 +159,28 @@ type CondFunc func(ExecContext) bool
 // DoneDataFunc produces the canonical payload for a final state's done event.
 type DoneDataFunc func(ExecContext) Value
 
-// actionBlock is one SCXML block of executable content. An error skips the
-// rest of this block without affecting later blocks (for example, a second
-// <onentry> handler on the same state).
-type actionBlock []ActionFunc
+type compiledAction struct {
+	callback ActionFunc
+	model    CompiledExpression
+	useModel bool
+}
+
+// actionBlock is one statechart block of executable content. An error skips
+// the rest of this block without affecting later blocks. callback is the
+// temporary Go-builder path; model is the datamodel-neutral compiled path.
+type actionBlock []compiledAction
+
+func legacyActionBlock(actions []ActionFunc) actionBlock {
+	block := make(actionBlock, len(actions))
+	for i, action := range actions {
+		block[i] = compiledAction{callback: action}
+	}
+	return block
+}
+
+func modelAction(expression CompiledExpression) compiledAction {
+	return compiledAction{model: expression, useModel: true}
+}
 
 // Action adapts a callback operating on the chart's concrete datamodel type
 // D into an ActionFunc. A chart is bound to exactly one D for its entire

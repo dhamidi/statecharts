@@ -15,6 +15,70 @@ import (
 	"github.com/dhamidi/statecharts"
 )
 
+type actorTestDatamodelProgram struct {
+	created chan struct{}
+}
+
+func (p actorTestDatamodelProgram) Fingerprint() []byte { return []byte("actor-test/v1") }
+
+func (p actorTestDatamodelProgram) NewSession(statecharts.SessionOptions) (statecharts.DatamodelSession, error) {
+	p.created <- struct{}{}
+	return actorTestDatamodelSession{}, nil
+}
+
+type actorTestDatamodelSession struct{}
+
+func (actorTestDatamodelSession) EvaluateBoolean(statecharts.ExecContext, statecharts.CompiledExpression) (bool, error) {
+	return true, nil
+}
+
+func (actorTestDatamodelSession) EvaluateValue(statecharts.ExecContext, statecharts.CompiledExpression) (statecharts.Value, error) {
+	return statecharts.Value{}, nil
+}
+
+func (actorTestDatamodelSession) Assign(statecharts.ExecContext, statecharts.CompiledExpression, statecharts.Value) error {
+	return nil
+}
+
+func (actorTestDatamodelSession) Execute(statecharts.ExecContext, statecharts.CompiledExpression) error {
+	return nil
+}
+
+func (actorTestDatamodelSession) ForEach(statecharts.ExecContext, statecharts.CompiledExpression, statecharts.IterationBindings, func() error) error {
+	return nil
+}
+
+func (actorTestDatamodelSession) EncodeSnapshot() ([]byte, error) { return nil, nil }
+func (actorTestDatamodelSession) DecodeSnapshot([]byte) error     { return nil }
+func (actorTestDatamodelSession) Close() error                    { return nil }
+
+func TestSpawnUsesRegisteredDatamodelProgram(t *testing.T) {
+	created := make(chan struct{}, 1)
+	chart, err := statecharts.Build(
+		statecharts.Atomic("program"),
+		statecharts.WithDatamodelProgram(actorTestDatamodelProgram{created: created}),
+		statecharts.WithVersion("test-v1"),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	sys := NewSystem()
+	if err := sys.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := sys.Spawn(context.Background(), "program-1", chart.ID()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	select {
+	case <-created:
+	default:
+		t.Fatal("Spawn did not create a session from the registered datamodel program")
+	}
+	if err := sys.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestRegisterRejectsChartWithoutDatamodelFactory(t *testing.T) {
 	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithVersion("test-v1"))
 	if err != nil {
@@ -142,10 +206,7 @@ func TestPeerMessagingSetsOriginAndAllowsReply(t *testing.T) {
 	if len(dms) == 0 {
 		t.Fatalf("caller datamodel count = 0, want at least 1")
 	}
-	// Register's own check that the chart has a datamodel factory
-	// (chart.NewDatamodel()'s ok) calls that factory once itself, so the
-	// live datamodel actually wired into the running actor is the last one
-	// produced, not necessarily dms[0].
+	// The most recently produced datamodel is the one wired into the actor.
 	live := dms[len(dms)-1]
 	if live.ReceivedFrom != "responder-1" {
 		t.Fatalf("ReceivedFrom = %q, want %q", live.ReceivedFrom, "responder-1")

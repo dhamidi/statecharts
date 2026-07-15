@@ -60,11 +60,7 @@ func TestDurableSpawnPersistsAndResumesViaLogWithoutDoubleApplying(t *testing.T)
 			t.Fatalf("Tell %d: %v", i, err)
 		}
 	}
-	// Register's own check that chart has a datamodel factory
-	// (chart.NewDatamodel()'s ok) necessarily calls that factory once,
-	// producing a throwaway entry in dms1 before Spawn's own -- so the
-	// live datamodel actually wired into the running actor is the last one
-	// produced, not dms1[0].
+	// The most recently produced datamodel is the one wired into the actor.
 	live := dms1[len(dms1)-1]
 	if live.Applied != 3 {
 		t.Fatalf("live Applied = %d, want 3", live.Applied)

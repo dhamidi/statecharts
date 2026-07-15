@@ -93,7 +93,7 @@ func Children(children ...StateSpec) StateOption {
 func OnEntry(actions ...ActionFunc) StateOption {
 	return func(s *StateSpec) {
 		s.OnEntry = append(s.OnEntry, actions...)
-		s.onEntryBlocks = append(s.onEntryBlocks, append(actionBlock(nil), actions...))
+		s.onEntryBlocks = append(s.onEntryBlocks, legacyActionBlock(actions))
 	}
 }
 
@@ -101,7 +101,7 @@ func OnEntry(actions ...ActionFunc) StateOption {
 func OnExit(actions ...ActionFunc) StateOption {
 	return func(s *StateSpec) {
 		s.OnExit = append(s.OnExit, actions...)
-		s.onExitBlocks = append(s.onExitBlocks, append(actionBlock(nil), actions...))
+		s.onExitBlocks = append(s.onExitBlocks, legacyActionBlock(actions))
 	}
 }
 

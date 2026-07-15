@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"sort"
 	"time"
 )
@@ -12,8 +11,8 @@ import (
 // Snapshot is a point-in-time cache of a running chart's datamodel and
 // interpreter state: the session id, active configuration, recorded history,
 // both event queues, running flag, outstanding delayed sends, and active
-// invocation bookkeeping. Datamodel encoding is controlled by the Chart's
-// DatamodelCodec (JSON by default).
+// invocation bookkeeping. Datamodel bytes are an opaque cache owned by the
+// instance's DatamodelSession.
 //
 // Snapshot is a derivable checkpoint, not an independent source of truth: it
 // captures exactly what replaying a Log up to some point would produce, and
@@ -90,7 +89,7 @@ func (in *Instance) Snapshot(ctx context.Context) (Snapshot, error) {
 
 func (in *Instance) buildSnapshot() (Snapshot, error) {
 	ip := in.ip
-	datamodel, err := in.chart.codec.Encode(ip.datamodel)
+	datamodel, err := in.session.EncodeSnapshot()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("statecharts: snapshot datamodel: %w", err)
 	}
@@ -167,26 +166,55 @@ func (in *Instance) buildSnapshot() (Snapshot, error) {
 // one gets error.communication or a real InvokeResumeFunc call. The Instance
 // is constructed but not started; call Start to spawn its goroutine.
 func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Instance, error) {
+	if err := validateSnapshotHeader(chart, snap); err != nil {
+		return nil, err
+	}
+	return restoreInstanceForSession(chart, newLegacyDatamodelSession(datamodel), snap, opts...)
+}
+
+// Restore reconstructs a paused Instance from snap with a fresh session from
+// the chart's DatamodelProgram. The session owns decoding the opaque model
+// snapshot bytes. The returned instance is not started.
+func (c *Chart) Restore(snap Snapshot, opts ...Option) (*Instance, error) {
+	if c.program == nil {
+		return nil, fmt.Errorf("statecharts: chart has no datamodel program")
+	}
+	return restoreInstanceFromFactory(c, snap, func() (DatamodelSession, error) {
+		return c.program.NewSession(SessionOptions{})
+	}, opts...)
+}
+
+func restoreInstanceFromFactory(chart *Chart, snap Snapshot, factory datamodelSessionFactory, opts ...Option) (*Instance, error) {
+	if err := validateSnapshotHeader(chart, snap); err != nil {
+		return nil, err
+	}
+	session, err := factory()
+	if err != nil {
+		return nil, fmt.Errorf("statecharts: create datamodel session: %w", err)
+	}
+	if session == nil {
+		return nil, fmt.Errorf("statecharts: create datamodel session: program returned nil session")
+	}
+	return restoreInstanceForSession(chart, session, snap, opts...)
+}
+
+func validateSnapshotHeader(chart *Chart, snap Snapshot) error {
 	if snap.Version != snapshotVersion {
-		return nil, fmt.Errorf("%w: unsupported snapshot version %d (want %d)", ErrInvalidSnapshot, snap.Version, snapshotVersion)
+		return fmt.Errorf("%w: unsupported snapshot version %d (want %d)", ErrInvalidSnapshot, snap.Version, snapshotVersion)
 	}
 	if snap.ChartVersion != chart.version {
-		return nil, fmt.Errorf("%w: chart version mismatch", ErrInvalidSnapshot)
+		return fmt.Errorf("%w: chart version mismatch", ErrInvalidSnapshot)
 	}
-	var decoded any
-	var err error
-	if datamodel == nil && len(snap.Datamodel) == 0 {
-		// A nil datamodel has no payload to encode. In particular, preserve
-		// control-state-only snapshots written with an empty SQL blob.
-		decoded = nil
-	} else {
-		// Never let a codec mutate the caller's observable value before all
-		// snapshot control state has also passed validation.
-		decoded, err = chart.codec.Decode(snap.Datamodel, freshDecodePrototype(datamodel))
-		if err != nil {
-			return nil, fmt.Errorf("%w: decode datamodel: %v", ErrInvalidSnapshot, err)
+	return nil
+}
+
+func restoreInstanceForSession(chart *Chart, session DatamodelSession, snap Snapshot, opts ...Option) (_ *Instance, resultErr error) {
+	keepSession := false
+	defer func() {
+		if !keepSession {
+			_ = closeSession(session)
 		}
-	}
+	}()
 	cfg := defaultInstanceConfig()
 	for _, opt := range opts {
 		opt(&cfg)
@@ -202,65 +230,23 @@ func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Insta
 	if id == "" {
 		id = cfg.idGen.NewID()
 	}
-	ip := newInterpretation(chart, decoded)
-	in := newInstance(chart, ip, cfg, id)
+	ip := newInterpretation(chart, legacySessionValue(session))
+	ip.session = session
+	if cfg.deliveryNamespace != "" {
+		ip.deliveryNamespace = cfg.deliveryNamespace
+	} else {
+		ip.deliveryNamespace = fmt.Sprintf("incarnation-%d", incarnationSeq.Add(1))
+	}
 	if err := ip.restoreFrom(chart, snap); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidSnapshot, err)
 	}
-	// Validation is complete. Commit the decoded state to the supplied
-	// datamodel where its shape is mutable, then ensure future actions see
-	// that same caller-observable value.
-	ip.datamodel = commitDecodedDatamodel(datamodel, decoded)
+	if err := session.DecodeSnapshot(snap.Datamodel); err != nil {
+		return nil, fmt.Errorf("%w: decode datamodel: %v", ErrInvalidSnapshot, err)
+	}
+	ip.datamodel = legacySessionValue(session)
+	in := newInstance(chart, ip, session, cfg, id)
+	keepSession = true
 	return in, nil
-}
-
-func freshDecodePrototype(datamodel any) any {
-	if datamodel == nil {
-		return nil
-	}
-	t := reflect.TypeOf(datamodel)
-	if t.Kind() == reflect.Pointer {
-		return reflect.New(t.Elem()).Interface()
-	}
-	return reflect.New(t).Elem().Interface()
-}
-
-func commitDecodedDatamodel(datamodel, decoded any) any {
-	if datamodel == nil || decoded == nil {
-		return decoded
-	}
-	dst, src := reflect.ValueOf(datamodel), reflect.ValueOf(decoded)
-	switch dst.Kind() {
-	case reflect.Pointer:
-		if !dst.IsNil() {
-			if src.Type() == dst.Type() && !src.IsNil() {
-				dst.Elem().Set(src.Elem())
-				return datamodel
-			}
-			if src.Type().AssignableTo(dst.Elem().Type()) {
-				dst.Elem().Set(src)
-				return datamodel
-			}
-		}
-	case reflect.Map:
-		if !dst.IsNil() && src.Type() == dst.Type() {
-			dst.Clear()
-			for _, key := range src.MapKeys() {
-				dst.SetMapIndex(key, src.MapIndex(key))
-			}
-			return datamodel
-		}
-	case reflect.Slice:
-		// A slice header passed through an interface is not settable. It is
-		// nevertheless fully observable when its length already matches.
-		if !dst.IsNil() && src.Type() == dst.Type() && dst.Len() == src.Len() {
-			reflect.Copy(dst, src)
-			return datamodel
-		}
-	}
-	// Non-pointer scalars (and shapes that cannot be replaced through the
-	// interface) are explicitly allowed to use the decoded value.
-	return decoded
 }
 
 func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {

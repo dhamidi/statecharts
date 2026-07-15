@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -16,9 +17,11 @@ import (
 // request to the actor's own goroutine and wait for it to be accepted, but
 // that plumbing is entirely unexported.
 type Instance struct {
-	chart *Chart
-	ip    *interpretation
-	clock Clock
+	chart            *Chart
+	ip               *interpretation
+	session          DatamodelSession
+	closeSessionOnce sync.Once
+	clock            Clock
 	// ingressHook runs on the actor goroutine immediately before an event
 	// delivered through Send/Deliver is applied. Durable runtimes use it for
 	// write-ahead logging so invocation results and IOProcessor callbacks pass
@@ -245,6 +248,45 @@ func defaultInstanceConfig() instanceConfig {
 // minted by the configured IDGenerator (see Instance.ID). The interpreter
 // goroutine is not started until Start is called.
 func New(chart *Chart, datamodel any, opts ...Option) *Instance {
+	session := newLegacyDatamodelSession(datamodel)
+	in, err := newInstanceForSession(chart, session, opts...)
+	if err != nil {
+		panic(err)
+	}
+	return in
+}
+
+type datamodelSessionFactory func() (DatamodelSession, error)
+
+// NewInstance constructs an Instance with a fresh session from the chart's
+// DatamodelProgram. The interpreter goroutine is not started until Start is
+// called.
+func (c *Chart) NewInstance(opts ...Option) (*Instance, error) {
+	if c.program == nil {
+		return nil, fmt.Errorf("statecharts: chart has no datamodel program")
+	}
+	return newInstanceFromFactory(c, func() (DatamodelSession, error) {
+		return c.program.NewSession(SessionOptions{})
+	}, opts...)
+}
+
+func newInstanceFromFactory(chart *Chart, factory datamodelSessionFactory, opts ...Option) (*Instance, error) {
+	session, err := factory()
+	if err != nil {
+		return nil, fmt.Errorf("statecharts: create datamodel session: %w", err)
+	}
+	if session == nil {
+		return nil, fmt.Errorf("statecharts: create datamodel session: program returned nil session")
+	}
+	in, err := newInstanceForSession(chart, session, opts...)
+	if err != nil {
+		_ = closeSession(session)
+		return nil, err
+	}
+	return in, nil
+}
+
+func newInstanceForSession(chart *Chart, session DatamodelSession, opts ...Option) (*Instance, error) {
 	cfg := defaultInstanceConfig()
 	for _, opt := range opts {
 		opt(&cfg)
@@ -253,18 +295,28 @@ func New(chart *Chart, datamodel any, opts ...Option) *Instance {
 	if id == "" {
 		id = cfg.idGen.NewID()
 	}
-	ip := newInterpretation(chart, datamodel)
+	ip := newInterpretation(chart, legacySessionValue(session))
+	ip.session = session
 	if cfg.deliveryNamespace != "" {
 		ip.deliveryNamespace = cfg.deliveryNamespace
 	} else {
 		ip.deliveryNamespace = fmt.Sprintf("incarnation-%d", incarnationSeq.Add(1))
 	}
-	return newInstance(chart, ip, cfg, id)
+	return newInstance(chart, ip, session, cfg, id), nil
 }
 
-func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id SessionID) *Instance {
+func legacySessionValue(session DatamodelSession) any {
+	legacy, _ := session.(interface{ legacyValue() any })
+	if legacy == nil {
+		return nil
+	}
+	return legacy.legacyValue()
+}
+
+func newInstance(chart *Chart, ip *interpretation, session DatamodelSession, cfg instanceConfig, id SessionID) *Instance {
 	in := &Instance{
 		chart:       chart,
+		session:     session,
 		clock:       cfg.clock,
 		ingressHook: cfg.ingressHook,
 		inbox:       make(chan actorRequest, cfg.inboxSize),
@@ -595,12 +647,17 @@ func (in *Instance) Start(ctx context.Context) error {
 	case <-in.doneCh:
 		return in.Err()
 	case <-ctx.Done():
+		// Start returning an error must not leave a session running behind
+		// the caller's back. The actor goroutine remains the sole owner of
+		// model execution and closes the session after it can process Stop.
+		go func() { _ = in.Stop(context.Background()) }()
 		return ctx.Err()
 	}
 }
 
 func (in *Instance) run() {
 	defer close(in.doneCh)
+	defer in.closeDatamodelSession()
 	defer func() {
 		if r := recover(); r != nil {
 			in.setTerminalErr(fmt.Errorf("statecharts: instance panic: %v", r))
@@ -710,6 +767,26 @@ func (in *Instance) run() {
 	}
 }
 
+func (in *Instance) closeDatamodelSession() {
+	in.closeSessionOnce.Do(func() {
+		if in.session == nil {
+			return
+		}
+		if err := closeSession(in.session); err != nil && in.Err() == nil {
+			in.setTerminalErr(fmt.Errorf("statecharts: close datamodel session: %w", err))
+		}
+	})
+}
+
+func closeSession(session DatamodelSession) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("datamodel session close panicked: %v", recovered)
+		}
+	}()
+	return session.Close()
+}
+
 // Send places ev on the external queue, regardless of its incoming Type, and
 // blocks until the resulting macrostep(s) have been fully processed and
 // Configuration() reflects them, honoring ctx.
@@ -731,6 +808,12 @@ func (in *Instance) send(ctx context.Context, ev Event) error {
 // relative to in-flight Sends that a second, separate channel could not.
 // Stopping an already-stopped Instance is not an error.
 func (in *Instance) Stop(ctx context.Context) error {
+	if in.started.CompareAndSwap(false, true) {
+		in.closeDatamodelSession()
+		close(in.readyCh)
+		close(in.doneCh)
+		return in.Err()
+	}
 	req := actorRequest{kind: reqStop, reply: make(chan error, 1)}
 	err := in.submit(ctx, req)
 	if err == nil {

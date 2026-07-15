@@ -565,7 +565,7 @@ func TestRehydrateRejectedSnapshotLeavesProvidedDatamodelUntouchedBeforeReplay(t
 	if err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	badModel, err := chart.codec.Encode(&model{Applied: 500})
+	badModel, err := json.Marshal(&model{Applied: 500})
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
