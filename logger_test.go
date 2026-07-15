@@ -31,66 +31,78 @@ func (panicLogger) Log(string, Value) { panic("logger failed") }
 
 func TestLoggerPanicDoesNotAffectInterpretation(t *testing.T) {
 	var actions []string
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	logThenRecord, err := model.Action("logger.log-then-record", "v1", func(_ *struct{}, ec ExecContext, _ []Value) error {
+		ec.Log("diagnostic", Int64Value(42))
+		actions = append(actions, "after-log")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordNext, err := model.Action("logger.record-next-action", "v1", func(_ *struct{}, _ ExecContext, _ []Value) error {
+		actions = append(actions, "next-action")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	chart, err := Build(
 		Compound("root", "active",
 			Children(
 				Atomic("active",
-					On("go", Target("target"), Then(
-						func(ec ExecContext) error {
-							ec.Log("diagnostic", Int64Value(42))
-							actions = append(actions, "after-log")
-							return nil
-						},
-						func(ExecContext) error {
-							actions = append(actions, "next-action")
-							return nil
-						},
-					)),
+					On("go", Target("target"), Then(logThenRecord.Do(), recordNext.Do())),
 				),
 				Atomic("target", On(string(ErrEventExecution), Target("wrong"))),
 				Atomic("wrong"),
 			),
-		),
+		), model, WithRevisionSalt("logger-panic-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
-	ip.logger = panicLogger{}
-	ip.start()
-	ip.enqueue(Event{Name: "go", Type: EventExternal})
-	ip.processNextExternal()
+	ip, err := chart.NewInstance(WithLogger(panicLogger{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := ip.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer ip.Stop(ctx)
+	if err := ip.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
+		t.Fatal(err)
+	}
 
 	if got, want := strings.Join(actions, ","), "after-log,next-action"; got != want {
 		t.Fatalf("actions after logger panic = %q, want %q", got, want)
 	}
-	if !hasState(ip.activeStates(), "target") {
-		t.Fatalf("configuration = %v, want target; logger panic must not produce error.execution", ip.activeStates())
+	if !hasState(ip.Configuration(), "target") {
+		t.Fatalf("configuration = %v, want target; logger panic must not produce error.execution", ip.Configuration())
 	}
 }
 
 func TestExecContextLogCallsConfiguredLogger(t *testing.T) {
-	logOnEntry := Action(func(d *Door, ec ExecContext) error {
-		ec.Log("entered", testStringValue("open"))
-		return nil
-	})
+	model := NewGoModel(func() *Door { return &Door{} })
 
 	chart, err := Build(
 		Compound("door", "closed",
 			Children(
 				Atomic("closed", On("open.request", Target("open"))),
-				Atomic("open", OnEntry(logOnEntry)),
+				Atomic("open", OnEntry(LogValue("entered", GoLiteral(testStringValue("open"))))),
 			),
-		),
+		), model, WithRevisionSalt("logger-configured-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
 	rec := &recordingLogger{}
-	d := &Door{}
-	in := New(chart, d, WithLogger(rec))
+	in, err := chart.NewInstance(WithLogger(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -114,15 +126,19 @@ func TestExecContextLogClonesValueAtEvaluation(t *testing.T) {
 	source := map[string]Value{"count": Int64Value(1)}
 	payload := Value{kind: ValueKindMap, object: source}
 	rec := &recordingLogger{}
-	chart, err := Build(Atomic("ready", OnEntry(func(ec ExecContext) error {
-		ec.Log("payload", payload)
-		source["count"] = Int64Value(9)
-		return nil
-	})))
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	mutate, err := model.Action("logger.mutate-source", "v1", func(_ *struct{}, _ ExecContext, _ []Value) error { source["count"] = Int64Value(9); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart, err := Build(Atomic("ready", OnEntry(LogValue("payload", GoLiteral(payload)), mutate.Do())), model, WithRevisionSalt("logger-clone-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	in := New(chart, nil, WithLogger(rec))
+	in, err := chart.NewInstance(WithLogger(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := in.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -144,24 +160,23 @@ func TestExecContextLogIsNoopWithoutLogger(t *testing.T) {
 	var bare ExecContext
 	bare.Log("label", testStringValue("data")) // must not panic
 
-	logOnEntry := Action(func(d *Door, ec ExecContext) error {
-		ec.Log("entered", testStringValue("open"))
-		return nil
-	})
+	model := NewGoModel(func() *Door { return &Door{} })
 	chart, err := Build(
 		Compound("door", "closed",
 			Children(
 				Atomic("closed", On("open.request", Target("open"))),
-				Atomic("open", OnEntry(logOnEntry)),
+				Atomic("open", OnEntry(LogValue("entered", GoLiteral(testStringValue("open"))))),
 			),
-		),
+		), model, WithRevisionSalt("logger-noop-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	d := &Door{}
-	in := New(chart, d) // no WithLogger -- defaults to NoopLogger
+	in, err := chart.NewInstance() // no WithLogger -- defaults to NoopLogger
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -230,25 +245,24 @@ func TestRehydrateSuppressesLoggerDuringReplayThenGoesLive(t *testing.T) {
 	store := newMemSnapshotStore()
 	sessionID := SessionID("sess-logger")
 
-	logAction := func(ec ExecContext) error {
-		ec.Log("transition", Value{})
-		return nil
-	}
-
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
 	chart, err := Build(
 		Compound("m", "a",
 			Children(
-				Atomic("a", On("go", Target("b"), Then(logAction))),
-				Atomic("b", On("back", Target("a"), Then(logAction))),
+				Atomic("a", On("go", Target("b"), Then(LogValue("transition", GoLiteral(Value{}))))),
+				Atomic("b", On("back", Target("a"), Then(LogValue("transition", GoLiteral(Value{}))))),
 			),
-		),
+		), model, WithRevisionSalt("logger-rehydrate-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
 	spy := &spyLogger{}
-	in := New(chart, nil, WithLogger(spy))
+	in, err := chart.NewInstance(WithLogger(spy))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -267,7 +281,7 @@ func TestRehydrateSuppressesLoggerDuringReplayThenGoesLive(t *testing.T) {
 	}
 
 	spy2 := &spyLogger{}
-	in2, err := Rehydrate(ctx, chart, nil, log, store, sessionID, NoopIOProcessor, WithLogger(spy2))
+	in2, err := chart.Rehydrate(ctx, log, store, sessionID, NoopIOProcessor, WithLogger(spy2))
 	if err != nil {
 		t.Fatalf("Rehydrate: %v", err)
 	}

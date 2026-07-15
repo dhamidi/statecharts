@@ -1,7 +1,6 @@
 package actors
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -89,24 +88,35 @@ type counterModel struct {
 // produces is appended to sink, so a test can inspect whichever one a
 // System most recently activated.
 func buildLadderChart(sink *[]*counterModel) *statecharts.Chart {
-	inc := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *counterModel {
+		d := &counterModel{}
+		*sink = append(*sink, d)
+		return d
+	})
+	inc, err := model.Action("ladder.increment", "1", func(d *counterModel, _ statecharts.ExecContext, _ []statecharts.Value) error {
 		d.Applied++
 		return nil
 	})
+	if err != nil {
+		panic(err)
+	}
+	observe, err := model.Action("ladder.observe", "1", func(d *counterModel, _ statecharts.ExecContext, _ []statecharts.Value) error {
+		*sink = append(*sink, d)
+		return nil
+	})
+	if err != nil {
+		panic(err)
+	}
 	chart, err := statecharts.Build(
 		statecharts.Compound("ladder", "s0",
 			statecharts.Children(
-				statecharts.Atomic("s0", statecharts.On("inc", statecharts.Target("s1"), statecharts.Then(inc))),
-				statecharts.Atomic("s1", statecharts.On("inc", statecharts.Target("s2"), statecharts.Then(inc))),
-				statecharts.Atomic("s2", statecharts.On("inc", statecharts.Target("s3"), statecharts.Then(inc))),
-				statecharts.Atomic("s3", statecharts.On("inc", statecharts.Then(inc))),
+				statecharts.Atomic("s0", statecharts.On("inc", statecharts.Target("s1"), statecharts.Then(inc.Do())), statecharts.On("inspect", statecharts.Then(observe.Do()))),
+				statecharts.Atomic("s1", statecharts.On("inc", statecharts.Target("s2"), statecharts.Then(inc.Do())), statecharts.On("inspect", statecharts.Then(observe.Do()))),
+				statecharts.Atomic("s2", statecharts.On("inc", statecharts.Target("s3"), statecharts.Then(inc.Do())), statecharts.On("inspect", statecharts.Then(observe.Do()))),
+				statecharts.Atomic("s3", statecharts.On("inc", statecharts.Then(inc.Do())), statecharts.On("inspect", statecharts.Then(observe.Do()))),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any {
-			d := &counterModel{}
-			*sink = append(*sink, d)
-			return d
-		}), statecharts.WithVersion("test-v1"))
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -125,23 +135,27 @@ type locationModel struct {
 // ec.IOProcessorLocation(statecharts.SCXMLEventProcessor) into its datamodel and moves to
 // "checked". Every datamodel value produced is appended to sink.
 func buildLocationChart(sink *[]*locationModel) *statecharts.Chart {
-	record := statecharts.Action(func(d *locationModel, ec statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *locationModel {
+		d := &locationModel{}
+		*sink = append(*sink, d)
+		return d
+	})
+	record, err := model.Action("location.record", "1", func(d *locationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		loc, ok := ec.IOProcessorLocation(statecharts.SCXMLEventProcessor)
 		d.Location, d.OK = loc.String(), ok
 		return nil
 	})
+	if err != nil {
+		panic(err)
+	}
 	chart, err := statecharts.Build(
 		statecharts.Compound("locator", "idle",
 			statecharts.Children(
-				statecharts.Atomic("idle", statecharts.On("check", statecharts.Target("checked"), statecharts.Then(record))),
+				statecharts.Atomic("idle", statecharts.On("check", statecharts.Target("checked"), statecharts.Then(record.Do()))),
 				statecharts.Atomic("checked"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any {
-			d := &locationModel{}
-			*sink = append(*sink, d)
-			return d
-		}), statecharts.WithVersion("test-v1"))
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -157,14 +171,18 @@ type callerModel struct {
 // targeted at ev.Origin, to every "ping" it receives -- the receiving half
 // of the peer-messaging test pair.
 func buildResponderChart() *statecharts.Chart {
-	reply := func(ec statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	reply, err := model.Action("responder.reply", "1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		ec.Send("pong", statecharts.SendOptions{Target: ev.Origin})
 		return nil
+	})
+	if err != nil {
+		panic(err)
 	}
 	chart, err := statecharts.Build(
-		statecharts.Atomic("responder", statecharts.On("ping", statecharts.Then(reply))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("responder", statecharts.On("ping", statecharts.Then(reply.Do()))),
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -176,28 +194,28 @@ func buildResponderChart() *statecharts.Chart {
 // Origin) into its datamodel. Every datamodel value produced is appended to
 // sink.
 func buildCallerChart(sink *[]*callerModel, target statecharts.Identifier) *statecharts.Chart {
-	sendPing := statecharts.Action(func(d *callerModel, ec statecharts.ExecContext) error {
-		ec.Send("ping", statecharts.SendOptions{Target: target})
-		return nil
+	model := statecharts.NewGoModel(func() *callerModel {
+		d := &callerModel{}
+		*sink = append(*sink, d)
+		return d
 	})
-	recordOrigin := statecharts.Action(func(d *callerModel, ec statecharts.ExecContext) error {
+	recordOrigin, err := model.Action("caller.record-origin", "1", func(d *callerModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		d.ReceivedFrom = ev.Origin
 		return nil
 	})
+	if err != nil {
+		panic(err)
+	}
 	chart, err := statecharts.Build(
 		statecharts.Compound("caller", "idle",
 			statecharts.Children(
-				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(sendPing))),
-				statecharts.Atomic("waiting", statecharts.On("pong", statecharts.Target("done"), statecharts.Then(recordOrigin))),
+				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(statecharts.Send("ping", statecharts.SendTarget(string(target)))))),
+				statecharts.Atomic("waiting", statecharts.On("pong", statecharts.Target("done"), statecharts.Then(recordOrigin.Do()))),
 				statecharts.Atomic("done"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any {
-			d := &callerModel{}
-			*sink = append(*sink, d)
-			return d
-		}), statecharts.WithVersion("test-v1"))
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -215,12 +233,9 @@ func buildCallerChart(sink *[]*callerModel, target statecharts.Identifier) *stat
 func buildInvokingChart() *statecharts.Chart {
 	chart, err := statecharts.Build(
 		statecharts.Atomic("invoking",
-			statecharts.Invoke(func(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
-				<-ctx.Done()
-				return statecharts.NullValue(), nil
-			}),
+			statecharts.Invoke("actors.test.blocking", "blocking-service", statecharts.WithInvokeDefinitionID("blocking-service-v1")),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -238,7 +253,7 @@ func buildFinishingChart() *statecharts.Chart {
 				statecharts.Final("done"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -255,13 +270,13 @@ func buildDelayedFinishingChart(delay time.Duration) *statecharts.Chart {
 		statecharts.Compound("delayedFinisher", "running",
 			statecharts.Children(
 				statecharts.Atomic("running",
-					statecharts.OnEntry(statecharts.SendEvent("finish", statecharts.SendOptions{Delay: delay})),
+					statecharts.OnEntry(statecharts.Send("finish", statecharts.SendDelay(delay))),
 					statecharts.On("finish", statecharts.Target("done")),
 				),
 				statecharts.Final("done"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -275,15 +290,12 @@ func buildInitAbortChart() *statecharts.Chart {
 		statecharts.Compound("operation", "idle",
 			statecharts.Children(
 				statecharts.Atomic("idle", statecharts.On("init", statecharts.Target("running"),
-					statecharts.Then(statecharts.SendEvent("abort", statecharts.SendOptions{
-						SendID: "abort-operation",
-						Delay:  2 * time.Second,
-					})))),
+					statecharts.Then(statecharts.Send("abort", statecharts.SendID("abort-operation"), statecharts.SendDelay(2*time.Second))))),
 				statecharts.Atomic("running", statecharts.On("abort", statecharts.Target("aborted"))),
 				statecharts.Atomic("aborted"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -299,12 +311,12 @@ func buildCommTestChart(unknownTarget statecharts.Identifier) *statecharts.Chart
 		statecharts.Compound("commtest", "idle",
 			statecharts.Children(
 				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"),
-					statecharts.Then(statecharts.SendEvent("ping", statecharts.SendOptions{Target: unknownTarget})))),
+					statecharts.Then(statecharts.Send("ping", statecharts.SendTarget(string(unknownTarget)))))),
 				statecharts.Atomic("waiting", statecharts.On("error.communication", statecharts.Target("failed"))),
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}
@@ -317,27 +329,27 @@ type asyncFailureModel struct {
 }
 
 func buildAsyncFailureSender(sink *[]*asyncFailureModel, target statecharts.Identifier) *statecharts.Chart {
-	send := statecharts.Action(func(_ *asyncFailureModel, ec statecharts.ExecContext) error {
-		ec.Send("ping", statecharts.SendOptions{SendID: "request-7", Target: target})
-		return nil
+	model := statecharts.NewGoModel(func() *asyncFailureModel {
+		d := &asyncFailureModel{}
+		*sink = append(*sink, d)
+		return d
 	})
-	record := statecharts.Action(func(d *asyncFailureModel, ec statecharts.ExecContext) error {
+	record, err := model.Action("async-failure.record", "1", func(d *asyncFailureModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		d.Event, d.Seen = ec.Event()
 		return nil
 	})
+	if err != nil {
+		panic(err)
+	}
 	chart, err := statecharts.Build(
 		statecharts.Compound("async-failure-sender", "idle",
 			statecharts.Children(
-				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(send))),
-				statecharts.Atomic("waiting", statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("failed"), statecharts.Then(record))),
+				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(statecharts.Send("ping", statecharts.SendID("request-7"), statecharts.SendTarget(string(target)))))),
+				statecharts.Atomic("waiting", statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("failed"), statecharts.Then(record.Do()))),
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any {
-			d := &asyncFailureModel{}
-			*sink = append(*sink, d)
-			return d
-		}), statecharts.WithVersion("test-v1"))
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		panic(err)
 	}

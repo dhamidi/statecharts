@@ -160,22 +160,3 @@ func (p *LocalIOProcessor) IOProcessors() []IOProcessorInfo {
 		Location: LocationFromIdentifier(Identifier("#_scxml_" + string(identified.ID()))),
 	}}
 }
-
-// SendEvent returns executable content that schedules delivery of an event
-// named name, per opts -- the Go-API equivalent of <send>, for use in
-// Then(...)/OnEntry(...)/OnExit(...).
-func SendEvent(name Identifier, opts SendOptions) ActionFunc {
-	return func(ec ExecContext) error {
-		ec.Send(name, opts)
-		return nil
-	}
-}
-
-// CancelSend returns executable content that best-effort cancels a pending
-// delayed send by ID -- the Go-API equivalent of <cancel>.
-func CancelSend(sendID Identifier) ActionFunc {
-	return func(ec ExecContext) error {
-		ec.Cancel(sendID)
-		return nil
-	}
-}

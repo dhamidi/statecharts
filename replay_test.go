@@ -5,14 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"iter"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// memLog is a minimal in-memory Log test double.
 type memLog struct {
 	mu      sync.Mutex
 	entries map[SessionID][]LogEntry
@@ -20,42 +17,33 @@ type memLog struct {
 
 func newMemLog() *memLog { return &memLog{entries: map[SessionID][]LogEntry{}} }
 
-func (l *memLog) Append(ctx context.Context, entry LogEntry) (uint64, error) {
+func (l *memLog) Append(_ context.Context, entry LogEntry) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	seq := uint64(len(l.entries[entry.SessionID])) + 1
-	entry.Seq = seq
+	entry.Seq = uint64(len(l.entries[entry.SessionID])) + 1
 	l.entries[entry.SessionID] = append(l.entries[entry.SessionID], entry)
-	return seq, nil
+	return entry.Seq, nil
 }
 
-func (l *memLog) Read(ctx context.Context, sessionID SessionID, from uint64) iter.Seq2[LogEntry, error] {
+func (l *memLog) Read(_ context.Context, sessionID SessionID, from uint64) iter.Seq2[LogEntry, error] {
 	return func(yield func(LogEntry, error) bool) {
 		l.mu.Lock()
 		entries := append([]LogEntry(nil), l.entries[sessionID]...)
 		l.mu.Unlock()
-		for _, e := range entries {
-			if e.Seq < from {
-				continue
-			}
-			if !yield(e, nil) {
+		for _, entry := range entries {
+			if entry.Seq >= from && !yield(entry, nil) {
 				return
 			}
 		}
 	}
 }
 
-func (l *memLog) LastSeq(ctx context.Context, sessionID SessionID) (uint64, error) {
+func (l *memLog) LastSeq(_ context.Context, sessionID SessionID) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	entries := l.entries[sessionID]
-	if len(entries) == 0 {
-		return 0, nil
-	}
-	return entries[len(entries)-1].Seq, nil
+	return uint64(len(l.entries[sessionID])), nil
 }
 
-// memSnapshotStore is a minimal in-memory SnapshotStore test double.
 type memSnapshotStore struct {
 	mu sync.Mutex
 	cp map[SessionID]Checkpoint
@@ -65,1941 +53,952 @@ func newMemSnapshotStore() *memSnapshotStore {
 	return &memSnapshotStore{cp: map[SessionID]Checkpoint{}}
 }
 
-func (s *memSnapshotStore) Save(ctx context.Context, sessionID SessionID, cp Checkpoint) error {
+func (s *memSnapshotStore) Save(_ context.Context, sessionID SessionID, checkpoint Checkpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cp[sessionID] = cp
+	s.cp[sessionID] = checkpoint
 	return nil
 }
 
-func (s *memSnapshotStore) Load(ctx context.Context, sessionID SessionID) (Checkpoint, bool, error) {
+func (s *memSnapshotStore) Load(_ context.Context, sessionID SessionID) (Checkpoint, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cp, ok := s.cp[sessionID]
-	return cp, ok, nil
+	checkpoint, ok := s.cp[sessionID]
+	return checkpoint, ok, nil
 }
 
-func doorChart(t *testing.T) *Chart {
+type replayDoor struct {
+	Locked    bool
+	OpenCount int
+}
+
+func replayDoorChart(t *testing.T, created *[]*replayDoor, observations ...chan<- int) *Chart {
 	t.Helper()
-	notLocked := Cond(func(d *Door, ec ExecContext) bool { return !d.Locked })
-	recordOpen := Action(func(d *Door, ec ExecContext) error { d.OpenCount++; return nil })
-	chart, err := Build(
-		Compound("door", "closed",
-			Children(
-				Atomic("closed", On("open.request", Target("open"), If(notLocked), Then(recordOpen))),
-				Atomic("open", On("close.request", Target("closed"))),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	return chart
-}
-
-type delayedAbortModel struct {
-	Aborts int
-}
-
-func delayedAbortChart(t *testing.T) *Chart {
-	t.Helper()
-	scheduleAbort := SendEvent("abort", SendOptions{SendID: "abort-operation", Delay: 2 * time.Second})
-	recordAbort := Action(func(d *delayedAbortModel, ec ExecContext) error {
-		d.Aborts++
+	b := newTestBuilder(t, func() *replayDoor {
+		data := &replayDoor{}
+		*created = append(*created, data)
+		return data
+	})
+	notLocked := b.condition("door-is-not-locked", func(data *replayDoor, _ ExecContext) bool { return !data.Locked })
+	recordOpen := b.action("record-door-open", func(data *replayDoor, _ ExecContext) error {
+		data.OpenCount++
 		return nil
 	})
-	chart, err := Build(
-		Compound("operation", "idle",
-			Children(
-				Atomic("idle", On("init", Target("running"), Then(scheduleAbort))),
-				Atomic("running", On("abort", Target("aborted"), Then(recordAbort))),
-				Atomic("aborted", On("abort", Then(recordAbort))),
-			),
-		),
-	)
+	observe := b.action("observe-door-open-count", func(data *replayDoor, _ ExecContext) error {
+		if len(observations) > 0 {
+			observations[0] <- data.OpenCount
+		}
+		return nil
+	})
+	chart, err := b.build(Compound("door", "closed", Children(
+		Atomic("closed", On("open.request", Target("open"), If(notLocked), Then(recordOpen))),
+		Atomic("open", On("close.request", Target("closed")), On("inspect", Then(observe))),
+	)), WithRevisionSalt("replay-door-v1"))
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
 	return chart
 }
 
-func TestSnapshotRoundTripJSON(t *testing.T) {
-	chart := doorChart(t)
-	d := &Door{}
-	in := New(chart, d)
+func TestSnapshotRoundTripRestoresConfigurationModelAndSessionID(t *testing.T) {
+	var created []*replayDoor
+	observed := make(chan int, 1)
+	chart := replayDoorChart(t, &created, observed)
+	instance, err := chart.NewInstance(WithSessionID("door-42"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := in.Send(ctx, Event{Name: "open.request", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
+	if err := instance.Send(ctx, Event{Name: "open.request"}); err != nil {
+		t.Fatal(err)
 	}
-
-	snap, err := in.Snapshot(ctx)
+	snapshot, err := instance.Snapshot(ctx)
 	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+		t.Fatal(err)
 	}
-	if !hasState(snap.Configuration, "open") {
-		t.Fatalf("snapshot configuration = %v, want 'open'", snap.Configuration)
+	if err := instance.Stop(ctx); err != nil {
+		t.Fatal(err)
 	}
 
-	b, err := json.Marshal(snap)
+	wire, err := json.Marshal(snapshot)
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
-	var got Snapshot
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	var decoded Snapshot
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatal(err)
 	}
-	if !hasState(got.Configuration, "open") {
-		t.Fatalf("round-tripped configuration = %v, want 'open'", got.Configuration)
+	restored, err := chart.Restore(decoded)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if restored.ID() != "door-42" {
+		t.Fatalf("restored ID = %q", restored.ID())
+	}
+	if err := restored.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Stop(ctx)
+	active := restored.Configuration()
+	if !hasState(active, "open") {
+		t.Fatalf("restored active = %v", active)
+	}
+	if err := restored.Send(ctx, Event{Name: "inspect"}); err != nil {
+		t.Fatal(err)
+	}
+	if count := <-observed; count != 1 {
+		t.Fatalf("restored open count = %d", count)
+	}
+	if err := restored.Send(ctx, Event{Name: "close.request"}); err != nil {
+		t.Fatal(err)
+	}
+	waitActive(t, restored, "closed")
+}
 
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+func TestRestoreWithSessionIDOverridesSnapshot(t *testing.T) {
+	var created []*replayDoor
+	chart := replayDoorChart(t, &created)
+	instance, err := chart.NewInstance(WithSessionID("snapshot-session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := instance.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := chart.Restore(snapshot, WithSessionID("option-session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.ID() != "option-session" {
+		t.Fatalf("restored ID = %q, want option-session", restored.ID())
 	}
 }
 
 func TestSnapshotQueuesAndPendingSendsRoundTripCanonicalValues(t *testing.T) {
-	nested, err := MapValue(map[string]Value{
-		"items": ListValue([]Value{Int64Value(1), testStringValue("two")}),
-	})
+	nested, err := MapValue(map[string]Value{"items": ListValue([]Value{Int64Value(1), testStringValue("two")})})
 	if err != nil {
-		t.Fatalf("MapValue: %v", err)
+		t.Fatal(err)
 	}
 	payload, err := TaggedValue("snapshot.payload/v1", nested)
 	if err != nil {
-		t.Fatalf("TaggedValue: %v", err)
+		t.Fatal(err)
 	}
-	snapshot := Snapshot{
+	want := Snapshot{
 		Version:       snapshotVersion,
 		InternalQueue: []Event{{Name: "internal", Type: EventInternal, Data: payload}},
 		ExternalQueue: []Event{{Name: "external", Type: EventExternal, Data: payload, DeliveryID: "delivery-1"}},
 		PendingSends: []PendingSend{{
 			SendID: "send-1", Target: "worker", Type: SCXMLEventProcessor,
-			Event:  Event{Name: "later", Data: payload, SendID: "send-1"},
-			FireAt: time.Unix(123, 456).UTC(),
+			Event: Event{Name: "later", Data: payload, SendID: "send-1"}, FireAt: time.Unix(123, 456).UTC(),
 		}},
 	}
-
-	encoded, err := json.Marshal(snapshot)
+	wire, err := json.Marshal(want)
 	if err != nil {
-		t.Fatalf("Marshal Snapshot: %v", err)
-	}
-	var decoded Snapshot
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
-		t.Fatalf("Unmarshal Snapshot: %v", err)
-	}
-	if len(decoded.InternalQueue) != 1 || !decoded.InternalQueue[0].Data.Equal(payload) {
-		t.Fatalf("internal queue = %#v, want canonical payload", decoded.InternalQueue)
-	}
-	if len(decoded.ExternalQueue) != 1 || decoded.ExternalQueue[0].DeliveryID != "delivery-1" || !decoded.ExternalQueue[0].Data.Equal(payload) {
-		t.Fatalf("external queue = %#v, want payload and delivery identity", decoded.ExternalQueue)
-	}
-	if len(decoded.PendingSends) != 1 || !decoded.PendingSends[0].Event.Data.Equal(payload) || !decoded.PendingSends[0].FireAt.Equal(snapshot.PendingSends[0].FireAt) {
-		t.Fatalf("pending sends = %#v, want canonical payload and deadline", decoded.PendingSends)
-	}
-}
-
-func TestSnapshotJSONRoundTripsID(t *testing.T) {
-	chart := doorChart(t)
-	d := &Door{}
-	in := New(chart, d, WithSessionID("sess-json-id"))
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if snap.ID != "sess-json-id" {
-		t.Fatalf("snap.ID = %q, want %q", snap.ID, "sess-json-id")
-	}
-
-	b, err := json.Marshal(snap)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
 	var got Snapshot
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	if err := json.Unmarshal(wire, &got); err != nil {
+		t.Fatal(err)
 	}
-	if got.ID != "sess-json-id" {
-		t.Fatalf("round-tripped ID = %q, want %q", got.ID, "sess-json-id")
-	}
-
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	if !got.InternalQueue[0].Data.Equal(payload) || !got.ExternalQueue[0].Data.Equal(payload) || !got.PendingSends[0].Event.Data.Equal(payload) {
+		t.Fatalf("snapshot payloads did not round-trip: %#v", got)
 	}
 }
 
-func TestRestorePreservesSessionIDFromSnapshot(t *testing.T) {
-	chart := doorChart(t)
-	d1 := &Door{}
-	in1 := New(chart, d1, WithSessionID("original-session"))
+func TestRestoreRearmsPendingSendAgainstConfiguredClock(t *testing.T) {
+	type model struct{ Aborts int }
+	var models []*model
+	b := newTestBuilder(t, func() *model { data := &model{}; models = append(models, data); return data })
+	aborted := make(chan int, 1)
+	recordAbort := b.action("record-delayed-abort", func(data *model, _ ExecContext) error {
+		data.Aborts++
+		aborted <- data.Aborts
+		return nil
+	})
+	chart, err := b.build(Compound("operation", "idle", Children(
+		Atomic("idle", On("start", Target("running"), Then(Send("abort", SendID("abort-operation"), SendDelay(2*time.Second))))),
+		Atomic("running", On("abort", Target("aborted"), Then(recordAbort))),
+		Atomic("aborted"),
+	)), WithRevisionSalt("delayed-abort-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := NewManualClock(time.Unix(0, 0))
+	instance, err := chart.NewInstance(WithClock(clock))
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
-	if err := in1.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	snap, err := in1.Snapshot(ctx)
+	if err := instance.Send(ctx, Event{Name: "start"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := instance.Snapshot(ctx)
 	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+		t.Fatal(err)
 	}
-	if err := in1.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	if err := instance.Stop(ctx); err != nil {
+		t.Fatal(err)
 	}
-
-	d2 := &Door{}
-	in2, err := Restore(chart, d2, snap)
+	restored, err := chart.Restore(snapshot, WithClock(clock))
 	if err != nil {
-		t.Fatalf("Restore: %v", err)
+		t.Fatal(err)
 	}
-	if in2.ID() != "original-session" {
-		t.Fatalf("restored Instance.ID() = %q, want %q (preserved from Snapshot)", in2.ID(), "original-session")
+	if err := restored.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestRestoreWithSessionIDOverridesSnapshot(t *testing.T) {
-	chart := doorChart(t)
-	d1 := &Door{}
-	in1 := New(chart, d1, WithSessionID("original-session"))
-	ctx := context.Background()
-	if err := in1.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	snap, err := in1.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := in1.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	d2 := &Door{}
-	in2, err := Restore(chart, d2, snap, WithSessionID("override-session"))
-	if err != nil {
-		t.Fatalf("Restore: %v", err)
-	}
-	if in2.ID() != "override-session" {
-		t.Fatalf("restored Instance.ID() = %q, want %q (explicit WithSessionID must override the Snapshot's)", in2.ID(), "override-session")
-	}
-}
-
-func TestRestoreFromSnapshot(t *testing.T) {
-	chart := doorChart(t)
-	d1 := &Door{}
-	in1 := New(chart, d1)
-	ctx := context.Background()
-	if err := in1.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if err := in1.Send(ctx, Event{Name: "open.request", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	snap, err := in1.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := in1.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	// Restore against a FRESH datamodel value, as a real cold start would.
-	d2 := &Door{}
-	in2, err := Restore(chart, d2, snap)
-	if err != nil {
-		t.Fatalf("Restore: %v", err)
-	}
-	if err := in2.Start(ctx); err != nil {
-		t.Fatalf("Start (restored): %v", err)
-	}
-	if !hasState(in2.Configuration(), "open") {
-		t.Fatalf("restored configuration = %v, want 'open'", in2.Configuration())
-	}
-	// Restore must populate the caller-provided datamodel from the snapshot,
-	// without re-running the action that originally produced this count.
-	if d2.OpenCount != 1 {
-		t.Fatalf("d2.OpenCount = %d, want restored value 1", d2.OpenCount)
-	}
-
-	// the restored instance must still work going forward.
-	if err := in2.Send(ctx, Event{Name: "close.request", Type: EventExternal}); err != nil {
-		t.Fatalf("Send after restore: %v", err)
-	}
-	if !hasState(in2.Configuration(), "closed") {
-		t.Fatalf("configuration after restore+Send = %v, want 'closed'", in2.Configuration())
-	}
-	if err := in2.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-}
-
-func TestRestoreUsesConfiguredClockForPendingSendDeadline(t *testing.T) {
-	ctx := context.Background()
-	startedAt := time.Unix(0, 0)
-	clock := NewManualClock(startedAt)
-	d := &delayedAbortModel{}
-	snap := Snapshot{
-		Version:       snapshotVersion,
-		Datamodel:     []byte(`{}`),
-		Configuration: []Identifier{"running"},
-		Running:       true,
-		PendingSends: []PendingSend{
-			{
-				SendID: "abort-operation",
-				Event:  Event{Name: "abort", SendID: "abort-operation"},
-				FireAt: startedAt.Add(2 * time.Second),
-			},
-		},
-	}
-
-	in, err := Restore(delayedAbortChart(t), d, snap, WithClock(clock))
-	if err != nil {
-		t.Fatalf("Restore: %v", err)
-	}
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
+	defer restored.Stop(ctx)
 	clock.Advance(time.Second)
-	if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-		t.Fatalf("synchronize after 1s: %v", err)
+	if err := restored.Send(ctx, Event{Name: "sync"}); err != nil {
+		t.Fatal(err)
 	}
-	if !hasState(in.Configuration(), "running") {
-		t.Fatalf("configuration after 1s = %v, want 'running' before the configured clock reaches FireAt", in.Configuration())
-	}
-
+	waitActive(t, restored, "running")
 	clock.Advance(time.Second)
-	if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-		t.Fatalf("synchronize after 2s: %v", err)
+	if err := restored.Send(ctx, Event{Name: "sync"}); err != nil {
+		t.Fatal(err)
 	}
-	if !hasState(in.Configuration(), "aborted") {
-		t.Fatalf("configuration after 2s = %v, want 'aborted' at FireAt", in.Configuration())
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	waitActive(t, restored, "aborted")
+	if count := <-aborted; count != 1 {
+		t.Fatalf("abort count = %d", count)
 	}
 }
 
 func TestRestorePreservesAutoGeneratedSendSequence(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Atomic("running",
+		OnEntry(Send("first", SendDelay(time.Hour))),
+		On("again", Then(Send("second", SendDelay(time.Hour)))),
+	), WithRevisionSalt("send-sequence-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
-	clock := NewManualClock(time.Unix(0, 0))
-	scheduleFirst := Action(func(_ *struct{}, ec ExecContext) error {
-		ec.Send("first", SendOptions{Delay: 10 * time.Second})
-		return nil
-	})
-	scheduleSecond := Action(func(_ *struct{}, ec ExecContext) error {
-		ec.Send("second", SendOptions{Delay: 20 * time.Second})
-		return nil
-	})
-	chart, err := Build(Atomic("running", OnEntry(scheduleFirst), On("again", Then(scheduleSecond))))
+	in, err := chart.NewInstance()
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
-	in1 := New(chart, &struct{}{}, WithClock(clock))
-	if err := in1.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := in.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	snap, err := in1.Snapshot(ctx)
+	snapshot, err := in.Snapshot(ctx)
 	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+		t.Fatal(err)
 	}
-	b, err := json.Marshal(snap)
+	wire, err := json.Marshal(snapshot)
 	if err != nil {
-		t.Fatalf("marshal Snapshot: %v", err)
+		t.Fatal(err)
 	}
 	var persisted Snapshot
-	if err := json.Unmarshal(b, &persisted); err != nil {
-		t.Fatalf("unmarshal Snapshot: %v", err)
+	if err := json.Unmarshal(wire, &persisted); err != nil {
+		t.Fatal(err)
 	}
-	if err := in1.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	if err := in.Stop(ctx); err != nil {
+		t.Fatal(err)
 	}
-
-	in2, err := Restore(chart, &struct{}{}, persisted, WithClock(clock))
+	restored, err := chart.Restore(persisted)
 	if err != nil {
-		t.Fatalf("Restore: %v", err)
+		t.Fatal(err)
 	}
-	if err := in2.Start(ctx); err != nil {
-		t.Fatalf("Start restored: %v", err)
+	if err := restored.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := in2.Send(ctx, Event{Name: "again", Type: EventExternal}); err != nil {
-		t.Fatalf("Send again: %v", err)
+	defer restored.Stop(ctx)
+	if err := restored.Send(ctx, Event{Name: "again"}); err != nil {
+		t.Fatal(err)
 	}
-	got, err := in2.Snapshot(ctx)
+	got, err := restored.Snapshot(ctx)
 	if err != nil {
-		t.Fatalf("Snapshot restored: %v", err)
+		t.Fatal(err)
 	}
 	if len(got.PendingSends) != 2 || got.PendingSends[0].SendID != "send.1" || got.PendingSends[1].SendID != "send.2" {
-		t.Fatalf("pending send IDs after restore = %v, want distinct send.1 and send.2", got.PendingSends)
-	}
-	if err := in2.Stop(ctx); err != nil {
-		t.Fatalf("Stop restored: %v", err)
+		t.Fatalf("pending sends = %#v, want send.1 and send.2", got.PendingSends)
 	}
 }
 
 func TestRestorePreservesAutoGeneratedInvokeSequence(t *testing.T) {
-	ctx := context.Background()
-	invoke := Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-		<-ctx.Done()
-		return Value{}, ctx.Err()
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	chart, err := Build(Compound("machine", "invoking", Children(
+		Atomic("invoking", Invoke("worker", "jobs", WithInvokeDefinitionID("worker-definition")), On("leave", Target("idle"))),
+		Atomic("idle", On("enter", Target("invoking"))),
+	)), model, WithRevisionSalt("invoke-sequence-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, _ InvokeIO) (Value, error) {
+			<-ctx.Done()
+			return NullValue(), ctx.Err()
+		})
 	})
-	chart, err := Build(
-		Compound("machine", "invoking",
-			Children(
-				Atomic("invoking", invoke, On("leave", Target("idle"))),
-				Atomic("idle", On("enter", Target("invoking"))),
-			),
-		),
-	)
+	ctx := context.Background()
+	in, err := chart.NewInstance(handler)
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
-	in1 := New(chart, nil)
-	if err := in1.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := in.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := in1.Send(ctx, Event{Name: "leave", Type: EventExternal}); err != nil {
-		t.Fatalf("Send leave: %v", err)
+	if err := in.Send(ctx, Event{Name: "leave", Type: EventExternal}); err != nil {
+		t.Fatal(err)
 	}
-	snap, err := in1.Snapshot(ctx)
+	snapshot, err := in.Snapshot(ctx)
 	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+		t.Fatal(err)
 	}
-	b, err := json.Marshal(snap)
+	wire, err := json.Marshal(snapshot)
 	if err != nil {
-		t.Fatalf("marshal Snapshot: %v", err)
+		t.Fatal(err)
 	}
 	var persisted Snapshot
-	if err := json.Unmarshal(b, &persisted); err != nil {
-		t.Fatalf("unmarshal Snapshot: %v", err)
+	if err := json.Unmarshal(wire, &persisted); err != nil {
+		t.Fatal(err)
 	}
-	if err := in1.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	if err := in.Stop(ctx); err != nil {
+		t.Fatal(err)
 	}
 
-	in2, err := Restore(chart, nil, persisted)
+	restored, err := chart.Restore(persisted, handler)
 	if err != nil {
-		t.Fatalf("Restore: %v", err)
+		t.Fatal(err)
 	}
-	if err := in2.Start(ctx); err != nil {
-		t.Fatalf("Start restored: %v", err)
+	if err := restored.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := in2.Send(ctx, Event{Name: "enter", Type: EventExternal}); err != nil {
-		t.Fatalf("Send enter: %v", err)
+	defer restored.Stop(ctx)
+	if err := restored.Send(ctx, Event{Name: "enter", Type: EventExternal}); err != nil {
+		t.Fatal(err)
 	}
-	got, err := in2.Snapshot(ctx)
+	got, err := restored.Snapshot(ctx)
 	if err != nil {
-		t.Fatalf("Snapshot restored: %v", err)
+		t.Fatal(err)
 	}
 	if len(got.ActiveInvokes) != 1 || got.ActiveInvokes[0].ID != "invoking.invoke2" {
 		t.Fatalf("active invokes after restore = %v, want session-unique id invoking.invoke2", got.ActiveInvokes)
 	}
-	if err := in2.Stop(ctx); err != nil {
-		t.Fatalf("Stop restored: %v", err)
-	}
 }
 
-func TestRestoreRejectsUnsupportedSnapshotVersion(t *testing.T) {
-	snap := Snapshot{Version: snapshotVersion + 100, Running: true}
-	if _, err := Restore(doorChart(t), &Door{}, snap); err == nil {
-		t.Fatalf("Restore accepted snapshot version %d, want an unsupported-version error", snap.Version)
-	}
-}
-
-func TestRehydrateIgnoresUnsupportedCheckpointAndReplaysLog(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("unsupported-checkpoint")
-	ev := Event{Name: "open.request", Type: EventExternal}
-	if _, err := log.Append(ctx, LogEntry{
-		SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Unix(1, 0), Event: ev,
-	}); err != nil {
-		t.Fatalf("Append: %v", err)
-	}
-	bad := Snapshot{
-		Version:       snapshotVersion + 100,
-		Configuration: []Identifier{"closed"},
-		Running:       true,
-	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: bad, Seq: 1}); err != nil {
-		t.Fatalf("Save unsupported checkpoint: %v", err)
-	}
-
-	in, err := Rehydrate(ctx, doorChart(t), &Door{}, log, store, sessionID, NoopIOProcessor)
+func TestSnapshotActiveInvokesJSONRoundTrip(t *testing.T) {
+	want := Snapshot{Version: snapshotVersion, ActiveInvokes: []ActiveInvoke{{
+		State: "running", DefinitionID: "worker-definition", ID: "worker.invoke7",
+		Type: "worker", Source: "jobs/42",
+	}}}
+	wire, err := json.Marshal(want)
 	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
+		t.Fatal(err)
 	}
-	if !hasState(in.Configuration(), "open") {
-		t.Fatalf("configuration = %v, want open from full log replay", in.Configuration())
+	var got Snapshot
+	if err := json.Unmarshal(wire, &got); err != nil {
+		t.Fatal(err)
 	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	if len(got.ActiveInvokes) != 1 || got.ActiveInvokes[0] != want.ActiveInvokes[0] {
+		t.Fatalf("active invokes = %#v, want %#v", got.ActiveInvokes, want.ActiveInvokes)
 	}
 }
 
-func TestRehydrateRejectedSnapshotLeavesProvidedDatamodelUntouchedBeforeReplay(t *testing.T) {
+func TestRestoreRejectsActiveInvokeNotInConfiguration(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Compound("root", "idle", Children(
+		Atomic("idle"), Atomic("running", Invoke("worker", "jobs", WithInvokeDefinitionID("worker-definition"))),
+	)), WithRevisionSalt("invalid-active-invoke-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = chart.Restore(Snapshot{
+		Version: snapshotVersion, ChartVersion: chart.Version(), Running: true,
+		Configuration: []Identifier{"idle"},
+		ActiveInvokes: []ActiveInvoke{{State: "running", DefinitionID: "worker-definition", ID: "worker-1", Type: "worker", Source: "jobs"}},
+	}, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+			return NullValue(), nil
+		})
+	}))
+	if !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("Restore error = %v, want ErrInvalidSnapshot", err)
+	}
+}
+
+func TestRestoreRejectsUnsupportedSnapshotVersionAndRevision(t *testing.T) {
+	var created []*replayDoor
+	chart := replayDoorChart(t, &created)
+	if _, err := chart.Restore(Snapshot{Version: snapshotVersion + 1}); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("unsupported version error = %v", err)
+	}
+	if _, err := chart.Restore(Snapshot{Version: snapshotVersion, ChartVersion: "other"}); !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("revision mismatch error = %v", err)
+	}
+}
+
+func TestRehydrateReplaysLogIntoFreshSession(t *testing.T) {
+	ctx := context.Background()
+	log := newMemLog()
+	sessionID := SessionID("replay-door")
+	_, _ = log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Unix(1, 0), Event: Event{Name: "open.request"}})
+	var created []*replayDoor
+	chart := replayDoorChart(t, &created)
+	instance, err := chart.Rehydrate(ctx, log, newMemSnapshotStore(), sessionID, NoopIOProcessor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(ctx)
+	waitActive(t, instance, "open")
+	if len(created) != 1 || created[0].OpenCount != 1 {
+		t.Fatalf("replayed models = %#v", created)
+	}
+}
+
+func TestRehydrateRejectsBadCheckpointAndReplaysFromBeginning(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := SessionID("rejected-snapshot-datamodel")
-	type model struct{ Applied int }
-	apply := Action(func(d *model, _ ExecContext) error {
-		d.Applied++
+	sessionID := SessionID("bad-checkpoint")
+	_, _ = log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Unix(1, 0), Event: Event{Name: "open.request"}})
+	store.cp[sessionID] = Checkpoint{Seq: 1, Snapshot: Snapshot{Version: snapshotVersion + 1}}
+	var created []*replayDoor
+	chart := replayDoorChart(t, &created)
+	instance, err := chart.Rehydrate(ctx, log, store, sessionID, NoopIOProcessor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(ctx)
+	waitActive(t, instance, "open")
+	if created[len(created)-1].OpenCount != 1 {
+		t.Fatalf("OpenCount = %d", created[len(created)-1].OpenCount)
+	}
+}
+
+func TestRehydrateRejectedSnapshotDecodeCannotMutateReplaySession(t *testing.T) {
+	type modelState struct{ Applied int }
+	var factorySessions []*modelState
+	var decodedSessions []*modelState
+	model := NewGoModel(func() *modelState {
+		data := &modelState{Applied: 99}
+		factorySessions = append(factorySessions, data)
+		return data
+	}, WithGoSnapshotCodec(GoSnapshotCodec[modelState]{
+		Encode: func(data *modelState) ([]byte, error) { return json.Marshal(data) },
+		Decode: func(data []byte) (*modelState, error) {
+			var decoded modelState
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				return nil, err
+			}
+			decodedSessions = append(decodedSessions, &decoded)
+			return nil, errors.New("reject decoded snapshot after partial mutation")
+		},
+	}))
+	apply, err := model.Action("apply", "v1", func(data *modelState, _ ExecContext, _ []Value) error {
+		data.Applied++
 		return nil
 	})
-	chart, err := Build(
-		Compound("root", "ready", Children(Atomic("ready", On("apply", Then(apply))))),
-		WithVersion("rejected-snapshot-v1"),
-	)
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
-	seq, err := log.Append(ctx, LogEntry{
-		SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(),
-		Event: Event{Name: "apply", Type: EventExternal},
-	})
+	chart, err := Build(Compound("root", "ready", Children(Atomic("ready", On("apply", Then(apply.Do()))))), model, WithRevisionSalt("rejected-snapshot-v1"))
 	if err != nil {
-		t.Fatalf("Append: %v", err)
+		t.Fatal(err)
 	}
-	badModel, err := json.Marshal(&model{Applied: 500})
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	bad := Snapshot{
-		Version: snapshotVersion, ChartVersion: chart.Version(), Datamodel: badModel,
-		Configuration: []Identifier{"missing"}, Running: true,
-	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: bad, Seq: seq}); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-
-	d := &model{Applied: 99}
-	in, err := Rehydrate(ctx, chart, d, log, store, sessionID, NoopIOProcessor)
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	defer in.Stop(ctx)
-	if d.Applied != 100 {
-		t.Fatalf("provided datamodel Applied = %d, want 100 (99 untouched by rejected cache, then one full-replay event)", d.Applied)
-	}
-}
-
-func TestRehydrateReplaysExplicitSends(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-1")
-
-	// Live phase: append-then-Send for each explicit external event, so
-	// the log is always written ahead of the event being applied.
-	chart := doorChart(t)
-	d := &Door{}
-	in := New(chart, d, WithIOProcessor(SCXMLEventProcessor, NoopIOProcessor))
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	sendLive := func(ev Event) {
-		t.Helper()
-		if _, err := log.Append(ctx, LogEntry{
-			SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(), Event: ev,
-		}); err != nil {
-			t.Fatalf("log.Append: %v", err)
-		}
-		if err := in.Send(ctx, ev); err != nil {
-			t.Fatalf("Send: %v", err)
-		}
-	}
-
-	sendLive(Event{Name: "open.request", Type: EventExternal})
-	sendLive(Event{Name: "close.request", Type: EventExternal})
-	sendLive(Event{Name: "open.request", Type: EventExternal})
-
-	if !hasState(in.Configuration(), "open") {
-		t.Fatalf("live configuration = %v, want 'open'", in.Configuration())
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-	if err := in.Wait(ctx); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-
-	// Cold start: reconstruct purely from the log (no checkpoint saved),
-	// against a brand new datamodel value.
-	d2 := &Door{}
-	in2, err := Rehydrate(ctx, chart, d2, log, store, sessionID, NoopIOProcessor)
+	sessionID := SessionID("rejected-snapshot-model")
+	seq, err := log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Unix(1, 0), Event: Event{Name: "apply", Type: EventExternal}})
 	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
+		t.Fatal(err)
 	}
-	if !hasState(in2.Configuration(), "open") {
-		t.Fatalf("rehydrated configuration = %v, want 'open'", in2.Configuration())
+	badModel, err := json.Marshal(&modelState{Applied: 500})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if d2.OpenCount != 2 {
-		t.Fatalf("d2.OpenCount = %d, want 2 (both open.request events replayed)", d2.OpenCount)
+	badModel, err = json.Marshal(goSnapshot{Version: 1, Data: badModel, Values: map[Identifier]Value{}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := in2.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	store.cp[sessionID] = Checkpoint{Seq: seq, Snapshot: Snapshot{
+		Version: snapshotVersion, ChartVersion: chart.Version(), Datamodel: badModel,
+		Configuration: []Identifier{"ready"}, Running: true,
+	}}
+	instance, err := chart.Rehydrate(ctx, log, store, sessionID, NoopIOProcessor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(ctx)
+	if len(decodedSessions) != 1 || decodedSessions[0].Applied != 500 {
+		t.Fatalf("decoded snapshot sessions = %#v, want one rejected session with Applied=500", decodedSessions)
+	}
+	if len(factorySessions) != 2 || factorySessions[0].Applied != 99 || factorySessions[1].Applied != 100 || factorySessions[0] == factorySessions[1] {
+		t.Fatalf("factory sessions = %#v, want discarded restore session at 99 and independent replay session at 100", factorySessions)
+	}
+}
+
+type replayIO struct {
+	mu       sync.Mutex
+	requests []SendRequest
+}
+
+func (*replayIO) Attach(Dispatcher) {}
+func (p *replayIO) Send(_ context.Context, request SendRequest) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.requests = append(p.requests, request)
+	return nil
+}
+func (p *replayIO) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.requests)
+}
+
+func TestRehydrateSuppressesExternalEffectsThenGoesLive(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Atomic("active", On("dispatch", Then(Send("work", SendTarget("worker"))))), WithRevisionSalt("dispatch-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	log := newMemLog()
+	sessionID := SessionID("dispatch-replay")
+	_, _ = log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Unix(1, 0), Event: Event{Name: "dispatch"}})
+	processor := &replayIO{}
+	instance, err := chart.Rehydrate(ctx, log, newMemSnapshotStore(), sessionID, processor, WithIOProcessor(SCXMLEventProcessor, processor))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(ctx)
+	if processor.count() != 0 {
+		t.Fatalf("replay dispatched %d effects", processor.count())
+	}
+	if err := instance.Send(ctx, Event{Name: "dispatch"}); err != nil {
+		t.Fatal(err)
+	}
+	if processor.count() != 1 {
+		t.Fatalf("live dispatch count = %d", processor.count())
 	}
 }
 
 func TestRehydratePreservesLoggedPlatformEventSemantics(t *testing.T) {
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	var observed Event
+	record, err := model.Action("record-platform-event", "v1", func(_ *struct{}, ec ExecContext, _ []Value) error {
+		observed, _ = ec.Event()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart, err := Build(Compound("root", "waiting", Children(
+		Atomic("waiting", On(string(ErrEventExecution), Target("recovered"), Then(record.Do()))),
+		Atomic("recovered"),
+	)), model, WithRevisionSalt("platform-replay-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("logged-platform-event")
-	var observed Event
-	chart, err := Build(Atomic("ready",
-		On(string(ErrEventExecution), Then(func(ec ExecContext) error {
-			observed, _ = ec.Event()
-			return nil
-		})),
-	))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	logged := Event{
-		Name: ErrEventExecution,
-		Type: EventPlatform,
-		Data: PlatformErrorValue(ErrEventExecution, errors.New("historical execution failure")),
-	}
-	if _, err := log.Append(ctx, LogEntry{
-		SessionID: sessionID,
-		Kind:      KindExternalEvent,
-		Timestamp: time.Now().UTC(),
-		Event:     logged,
-	}); err != nil {
-		t.Fatalf("Append: %v", err)
-	}
-
+	sessionID := SessionID("platform-replay")
+	payload := PlatformErrorValue(ErrEventExecution, errors.New("historical execution failure"))
+	_, _ = log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Unix(1, 0), Event: Event{Name: ErrEventExecution, Type: EventPlatform, Data: payload}})
 	ingressCalls := 0
-	in, err := Rehydrate(ctx, chart, nil, log, store, sessionID, NoopIOProcessor,
-		WithIngressHook(func(Event) error {
-			ingressCalls++
-			return nil
-		}),
-	)
+	instance, err := chart.Rehydrate(ctx, log, newMemSnapshotStore(), sessionID, NoopIOProcessor, WithIngressHook(func(Event) error {
+		ingressCalls++
+		return nil
+	}))
 	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
+		t.Fatal(err)
 	}
-	defer in.Stop(ctx)
+	defer instance.Stop(ctx)
+	waitActive(t, instance, "recovered")
 	if observed.Type != EventPlatform {
 		t.Fatalf("replayed event Type = %v, want platform", observed.Type)
+	}
+	if !observed.Data.Equal(payload) {
+		t.Fatalf("replayed event payload = %#v, want %#v", observed.Data, payload)
 	}
 	if ingressCalls != 0 {
 		t.Fatalf("ingress hook calls during replay = %d, want 0", ingressCalls)
 	}
-	if err := in.Send(ctx, Event{Name: "live"}); err != nil {
-		t.Fatalf("live Send: %v", err)
+	if err := instance.Send(ctx, Event{Name: "live", Type: EventExternal}); err != nil {
+		t.Fatal(err)
 	}
 	if ingressCalls != 1 {
-		t.Fatalf("ingress hook calls after live Send = %d, want 1", ingressCalls)
+		t.Fatalf("ingress hook calls after live event = %d, want 1", ingressCalls)
 	}
 }
 
-func TestRehydrateUsesCheckpointToSkipReplay(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-2")
-
-	chart := doorChart(t)
-	d := &Door{}
-	in := New(chart, d)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	ev := Event{Name: "open.request", Type: EventExternal}
-	seq, err := log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(), Event: ev})
-	if err != nil {
-		t.Fatalf("log.Append: %v", err)
-	}
-	if err := in.Send(ctx, ev); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: seq}); err != nil {
-		t.Fatalf("store.Save: %v", err)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	// A log entry AFTER the checkpoint must still be replayed.
-	ev2 := Event{Name: "close.request", Type: EventExternal}
-	if _, err := log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(), Event: ev2}); err != nil {
-		t.Fatalf("log.Append: %v", err)
-	}
-
-	d2 := &Door{}
-	in2, err := Rehydrate(ctx, chart, d2, log, store, sessionID, NoopIOProcessor)
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	if !hasState(in2.Configuration(), "closed") {
-		t.Fatalf("configuration = %v, want 'closed' (checkpoint + post-checkpoint replay)", in2.Configuration())
-	}
-	// Cache or full replay must produce the same caller-observable model.
-	if d2.OpenCount != 1 {
-		t.Fatalf("d2.OpenCount = %d, want historical value 1", d2.OpenCount)
-	}
-	if err := in2.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-}
-
-func TestRehydrateUsesLogTimestampsForDelayedSends(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("overdue-from-log")
-	startedAt := time.Date(2026, time.July, 14, 12, 0, 0, 0, time.UTC)
-
-	if _, err := log.Append(ctx, LogEntry{
-		SessionID: sessionID,
-		Kind:      KindExternalEvent,
-		Timestamp: startedAt,
-		Event:     Event{Name: "init", Type: EventExternal},
-	}); err != nil {
-		t.Fatalf("log.Append: %v", err)
-	}
-
-	clock := NewManualClock(startedAt.Add(5 * time.Second))
-	d := &delayedAbortModel{}
-	in, err := Rehydrate(ctx, delayedAbortChart(t), d, log, store, sessionID, NoopIOProcessor, WithClock(clock))
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	if !hasState(in.Configuration(), "aborted") {
-		t.Fatalf("configuration after Rehydrate = %v, want 'aborted' because init's historical 2s delay is overdue", in.Configuration())
-	}
-	if d.Aborts != 1 {
-		t.Fatalf("Aborts = %d, want 1", d.Aborts)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-}
-
-func TestRehydrateConsumesLoggedTimerFire(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("logged-timer-fire")
-	startedAt := time.Date(2026, time.July, 14, 12, 0, 0, 0, time.UTC)
-
-	if _, err := log.Append(ctx, LogEntry{
-		SessionID: sessionID,
-		Kind:      KindExternalEvent,
-		Timestamp: startedAt,
-		Event:     Event{Name: "init", Type: EventExternal},
-	}); err != nil {
-		t.Fatalf("append init: %v", err)
-	}
-	if _, err := log.Append(ctx, LogEntry{
-		SessionID: sessionID,
-		Kind:      KindTimerFired,
-		Timestamp: startedAt.Add(2 * time.Second),
-		SendID:    "abort-operation",
-		Event:     Event{Name: "abort", Type: EventExternal, SendID: "abort-operation"},
-	}); err != nil {
-		t.Fatalf("append timer fire: %v", err)
-	}
-
-	clock := NewManualClock(startedAt.Add(5 * time.Second))
-	d := &delayedAbortModel{}
-	in, err := Rehydrate(ctx, delayedAbortChart(t), d, log, store, sessionID, NoopIOProcessor, WithClock(clock))
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	if !hasState(in.Configuration(), "aborted") {
-		t.Fatalf("configuration after Rehydrate = %v, want 'aborted'", in.Configuration())
-	}
-	if d.Aborts != 1 {
-		t.Fatalf("Aborts = %d, want exactly 1 (logged timer fire must consume, not duplicate, the pending send)", d.Aborts)
-	}
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if len(snap.PendingSends) != 0 {
-		t.Fatalf("PendingSends after replaying timer fire = %v, want none", snap.PendingSends)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-}
-
-func TestRehydrateSuppressesRealDispatchDuringReplayThenGoesLive(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-3")
-
-	// A chart whose transition sends to a genuinely external target,
-	// so we can observe whether the real IOProcessor was invoked.
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a", On("go", Target("b"), Then(SendEvent("ping", SendOptions{Target: "external-target"})))),
-				Atomic("b"),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	spy := &spyIOProcessor{}
-	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, spy))
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	ev := Event{Name: "go", Type: EventExternal}
-	if _, err := log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(), Event: ev}); err != nil {
-		t.Fatalf("log.Append: %v", err)
-	}
-	if err := in.Send(ctx, ev); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if spy.sendCount != 1 {
-		t.Fatalf("live sendCount = %d, want 1", spy.sendCount)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	spy2 := &spyIOProcessor{}
-	in2, err := Rehydrate(ctx, chart, nil, log, store, sessionID, spy2)
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	if spy2.sendCount != 0 {
-		t.Fatalf("spy2.sendCount after replay = %d, want 0 (real dispatch must be suppressed during replay)", spy2.sendCount)
-	}
-	if !hasState(in2.Configuration(), "b") {
-		t.Fatalf("configuration after replay = %v, want 'b'", in2.Configuration())
-	}
-
-	// Now live: a fresh transition firing SendEvent should reach the real
-	// IOProcessor, proving the gate flips to pass-through after replay.
-	// (Re-use chart's only transition path isn't re-triggerable from b, so
-	// just confirm no further suppressed calls occurred and the gate itself
-	// is marked live.)
-	if err := in2.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-}
-
-// TestRehydrateIOProcessorsReportedDuringAndAfterReplay confirms
-// replayGate.IOProcessors forwards to the wrapped IOProcessor even while
-// !live -- unlike Send/Cancel/Log, reading an already-advertised address has
-// no real-world side effect to suppress during replay.
-func TestRehydrateIOProcessorsReportedDuringAndAfterReplay(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-ioprocessors")
-
-	var seen []IOProcessorInfo
-	record := func(ec ExecContext) error {
-		seen = ec.IOProcessors()
-		return nil
-	}
-
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a", On("go", Target("b"), Then(record))),
-				Atomic("b", On("go", Target("a"), Then(record))),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	liveIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://live")}}}
-	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, liveIO))
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	ev := Event{Name: "go", Type: EventExternal}
-	if _, err := log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(), Event: ev}); err != nil {
-		t.Fatalf("log.Append: %v", err)
-	}
-	if err := in.Send(ctx, ev); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	// Reset before Rehydrate so the next observation is unambiguously from
-	// the replay below, not the live phase above.
-	seen = nil
-
-	replayIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://replayed")}}}
-	in2, err := Rehydrate(ctx, chart, nil, log, store, sessionID, replayIO)
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-
-	// The single logged "go" event replays during Rehydrate itself, before
-	// goLive is called -- so this observation is from inside replay, while
-	// the gate is still suppressing Send/Cancel/Log.
-	if len(seen) != 1 || seen[0].Location.String() != "mock://replayed" {
-		t.Fatalf("ExecContext.IOProcessors() during replay = %v, want [{mock mock://replayed}]", seen)
-	}
-
-	// Now live: a fresh Send should see the same wrapped processor's
-	// entries, proving IOProcessors() keeps working once the gate flips.
-	seen = nil
-	if err := in2.Send(ctx, ev); err != nil {
-		t.Fatalf("Send (live): %v", err)
-	}
-	if len(seen) != 1 || seen[0].Location.String() != "mock://replayed" {
-		t.Fatalf("ExecContext.IOProcessors() after goLive = %v, want [{mock mock://replayed}]", seen)
-	}
-
-	if err := in2.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-}
-
-// TestRehydrateWithNilLoggerDoesNotPanicOnceLive reproduces a nil-pointer
-// panic in replayGate.Log: Rehydrate always wraps whatever Logger it finds
-// in a non-nil *replayGate, so doLog's own "logger != nil" guard always
-// passes even when the caller configured WithLogger(nil), and the gate must
-// therefore refuse to dereference a nil wrapped Logger itself once live.
 func TestRehydrateWithNilLoggerDoesNotPanicOnceLive(t *testing.T) {
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	chart, err := Build(Compound("machine", "idle", Children(
+		Atomic("idle", On("go", Target("done"), Then(LogValue("transition", GoLiteral(testStringValue("live")))))),
+		Atomic("done"),
+	)), model, WithRevisionSalt("nil-logger-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-nil-logger")
+	instance, err := chart.Rehydrate(ctx, newMemLog(), newMemSnapshotStore(), "nil-logger", NoopIOProcessor, WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(ctx)
+	if err := instance.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
+		t.Fatal(err)
+	}
+	waitActive(t, instance, "done")
+}
 
-	logAction := func(ec ExecContext) error {
-		ec.Log("transition", Value{})
+type replayInvokeHandler struct {
+	start  func(context.Context, InvokeRequest, InvokeIO) (Value, error)
+	resume func(context.Context, InvokeRequest, InvokeIO) (Value, error)
+}
+
+func (h *replayInvokeHandler) Start(ctx context.Context, request InvokeRequest, io InvokeIO) (Value, error) {
+	return h.start(ctx, request, io)
+}
+
+func (h *replayInvokeHandler) Resume(ctx context.Context, request InvokeRequest, io InvokeIO) (Value, error) {
+	return h.resume(ctx, request, io)
+}
+
+func replayInvokeChart(t *testing.T, captured chan<- Event, autoForward bool) *Chart {
+	t.Helper()
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	record, err := model.Action("record-resumed-invoke-event", "v1", func(_ *struct{}, ec ExecContext, _ []Value) error {
+		if captured != nil {
+			event, _ := ec.Event()
+			captured <- event
+		}
 		return nil
-	}
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a", On("go", Target("b"), Then(logAction))),
-				Atomic("b", On("back", Target("a"), Then(logAction))),
-			),
-		),
-	)
+	})
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
-
-	in2, err := Rehydrate(ctx, chart, nil, log, store, sessionID, NoopIOProcessor, WithLogger(nil))
+	options := []InvokeOption{
+		WithInvokeDefinitionID("job-definition"), WithInvokeID("job"),
+		WithInvokeContent(GoLiteral(testStringValue("persisted-input"))),
+	}
+	if autoForward {
+		options = append(options, WithAutoForward())
+	}
+	chart, err := Build(Compound("machine", "running", Children(
+		Atomic("running", Invoke("worker", "queue:jobs", options...),
+			On(string(ErrEventCommunication), Target("failed"), Then(record.Do())),
+			On("done.invoke.job", Target("finished"), Then(record.Do())),
+			On("invoke.echo", Target("finished"), Then(record.Do())),
+			On("send.direct", Then(Send("direct", SendTarget("#_job"))))),
+		Atomic("failed"), Atomic("finished"),
+	)), model, WithRevisionSalt("replay-invoke-canonical-v1"))
 	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
+		t.Fatal(err)
 	}
-
-	// A live Send that triggers Log must not panic even though no Logger
-	// was configured.
-	if err := in2.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
-		t.Fatalf("Send after Rehydrate: %v", err)
-	}
-	if !hasState(in2.Configuration(), "b") {
-		t.Fatalf("configuration = %v, want 'b'", in2.Configuration())
-	}
-	if err := in2.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
+	return chart
 }
 
-// TestRehydrateSuppressesInvokeStartAndSignalsCommErrorForMidInvokeState
-// covers github issue #5: an <invoke> attached to a state present in the
-// restored configuration must never actually restart (its real goroutine
-// already ran once, live -- restarting it during Rehydrate's own bootstrap
-// would repeat that real-world side effect, see ADR 0010), and Rehydrate
-// must instead synthesize error.communication for it once replay catches
-// up, since there is no way to guarantee the original invocation's process
-// is still alive.
-func TestRehydrateSuppressesInvokeStartAndSignalsCommErrorForMidInvokeState(t *testing.T) {
+func checkpointActiveInvoke(t *testing.T, chart *Chart, store *memSnapshotStore, sessionID SessionID, factory InvokeHandlerFactory) {
+	t.Helper()
 	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-invoke")
-
-	buildChart := func(t *testing.T, starts *int32, started chan struct{}) *Chart {
-		t.Helper()
-		chart, err := Build(
-			Compound("m", "a",
-				Children(
-					Atomic("a",
-						Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-							atomic.AddInt32(starts, 1)
-							if started != nil {
-								close(started)
-							}
-							<-ctx.Done()
-							return Value{}, nil
-						}),
-						On(string(ErrEventCommunication), Target("recovered")),
-					),
-					Atomic("recovered"),
-				),
-			),
-		)
-		if err != nil {
-			t.Fatalf("Build: %v", err)
+	started := make(chan InvokeRequest, 1)
+	instance, err := chart.NewInstance(WithInvokeHandler("worker", func() InvokeHandler {
+		h := factory().(*replayInvokeHandler)
+		h.start = func(ctx context.Context, request InvokeRequest, _ InvokeIO) (Value, error) {
+			started <- request
+			<-ctx.Done()
+			return Value{}, ctx.Err()
 		}
-		return chart
+		return h
+	}))
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// Live phase: the invoke genuinely starts once, entering "a" via
-	// Start's own initial-configuration bootstrap.
-	var liveStarts int32
-	started := make(chan struct{})
-	liveChart := buildChart(t, &liveStarts, started)
-	in := New(liveChart, nil)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
 	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("live invoke never started")
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	// Cold start: no checkpoint, nothing logged (entering "a" is itself the
-	// deterministic content replayed, exactly as Start's own bootstrap would
-	// produce it live) -- so Rehydrate's replay pass is just its Start call.
-	var replayStarts int32
-	replayChart := buildChart(t, &replayStarts, nil)
-	in2, err := Rehydrate(ctx, replayChart, nil, log, store, sessionID, NoopIOProcessor)
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	defer in2.Stop(ctx)
-
-	if got := atomic.LoadInt32(&replayStarts); got != 0 {
-		t.Fatalf("replay invoke start count = %d, want 0 (invoke must not restart during Rehydrate)", got)
-	}
-	if !hasState(in2.Configuration(), "recovered") {
-		t.Fatalf("configuration after Rehydrate = %v, want 'recovered' (mid-invoke error.communication must fire once replay catches up)", in2.Configuration())
-	}
-}
-
-// TestRestoreReconstructsActiveInvokeBookkeeping is the most direct test of
-// Snapshot.ActiveInvokes: Restore alone -- not Rehydrate -- never calls
-// enterStates/processInvokes, so ip.invokesByID/ip.activeInvokes can only be
-// populated here from snap.ActiveInvokes itself.
-func TestRestoreReconstructsActiveInvokeBookkeeping(t *testing.T) {
-	ctx := context.Background()
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						<-ctx.Done()
-						return Value{}, nil
-					}),
-				),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	wantID := Identifier("a.invoke1")
-	if len(snap.ActiveInvokes) != 1 || snap.ActiveInvokes[0] != (ActiveInvoke{State: "a", DefinitionID: "invoke.1", ID: wantID}) {
-		t.Fatalf("snap.ActiveInvokes = %+v, want a single {State:a DefinitionID:invoke.1 ID:%s}", snap.ActiveInvokes, wantID)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	in2, err := Restore(chart, nil, snap)
-	if err != nil {
-		t.Fatalf("Restore: %v", err)
-	}
-
-	ri, ok := in2.ip.invokesByID[wantID]
-	if !ok {
-		t.Fatalf("ip.invokesByID missing %q after Restore", wantID)
-	}
-	if ri.state == nil || ri.state.id != "a" || ri.spec == nil || ri.spec.definitionID != "invoke.1" {
-		t.Fatalf("restored runningInvoke = %+v, want state=\"a\" definitionID=invoke.1", ri)
-	}
-
-	stateA := chart.byID["a"]
-	if got := in2.ip.activeInvokes[stateA]; len(got) != 1 || got[0] != ri {
-		t.Fatalf("ip.activeInvokes[a] = %v, want [%v]", got, ri)
-	}
-}
-
-// TestRehydrateResolvesInvokeCapturedInCheckpointWithNoLogToReplay covers a
-// checkpoint captured while an invoke is genuinely running, with nothing
-// about entering the invoking state or starting the invoke ever written to
-// the log, so replaying from the checkpoint's Seq+1 replays nothing at all.
-// Without Snapshot.ActiveInvokes, ip.invokesByID would be empty after
-// Restore, leaving the invocation stuck forever, waiting on a done.invoke
-// nothing would ever generate.
-func TestRehydrateResolvesInvokeCapturedInCheckpointWithNoLogToReplay(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-checkpoint-invoke")
-
-	buildChart := func(t *testing.T, starts *int32, started chan struct{}) *Chart {
-		t.Helper()
-		chart, err := Build(
-			Compound("m", "a",
-				Children(
-					Atomic("a",
-						Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-							atomic.AddInt32(starts, 1)
-							if started != nil {
-								close(started)
-							}
-							<-ctx.Done()
-							return Value{}, nil
-						}),
-						On(string(ErrEventCommunication), Target("recovered")),
-					),
-					Atomic("recovered"),
-				),
-			),
-		)
-		if err != nil {
-			t.Fatalf("Build: %v", err)
+	case request := <-started:
+		if request.DefinitionID != "job-definition" || request.ID != "job" || request.Type != "worker" || request.Source != "queue:jobs" || !request.Data.Equal(testStringValue("persisted-input")) {
+			t.Fatalf("live InvokeRequest = %+v", request)
 		}
-		return chart
-	}
-
-	// Live phase: the invoke starts, and the checkpoint is taken while it is
-	// still running -- no log entry records entering "a" or starting the
-	// invoke, unlike the ADR 0012 case (TestRehydrateSuppressesInvokeStart...
-	// above), where Rehydrate's own bootstrap replays that entry.
-	var liveStarts int32
-	started := make(chan struct{})
-	liveChart := buildChart(t, &liveStarts, started)
-	in := New(liveChart, nil)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	select {
-	case <-started:
 	case <-time.After(2 * time.Second):
-		t.Fatalf("live invoke never started")
+		t.Fatal("live invoke did not start")
 	}
-
-	snap, err := in.Snapshot(ctx)
+	snapshot, err := instance.Snapshot(ctx)
 	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+		t.Fatal(err)
 	}
-	if len(snap.ActiveInvokes) != 1 {
-		t.Fatalf("snap.ActiveInvokes = %v, want 1 entry", snap.ActiveInvokes)
+	if len(snapshot.ActiveInvokes) != 1 {
+		t.Fatalf("active invokes = %+v", snapshot.ActiveInvokes)
 	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: 0}); err != nil {
-		t.Fatalf("store.Save: %v", err)
+	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: snapshot}); err != nil {
+		t.Fatal(err)
 	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	var replayStarts int32
-	replayChart := buildChart(t, &replayStarts, nil)
-	in2, err := Rehydrate(ctx, replayChart, nil, log, store, sessionID, NoopIOProcessor)
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	defer in2.Stop(ctx)
-
-	if got := atomic.LoadInt32(&replayStarts); got != 0 {
-		t.Fatalf("rehydrated invoke start count = %d, want 0 (a non-resumable invoke must never restart)", got)
-	}
-	if !hasState(in2.Configuration(), "recovered") {
-		t.Fatalf("configuration after Rehydrate = %v, want 'recovered' (checkpoint-derived invoke must still resolve to error.communication)", in2.Configuration())
+	if err := instance.Stop(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// TestInvokeResumeErrorBecomesCommunicationError covers WithInvokeResume's
-// first outcome: Resume reporting the real-world resource confirmed gone.
+func TestRehydrateCheckpointActiveNonResumableInvokeSignalsCommunicationError(t *testing.T) {
+	ctx := context.Background()
+	store := newMemSnapshotStore()
+	chart := replayInvokeChart(t, nil, false)
+	startedAgain := make(chan struct{}, 1)
+	checkpointActiveInvoke(t, chart, store, "checkpoint-non-resumable", func() InvokeHandler {
+		return &replayInvokeHandler{resume: func(context.Context, InvokeRequest, InvokeIO) (Value, error) { return Value{}, nil }}
+	})
+	instance, err := chart.Rehydrate(ctx, newMemLog(), store, "checkpoint-non-resumable", NoopIOProcessor,
+		WithInvokeHandler("worker", func() InvokeHandler {
+			return InvokeHandlerFunc(func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+				startedAgain <- struct{}{}
+				return NullValue(), nil
+			})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(ctx)
+	waitActive(t, instance, "failed")
+	select {
+	case <-startedAgain:
+		t.Fatal("non-resumable handler was started again")
+	default:
+	}
+}
+
 func TestInvokeResumeErrorBecomesCommunicationError(t *testing.T) {
 	ctx := context.Background()
-	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-resume-error")
-	resumeErr := errors.New("resume: process confirmed gone")
-
-	buildChart := func(t *testing.T, resume InvokeResumeFunc, started chan struct{}, captured chan Event) *Chart {
-		t.Helper()
-		onCommError := Action(func(d *struct{}, ec ExecContext) error {
-			if captured != nil {
-				ev, _ := ec.Event()
-				captured <- ev
-			}
-			return nil
-		})
-		chart, err := Build(
-			Compound("m", "a",
-				Children(
-					Atomic("a",
-						Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-							if started != nil {
-								close(started)
-							}
-							<-ctx.Done()
-							return Value{}, nil
-						}, WithInvokeID("job"), WithInvokeResume(resume)),
-						On(string(ErrEventCommunication), Then(onCommError), Target("failed")),
-					),
-					Atomic("failed"),
-				),
-			),
-		)
-		if err != nil {
-			t.Fatalf("Build: %v", err)
-		}
-		return chart
-	}
-
-	started := make(chan struct{})
-	in := New(buildChart(t, nil, started, nil), &struct{}{})
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("live invoke never started")
-	}
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: 0}); err != nil {
-		t.Fatalf("store.Save: %v", err)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	resume := func(ctx context.Context, id Identifier, params Value, io InvokeIO) (Value, error) {
-		return Value{}, resumeErr
-	}
 	captured := make(chan Event, 1)
-	replayChart := buildChart(t, resume, nil, captured)
-	in2, err := Rehydrate(ctx, replayChart, &struct{}{}, log, store, sessionID, NoopIOProcessor)
+	chart := replayInvokeChart(t, captured, false)
+	factory := func() InvokeHandler { return &replayInvokeHandler{} }
+	checkpointActiveInvoke(t, chart, store, "resume-error", factory)
+	wantErr := errors.New("resume: process confirmed gone")
+	instance, err := chart.Rehydrate(ctx, newMemLog(), store, "resume-error", NoopIOProcessor, WithInvokeHandler("worker", func() InvokeHandler {
+		return &replayInvokeHandler{start: func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+			t.Fatal("Start called during rehydrate")
+			return Value{}, nil
+		}, resume: func(_ context.Context, request InvokeRequest, _ InvokeIO) (Value, error) {
+			if request.ID != "job" || request.DefinitionID != "job-definition" || request.Type != "worker" || request.Source != "queue:jobs" || !request.Data.Equal(testStringValue("persisted-input")) {
+				t.Errorf("resumed InvokeRequest = %+v", request)
+			}
+			return Value{}, wantErr
+		}}
+	}))
 	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
+		t.Fatal(err)
 	}
-	defer in2.Stop(ctx)
-
+	defer instance.Stop(ctx)
 	select {
-	case ev := <-captured:
-		classification, message, ok := PlatformErrorDetails(ev.Data)
-		if !ok || classification != ErrEventCommunication || message != resumeErr.Error() {
-			t.Fatalf("error.communication Data = %v, want %v", ev.Data, resumeErr)
-		}
-		if ev.InvokeID != "job" {
-			t.Fatalf("error.communication InvokeID = %q, want %q", ev.InvokeID, "job")
+	case event := <-captured:
+		classification, message, ok := PlatformErrorDetails(event.Data)
+		if event.Name != ErrEventCommunication || event.InvokeID != "job" || !ok || classification != ErrEventCommunication || message != wantErr.Error() {
+			t.Fatalf("communication event = %+v, details = %q/%q/%v", event, classification, message, ok)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("Resume's error never produced error.communication")
-	}
-
-	// captured fires from inside the transition's own action content, before
-	// enterStates/publishConfig for "failed" complete -- poll (same pattern
-	// as TestInvokeStartsOnStateEntryAndDeliversEvents) instead of assuming
-	// Configuration is already updated the instant captured receives.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if err := in2.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-			t.Fatalf("Send: %v", err)
-		}
-		if hasState(in2.Configuration(), "failed") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("configuration = %v, want 'failed'", in2.Configuration())
-		}
-		time.Sleep(time.Millisecond)
+		t.Fatal("Resume error was not delivered")
 	}
 }
 
-// TestInvokeResumeDataBecomesDoneInvoke covers WithInvokeResume's second
-// outcome: the work already finished while nothing was watching it, so
-// Resume returns immediately with data instead of blocking.
-func TestInvokeResumeDataBecomesDoneInvoke(t *testing.T) {
+func TestInvokeResumeValueBecomesDoneInvoke(t *testing.T) {
 	ctx := context.Background()
-	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-resume-data")
-
-	buildChart := func(t *testing.T, resume InvokeResumeFunc, started chan struct{}, captured chan Event) *Chart {
-		t.Helper()
-		onDone := Action(func(d *struct{}, ec ExecContext) error {
-			if captured != nil {
-				ev, _ := ec.Event()
-				captured <- ev
-			}
-			return nil
-		})
-		chart, err := Build(
-			Compound("m", "a",
-				Children(
-					Atomic("a",
-						Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-							if started != nil {
-								close(started)
-							}
-							<-ctx.Done()
-							return Value{}, nil
-						}, WithInvokeID("job"), WithInvokeResume(resume)),
-						On("done.invoke.job", Then(onDone), Target("finished")),
-					),
-					Atomic("finished"),
-				),
-			),
-		)
-		if err != nil {
-			t.Fatalf("Build: %v", err)
-		}
-		return chart
-	}
-
-	started := make(chan struct{})
-	in := New(buildChart(t, nil, started, nil), &struct{}{})
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("live invoke never started")
-	}
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: 0}); err != nil {
-		t.Fatalf("store.Save: %v", err)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	resume := func(ctx context.Context, id Identifier, params Value, io InvokeIO) (Value, error) {
-		return testStringValue("job-result"), nil
-	}
 	captured := make(chan Event, 1)
-	replayChart := buildChart(t, resume, nil, captured)
-	in2, err := Rehydrate(ctx, replayChart, &struct{}{}, log, store, sessionID, NoopIOProcessor)
+	chart := replayInvokeChart(t, captured, false)
+	checkpointActiveInvoke(t, chart, store, "resume-value", func() InvokeHandler { return &replayInvokeHandler{} })
+	want := testStringValue("completed-payload")
+	instance, err := chart.Rehydrate(ctx, newMemLog(), store, "resume-value", NoopIOProcessor, WithInvokeHandler("worker", func() InvokeHandler {
+		return &replayInvokeHandler{start: func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+			t.Fatal("Start called during rehydrate")
+			return Value{}, nil
+		}, resume: func(_ context.Context, request InvokeRequest, _ InvokeIO) (Value, error) {
+			if request.ID != "job" || !request.Data.Equal(testStringValue("persisted-input")) {
+				t.Errorf("resumed InvokeRequest = %+v", request)
+			}
+			return want, nil
+		}}
+	}))
 	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
+		t.Fatal(err)
 	}
-	defer in2.Stop(ctx)
-
+	defer instance.Stop(ctx)
 	select {
-	case ev := <-captured:
-		if !ev.Data.Equal(testStringValue("job-result")) {
-			t.Fatalf("done.invoke.job Data = %v, want %q", ev.Data, "job-result")
-		}
-		if ev.InvokeID != "job" {
-			t.Fatalf("done.invoke.job InvokeID = %q, want %q", ev.InvokeID, "job")
+	case event := <-captured:
+		if event.Name != "done.invoke.job" || event.InvokeID != "job" || !event.Data.Equal(want) {
+			t.Fatalf("done event = %+v, want exact payload %v", event, want)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("Resume's data never produced done.invoke.job")
-	}
-
-	// captured fires from inside the transition's own action content, before
-	// enterStates/publishConfig for "finished" complete -- poll instead of
-	// assuming Configuration is already updated the instant captured
-	// receives.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if err := in2.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-			t.Fatalf("Send: %v", err)
-		}
-		if hasState(in2.Configuration(), "finished") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("configuration = %v, want 'finished'", in2.Configuration())
-		}
-		time.Sleep(time.Millisecond)
+		t.Fatal("Resume value was not delivered")
 	}
 }
 
-// TestInvokeResumeBlockingKeepsInvocationActiveAndReachable covers
-// WithInvokeResume's third outcome: Resume blocks, and the resumed
-// invocation keeps running exactly as if it had never stopped -- proven two
-// ways, HasActiveInvokes staying true and a round trip through
-// io.Incoming/io.Deliver actually reaching the live chart.
-func TestInvokeResumeBlockingKeepsInvocationActiveAndReachable(t *testing.T) {
+func TestInvokeResumeBlockingRemainsReachableAndCancels(t *testing.T) {
 	ctx := context.Background()
-	log := newMemLog()
 	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-resume-blocking")
-
-	buildChart := func(t *testing.T, resume InvokeResumeFunc, started chan struct{}) *Chart {
-		t.Helper()
-		chart, err := Build(
-			Compound("m", "a",
-				Children(
-					Atomic("a",
-						Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-							if started != nil {
-								close(started)
-							}
-							<-ctx.Done()
-							return Value{}, nil
-						}, WithInvokeID("job"), WithInvokeResume(resume), WithAutoForward()),
-						On("resumed.echo", Target("echoed")),
-					),
-					Atomic("echoed"),
-				),
-			),
-		)
-		if err != nil {
-			t.Fatalf("Build: %v", err)
-		}
-		return chart
-	}
-
-	started := make(chan struct{})
-	in := New(buildChart(t, nil, started), nil)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("live invoke never started")
-	}
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: 0}); err != nil {
-		t.Fatalf("store.Save: %v", err)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
+	captured := make(chan Event, 1)
+	chart := replayInvokeChart(t, captured, true)
+	checkpointActiveInvoke(t, chart, store, "resume-blocking", func() InvokeHandler { return &replayInvokeHandler{} })
 	resumed := make(chan struct{})
-	resume := func(ctx context.Context, id Identifier, params Value, io InvokeIO) (Value, error) {
-		close(resumed)
-		for {
-			select {
-			case ev := <-io.Incoming:
-				if ev.Name == "poke" {
-					io.Deliver(Event{Name: "resumed.echo"})
+	cancelled := make(chan struct{})
+	incoming := make(chan Identifier, 3)
+	instance, err := chart.Rehydrate(ctx, newMemLog(), store, "resume-blocking", NoopIOProcessor, WithInvokeHandler("worker", func() InvokeHandler {
+		return &replayInvokeHandler{start: func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+			t.Fatal("Start called during rehydrate")
+			return Value{}, nil
+		}, resume: func(ctx context.Context, request InvokeRequest, io InvokeIO) (Value, error) {
+			close(resumed)
+			for {
+				select {
+				case event := <-io.Incoming:
+					incoming <- event.Name
+					if event.Name == "direct" {
+						io.Deliver(Event{Name: "invoke.echo", Data: testStringValue("from-resume")})
+					}
+				case <-ctx.Done():
+					close(cancelled)
+					return Value{}, ctx.Err()
 				}
-			case <-ctx.Done():
-				return Value{}, nil
 			}
-		}
-	}
-	replayChart := buildChart(t, resume, nil)
-	in2, err := Rehydrate(ctx, replayChart, nil, log, store, sessionID, NoopIOProcessor)
+		}}
+	}))
 	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
+		t.Fatal(err)
 	}
-	defer in2.Stop(ctx)
-
 	select {
 	case <-resumed:
 	case <-time.After(2 * time.Second):
-		t.Fatalf("Resume was never called")
+		t.Fatal("Resume was not called")
 	}
-
-	active, err := in2.HasActiveInvokes(ctx)
-	if err != nil {
-		t.Fatalf("HasActiveInvokes: %v", err)
+	active, err := instance.HasActiveInvokes(ctx)
+	if err != nil || !active {
+		t.Fatalf("HasActiveInvokes = %v, %v", active, err)
 	}
-	if !active {
-		t.Fatalf("HasActiveInvokes = false, want true for a blocking Resume that kept running")
+	if err := instance.Send(ctx, Event{Name: "poke", Type: EventExternal}); err != nil {
+		t.Fatal(err)
 	}
-
-	// WithAutoForward carries "poke" to Resume's io.Incoming; Resume echoes
-	// it back via io.Deliver, proving the resumed invocation's traffic
-	// reaches the live chart in both directions rather than a dead end.
-	if err := in2.Send(ctx, Event{Name: "poke", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
+	if err := instance.Send(ctx, Event{Name: "send.direct", Type: EventExternal}); err != nil {
+		t.Fatal(err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if err := in2.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-			t.Fatalf("Send: %v", err)
-		}
-		if hasState(in2.Configuration(), "echoed") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("configuration = %v, want 'echoed' after Resume echoed back via io.Deliver", in2.Configuration())
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-// resumeParamsModel is the datamodel TestInvokeResumeParamsRecomputedFromRestoredDatamodel
-// mutates via a replayed event, to distinguish Resume's params argument
-// (must reflect the post-replay value) from the checkpoint's own mid-invoke
-// snapshot of it (still the pre-bump value).
-type resumeParamsModel struct {
-	Value int
-}
-
-// TestInvokeResumeParamsRecomputedFromRestoredDatamodel confirms Resume's
-// params argument is computed fresh from the fully-restored-and-replayed
-// datamodel, not read back from anywhere stale.
-func TestInvokeResumeParamsRecomputedFromRestoredDatamodel(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-resume-params")
-
-	params := func(ec ExecContext) Value {
-		d, _ := ec.Datamodel().(*resumeParamsModel)
-		if d == nil {
-			return Int64Value(0)
-		}
-		return Int64Value(int64(d.Value))
-	}
-	bump := Action(func(d *resumeParamsModel, ec ExecContext) error {
-		d.Value = 5
-		return nil
-	})
-	buildChart := func(t *testing.T, resume InvokeResumeFunc, started chan struct{}) *Chart {
-		t.Helper()
-		chart, err := Build(
-			Compound("m", "a",
-				Children(
-					Atomic("a",
-						Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-							if started != nil {
-								close(started)
-							}
-							<-ctx.Done()
-							return Value{}, nil
-						}, WithInvokeID("job"), WithInvokeParams(params), WithInvokeResume(resume)),
-						On("bump", Then(bump)),
-					),
-				),
-			),
-		)
-		if err != nil {
-			t.Fatalf("Build: %v", err)
-		}
-		return chart
-	}
-
-	started := make(chan struct{})
-	d1 := &resumeParamsModel{}
-	in := New(buildChart(t, nil, started), d1)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("live invoke never started")
-	}
-
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: 0}); err != nil {
-		t.Fatalf("store.Save: %v", err)
-	}
-
-	// Logged and applied AFTER the checkpoint: replay must apply this to the
-	// restored datamodel before Resume's params are (re)computed.
-	bumpEvent := Event{Name: "bump", Type: EventExternal}
-	if _, err := log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(), Event: bumpEvent}); err != nil {
-		t.Fatalf("log.Append: %v", err)
-	}
-	if err := in.Send(ctx, bumpEvent); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if d1.Value != 5 {
-		t.Fatalf("live d1.Value = %d, want 5", d1.Value)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	gotParams := make(chan Value, 1)
-	resume := func(ctx context.Context, id Identifier, params Value, io InvokeIO) (Value, error) {
-		gotParams <- params
-		<-ctx.Done()
-		return Value{}, nil
-	}
-	d2 := &resumeParamsModel{}
-	in2, err := Rehydrate(ctx, buildChart(t, resume, nil), d2, log, store, sessionID, NoopIOProcessor)
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	defer in2.Stop(ctx)
-
-	select {
-	case params := <-gotParams:
-		if !params.Equal(Int64Value(5)) {
-			t.Fatalf("Resume params = %v, want 5 (recomputed from the restored+replayed datamodel)", params)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("Resume was never called")
-	}
-}
-
-// resumeEventUnboundModel is the datamodel
-// TestInvokeResumeParamsEventIsUnbound mutates via a replayed event. Its
-// Value doubles as proof that Resume's params recomputation still sees the
-// fully-replayed datamodel even though, per that same recomputation,
-// _event does not.
-type resumeEventUnboundModel struct {
-	Value int
-}
-
-// paramsEventSnapshot is what TestInvokeResumeParamsEventIsUnbound's Params
-// callback records each time it runs, so the test can inspect both halves
-// of ExecContext's state at the moment Resume's params were recomputed.
-type paramsEventSnapshot struct {
-	datamodelValue int
-	event          Event
-	hasEvent       bool
-}
-
-// TestInvokeResumeParamsEventIsUnbound confirms that when
-// resumeInvokesAfterReplay recomputes an invocation's params, ec.Event()
-// reports unbound -- SCXML 5.10.1's rule for before the first event is
-// processed -- rather than leaking whatever event ip.lastEvent happens to
-// hold left over from replaying an unrelated event after the checkpoint.
-// It also confirms ec.Datamodel() is unaffected by that same recomputation,
-// still reflecting the fully-replayed datamodel.
-func TestInvokeResumeParamsEventIsUnbound(t *testing.T) {
-	ctx := context.Background()
-	log := newMemLog()
-	store := newMemSnapshotStore()
-	sessionID := SessionID("sess-resume-event-unbound")
-
-	gotParams := make(chan paramsEventSnapshot, 1)
-	params := func(ec ExecContext) Value {
-		d, _ := ec.Datamodel().(*resumeEventUnboundModel)
-		v := 0
-		if d != nil {
-			v = d.Value
-		}
-		ev, ok := ec.Event()
+	for _, want := range []Identifier{"poke", "send.direct", "direct"} {
 		select {
-		case gotParams <- paramsEventSnapshot{datamodelValue: v, event: ev, hasEvent: ok}:
-		default:
+		case got := <-incoming:
+			if got != want {
+				t.Fatalf("incoming event = %q, want %q", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("incoming event %q was not delivered", want)
 		}
-		return Int64Value(int64(v))
-	}
-	bump := Action(func(d *resumeEventUnboundModel, ec ExecContext) error {
-		d.Value = 7
-		return nil
-	})
-
-	buildChart := func(t *testing.T, resume InvokeResumeFunc, started chan struct{}) *Chart {
-		t.Helper()
-		chart, err := Build(
-			Compound("m", "a",
-				Children(
-					Atomic("a",
-						Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-							if started != nil {
-								close(started)
-							}
-							<-ctx.Done()
-							return Value{}, nil
-						}, WithInvokeID("job"), WithInvokeParams(params), WithInvokeResume(resume)),
-						On("bump", Then(bump)),
-					),
-				),
-			),
-			WithVersion("resume-event-unbound-v1"),
-		)
-		if err != nil {
-			t.Fatalf("Build: %v", err)
-		}
-		return chart
-	}
-
-	started := make(chan struct{})
-	d1 := &resumeEventUnboundModel{}
-	in := New(buildChart(t, nil, started), d1)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
 	}
 	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("live invoke never started")
-	}
-
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := store.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: 0}); err != nil {
-		t.Fatalf("store.Save: %v", err)
-	}
-
-	// Logged and applied AFTER the checkpoint: an event with no relation at
-	// all to why "a" (and its invoke) was ever entered. Pre-fix, this is
-	// exactly the event a buggy recomputation would leak into Resume's
-	// params via ip.lastEvent.
-	bumpEvent := Event{Name: "bump", Type: EventExternal}
-	if _, err := log.Append(ctx, LogEntry{SessionID: sessionID, Kind: KindExternalEvent, Timestamp: time.Now().UTC(), Event: bumpEvent}); err != nil {
-		t.Fatalf("log.Append: %v", err)
-	}
-	if err := in.Send(ctx, bumpEvent); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if d1.Value != 7 {
-		t.Fatalf("live d1.Value = %d, want 7", d1.Value)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	// Drain the live-entry call recorded above (pre-first-event, so already
-	// hasEvent=false there too) -- the next value received must be the
-	// Resume-driven recomputation below, not a leftover from live entry.
-	select {
-	case <-gotParams:
-	default:
-	}
-
-	resume := func(ctx context.Context, id Identifier, params Value, io InvokeIO) (Value, error) {
-		<-ctx.Done()
-		return Value{}, nil
-	}
-	d2 := &resumeEventUnboundModel{}
-	in2, err := Rehydrate(ctx, buildChart(t, resume, nil), d2, log, store, sessionID, NoopIOProcessor)
-	if err != nil {
-		t.Fatalf("Rehydrate: %v", err)
-	}
-	defer in2.Stop(ctx)
-
-	select {
-	case got := <-gotParams:
-		if got.hasEvent {
-			t.Fatalf("Resume's params recomputation saw ec.Event() = (%+v, true), want hasEvent=false (SCXML 5.10.1 unbound)", got.event)
-		}
-		if got.datamodelValue != 7 {
-			t.Fatalf("Resume's params recomputation saw datamodel value = %d, want 7 (still fully replayed)", got.datamodelValue)
+	case event := <-captured:
+		if event.Name != "invoke.echo" || event.InvokeID != "job" || !event.Data.Equal(testStringValue("from-resume")) {
+			t.Fatalf("invoke-to-parent event = %+v", event)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("Resume's params recomputation was never observed")
+		t.Fatal("invoke-to-parent delivery was not received")
+	}
+	if err := instance.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking Resume was not cancelled")
 	}
 }
 
-// TestRestoreRejectsActiveInvokeNotInConfiguration confirms restoreFrom
-// cross-validates ActiveInvoke.State against the restored Configuration,
-// the same way it already validates Configuration/HistoryValue entries
-// against the chart. A hand-built or corrupted Snapshot claiming an active
-// invoke for a state the configuration doesn't include would otherwise
-// populate invoke bookkeeping for a state the interpreter never thinks it
-// entered -- whose exit, and thus cancelInvokes, will then never run.
-func TestRestoreRejectsActiveInvokeNotInConfiguration(t *testing.T) {
-	ctx := context.Background()
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						<-ctx.Done()
-						return Value{}, nil
-					}),
-					On("next", Target("b")),
-				),
-				Atomic("b"),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	// Exit "a" (cancelling its invoke) so the resulting Configuration
-	// genuinely has no invoke-bearing state in it.
-	if err := in.Send(ctx, Event{Name: "next", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if err := in.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-	if hasState(snap.Configuration, "a") {
-		t.Fatalf("snap.Configuration = %v, want it to no longer contain \"a\"", snap.Configuration)
-	}
-
-	// Hand-craft an ActiveInvoke for "a" onto an otherwise-legitimate
-	// snapshot whose Configuration does not contain "a" -- the corruption
-	// this test targets.
-	snap.ActiveInvokes = append(snap.ActiveInvokes, ActiveInvoke{State: "a", DefinitionID: "invoke.1", ID: "job"})
-
-	if _, err := Restore(chart, nil, snap); err == nil {
-		t.Fatalf("Restore succeeded, want an error for an active invoke referencing a state outside Configuration")
-	} else if !strings.Contains(err.Error(), "not in Configuration") {
-		t.Fatalf("Restore error = %v, want it to mention %q", err, "not in Configuration")
-	}
-}
-
-// TestSnapshotActiveInvokesJSONRoundTrip confirms Snapshot.ActiveInvokes
-// survives a JSON marshal/unmarshal round trip.
-func TestSnapshotActiveInvokesJSONRoundTrip(t *testing.T) {
-	ctx := context.Background()
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						<-ctx.Done()
-						return Value{}, nil
-					}),
-				),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-
-	snap, err := in.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
-	}
-	if len(snap.ActiveInvokes) != 1 {
-		t.Fatalf("snap.ActiveInvokes = %v, want 1 entry", snap.ActiveInvokes)
-	}
-
-	b, err := json.Marshal(snap)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	var got Snapshot
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	if len(got.ActiveInvokes) != 1 || got.ActiveInvokes[0] != snap.ActiveInvokes[0] {
-		t.Fatalf("round-tripped ActiveInvokes = %v, want %v", got.ActiveInvokes, snap.ActiveInvokes)
-	}
-}
-
-type spyIOProcessor struct {
-	sendCount int
-}
-
-func (s *spyIOProcessor) Attach(Dispatcher) {}
-func (s *spyIOProcessor) Send(ctx context.Context, req SendRequest) error {
-	s.sendCount++
-	return nil
-}
-
-type capturingIOProcessor struct {
+type capturingReplayIO struct {
 	dispatcher Dispatcher
 }
 
-func (c *capturingIOProcessor) Attach(d Dispatcher)                     { c.dispatcher = d }
-func (c *capturingIOProcessor) Send(context.Context, SendRequest) error { return nil }
+func (p *capturingReplayIO) Attach(dispatcher Dispatcher) { p.dispatcher = dispatcher }
+func (*capturingReplayIO) Send(context.Context, SendRequest) error {
+	return nil
+}
 
 func TestRehydrateStopsStartedInstanceWhenReplayFails(t *testing.T) {
-	ctx := context.Background()
-	chart, err := Build(Atomic("live"))
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	chart, err := Build(Atomic("live"), model, WithRevisionSalt("failed-replay-cleanup-v1"))
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
+	ctx := context.Background()
 	log := newMemLog()
+	const sessionID SessionID = "broken-replay"
 	if _, err := log.Append(ctx, LogEntry{
-		SessionID: "broken-replay", Kind: EntryKind("unknown"), Timestamp: time.Unix(1, 0),
+		SessionID: sessionID,
+		Kind:      EntryKind("unknown"),
+		Timestamp: time.Unix(1, 0),
 	}); err != nil {
-		t.Fatalf("Append: %v", err)
+		t.Fatal(err)
 	}
-	io := &capturingIOProcessor{}
-	if _, err := Rehydrate(ctx, chart, nil, log, newMemSnapshotStore(), "broken-replay", io); err == nil {
-		t.Fatalf("Rehydrate succeeded, want replay error")
+	io := &capturingReplayIO{}
+	if _, err := chart.Rehydrate(ctx, log, newMemSnapshotStore(), sessionID, io); err == nil {
+		t.Fatal("Rehydrate succeeded, want replay error")
 	}
-	inst, ok := io.dispatcher.(*Instance)
-	if !ok || inst == nil {
+	instance, ok := io.dispatcher.(*Instance)
+	if !ok || instance == nil {
 		t.Fatalf("captured Dispatcher = %T, want *Instance", io.dispatcher)
 	}
 	select {
-	case <-inst.Done():
+	case <-instance.Done():
 	case <-time.After(time.Second):
-		t.Fatalf("Instance remained running after Rehydrate returned an error")
+		t.Fatal("started instance remained running after replay failed")
 	}
 }
 
-func TestRehydrateCleanupHonorsCallerCancellation(t *testing.T) {
+func TestRehydrateCleanupCompletesAfterCallerCancellation(t *testing.T) {
+	entered := make(chan struct{})
 	release := make(chan struct{})
-	chart, err := Build(Atomic("blocked-start", OnEntry(
-		Action(func(_ *struct{}, _ ExecContext) error {
-			<-release
-			return nil
-		}),
-	)))
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	blockStart, err := model.Action("block-start", "v1", func(_ *struct{}, _ ExecContext, _ []Value) error {
+		close(entered)
+		<-release
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	chart, err := Build(Atomic("blocked-start", OnEntry(blockStart.Do())), model, WithRevisionSalt("cancelled-cleanup-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	io := &capturingReplayIO{}
 	returned := make(chan error, 1)
 	go func() {
-		_, err := Rehydrate(ctx, chart, &struct{}{}, newMemLog(), newMemSnapshotStore(), "blocked-start", NoopIOProcessor)
+		_, err := chart.Rehydrate(ctx, newMemLog(), newMemSnapshotStore(), "blocked-start", io)
 		returned <- err
 	}()
 	select {
+	case <-entered:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("initial entry action was not called")
+	}
+	select {
 	case err := <-returned:
-		close(release)
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("Rehydrate error = %v, want context deadline", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Rehydrate error = %v, want context cancellation", err)
 		}
 	case <-time.After(time.Second):
-		close(release)
-		<-returned
-		t.Fatalf("Rehydrate cleanup ignored its expired caller context")
+		t.Fatal("Rehydrate cleanup ignored its canceled caller context")
+	}
+	instance, ok := io.dispatcher.(*Instance)
+	if !ok || instance == nil {
+		t.Fatalf("captured Dispatcher = %T, want *Instance", io.dispatcher)
+	}
+	close(release)
+	select {
+	case <-instance.Done():
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not stop the instance after the action unwound")
 	}
 }

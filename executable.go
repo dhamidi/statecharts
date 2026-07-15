@@ -1,5 +1,7 @@
 package statecharts
 
+import "time"
+
 // ExecutableKind identifies one first-class executable-content node.
 type ExecutableKind string
 
@@ -172,6 +174,83 @@ func NewCallExecutable(value CallDefinition) Executable {
 // NewExtensionExecutable returns an extension executable with a valid outer union.
 func NewExtensionExecutable(value ExtensionDefinition) Executable {
 	return Executable{Kind: ExecutableExtension, Extension: &value}
+}
+
+// Raise creates executable content that raises an internal event. An optional
+// expression computes its payload.
+func Raise(event Identifier, data ...Expression) Executable {
+	definition := RaiseDefinition{Event: event}
+	if len(data) > 0 {
+		value := data[0].Clone()
+		definition.Data = &value
+	}
+	return NewRaiseExecutable(definition)
+}
+
+// SendOption configures serializable send executable content.
+type SendOption func(*SendDefinition)
+
+// SendTarget sets a static send target.
+func SendTarget(target string) SendOption {
+	return func(send *SendDefinition) { send.Target = target }
+}
+
+// SendType sets the static I/O processor type.
+func SendType(typ string) SendOption {
+	return func(send *SendDefinition) { send.Type = typ }
+}
+
+// SendID sets the author-visible send ID.
+func SendID(id Identifier) SendOption {
+	return func(send *SendDefinition) { send.ID = id }
+}
+
+// SendIDLocation stores a generated send ID at a model-owned location.
+func SendIDLocation(location Expression) SendOption {
+	return func(send *SendDefinition) {
+		value := location.Clone()
+		send.IDLocation = &value
+	}
+}
+
+// SendDelay delays delivery by a static duration.
+func SendDelay(delay time.Duration) SendOption {
+	return func(send *SendDefinition) { send.Delay = delay.String() }
+}
+
+// SendContent sets the whole event payload expression.
+func SendContent(content Expression) SendOption {
+	return func(send *SendDefinition) {
+		value := content.Clone()
+		send.Content = &value
+	}
+}
+
+// SendParams sets named event payload expressions.
+func SendParams(params ...ParamDefinition) SendOption {
+	return func(send *SendDefinition) { send.Params = cloneParams(params) }
+}
+
+// Send creates serializable event-delivery executable content.
+func Send(event Identifier, options ...SendOption) Executable {
+	definition := SendDefinition{Event: event}
+	for _, option := range options {
+		if option != nil {
+			option(&definition)
+		}
+	}
+	return NewSendExecutable(definition)
+}
+
+// CancelSend creates executable content that cancels a delayed send by ID.
+func CancelSend(sendID Identifier) Executable {
+	return NewCancelExecutable(CancelDefinition{SendID: sendID})
+}
+
+// LogValue creates diagnostic logging executable content.
+func LogValue(label string, expression Expression) Executable {
+	value := expression.Clone()
+	return NewLogExecutable(LogDefinition{Label: label, Expr: &value})
 }
 
 func (e Executable) clone() Executable {

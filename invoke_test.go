@@ -3,207 +3,432 @@ package statecharts
 import (
 	"context"
 	"errors"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestInvokeStartsOnStateEntryAndDeliversEvents(t *testing.T) {
-	started := make(chan struct{})
-	chart, err := Build(
-		Compound("m", "waiting",
-			Children(
-				Atomic("waiting",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						close(started)
-						io.Deliver(Event{Name: "ping"})
-						<-ctx.Done()
-						return Value{}, nil
-					}),
-					On("ping", Target("done")),
-				),
-				Atomic("done"),
-			),
+func TestDeclarativeInvokeStartsDeliversAndCancelsWithItsState(t *testing.T) {
+	t.Parallel()
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Compound("root", "idle", Children(
+		Atomic("idle", On("start", Target("running"))),
+		Atomic("running",
+			Invoke("worker", "jobs", WithInvokeID("job")),
+			On("worker.ready", Target("observed")),
+			On("stop", Target("idle")),
 		),
-	)
+		Atomic("observed", On("stop", Target("idle"))),
+	)))
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
 
-	in := New(chart, nil)
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("invoke never started")
-	}
-
-	// Synchronize with the actor goroutine: the invoke's "ping" arrives on
-	// the external queue asynchronously, so send a no-op and rely on FIFO
-	// ordering through the same inbox to know it was already processed --
-	// same pattern as the delayed-send tests.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-			t.Fatalf("Send: %v", err)
-		}
-		if hasState(in.Configuration(), "done") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("configuration = %v, want 'done' after invoke delivered 'ping'", in.Configuration())
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-func TestInvokeNotStartedIfStateExitedWithinSameMacrostep(t *testing.T) {
-	var started bool
-	chart, err := Build(
-		Compound("m", "transient",
-			Children(
-				// An eventless transition fires immediately, before the
-				// macrostep this state was entered in ever settles -- per
-				// SCXML mainEventLoop, the invoke must never actually
-				// start.
-				Atomic("transient",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						started = true
-						return Value{}, nil
-					}),
-					Eventless(Target("settled")),
-				),
-				Atomic("settled"),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-
-	if !hasState(in.Configuration(), "settled") {
-		t.Fatalf("configuration = %v, want 'settled'", in.Configuration())
-	}
-	if started {
-		t.Fatalf("invoke started for a state that was exited within its own entering macrostep")
-	}
-}
-
-func TestInvokeCancelledOnStateExitAndSuppressesDoneInvoke(t *testing.T) {
+	started := make(chan InvokeIO, 1)
 	cancelled := make(chan struct{})
-	returned := make(chan struct{})
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						<-ctx.Done()
-						close(cancelled)
-						close(returned)
-						return Value{}, nil
-					}),
-					On("go", Target("b")),
-				),
-				Atomic("b"),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, request InvokeRequest, io InvokeIO) (Value, error) {
+			if request.ID != "job" || request.Source != "jobs" {
+				t.Errorf("request = %+v", request)
+			}
+			started <- io
+			<-ctx.Done()
+			close(cancelled)
+			io.Deliver(Event{Name: "worker.ready"})
+			return NullValue(), nil
+		})
+	}))
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-
-	in := New(chart, nil)
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	defer instance.Stop(context.Background())
+	if err := instance.Send(context.Background(), Event{Name: "start"}); err != nil {
+		t.Fatal(err)
 	}
-	defer in.Stop(ctx)
-
-	if err := in.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
+	select {
+	case io := <-started:
+		io.Deliver(Event{Name: "worker.ready"})
+	case <-time.After(time.Second):
+		t.Fatal("invoke did not start")
 	}
-
+	waitActive(t, instance, "observed")
+	if err := instance.Send(context.Background(), Event{Name: "stop"}); err != nil {
+		t.Fatal(err)
+	}
+	waitActive(t, instance, "idle")
 	select {
 	case <-cancelled:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("invoke was never cancelled when its containing state was exited")
+	case <-time.After(time.Second):
+		t.Fatal("invoke context was not cancelled on state exit")
 	}
-	<-returned
+	time.Sleep(10 * time.Millisecond)
+	if active := instance.Configuration(); !hasState(active, "idle") {
+		t.Fatalf("late invoke delivery changed configuration: active=%v", active)
+	}
+}
 
-	// SCXML 6.4.3: a cancelled invocation MUST NOT generate done.invoke.
-	// Give the (already-returned) goroutine's Deliver call, if it wrongly
-	// fired, a moment to land, then confirm "b" never saw a transition.
-	time.Sleep(20 * time.Millisecond)
-	if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
+func TestInvokeIsNotStartedWhenStateExitsInSameMacrostep(t *testing.T) {
+	t.Parallel()
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Compound("root", "transient", Children(
+		Atomic("transient", Invoke("worker", "jobs"), Eventless(Target("done"))),
+		Final("done"),
+	)))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !hasState(in.Configuration(), "b") {
-		t.Fatalf("configuration = %v, want still 'b'", in.Configuration())
+	started := make(chan struct{}, 1)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+			started <- struct{}{}
+			return NullValue(), nil
+		})
+	}))
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(context.Background())
+	select {
+	case <-started:
+		t.Fatal("invoke started for a state exited before the macrostep settled")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestInvokeFailureRaisesCommunicationError(t *testing.T) {
+	t.Parallel()
+	type model struct{ failure Value }
+	var data *model
+	b := newTestBuilder(t, func() *model { data = &model{}; return data })
+	record := b.action("record-invoke-communication-error", func(data *model, ec ExecContext) error {
+		event, _ := ec.Event()
+		data.failure = event.Data
+		return nil
+	})
+	chart, err := b.build(Compound("root", "running", Children(
+		Atomic("running", Invoke("worker", "jobs", WithInvokeID("job")),
+			On(string(ErrEventCommunication), Then(record), Target("failed"))),
+		Atomic("failed"),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+			return Value{}, errors.New("service unavailable")
+		})
+	}))
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(context.Background())
+	waitActive(t, instance, "failed")
+	classification, message, ok := PlatformErrorDetails(data.failure)
+	if !ok || classification != ErrEventCommunication || message != "service unavailable" {
+		t.Fatalf("error.communication Data = %v, want classification=%q message=%q", data.failure, ErrEventCommunication, "service unavailable")
+	}
+}
+
+func TestInvokeReceivesExplicitAndAutoForwardedEvents(t *testing.T) {
+	t.Parallel()
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Compound("root", "running", Children(
+		Atomic("running",
+			Invoke("worker", "jobs", WithInvokeID("job"), WithAutoForward()),
+			On("send.explicit", Then(Send("explicit", SendTarget("#_job")))),
+		),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan Event, 4)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, io InvokeIO) (Value, error) {
+			for {
+				select {
+				case event := <-io.Incoming:
+					received <- event
+				case <-ctx.Done():
+					return NullValue(), nil
+				}
+			}
+		})
+	}))
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(context.Background())
+	if err := instance.Send(context.Background(), Event{Name: "send.explicit"}); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[Identifier]bool{}
+	deadline := time.After(time.Second)
+	for len(seen) < 2 {
+		select {
+		case event := <-received:
+			seen[event.Name] = true
+		case <-deadline:
+			t.Fatalf("received events = %v, want explicit and send.explicit", seen)
+		}
+	}
+	if !seen["explicit"] || !seen["send.explicit"] {
+		t.Fatalf("received events = %v", seen)
+	}
+}
+
+func TestInvokeFinalizeRunsBeforeReturnedEventGuard(t *testing.T) {
+	t.Parallel()
+	type model struct{ normalized bool }
+	var data *model
+	b := newTestBuilder(t, func() *model { data = &model{}; return data })
+	normalize := b.action("normalize-invoke-result", func(data *model, _ ExecContext) error {
+		data.normalized = true
+		return nil
+	})
+	normalized := b.condition("invoke-result-is-normalized", func(data *model, _ ExecContext) bool {
+		return data.normalized
+	})
+	chart, err := b.build(Compound("root", "running", Children(
+		Atomic("running",
+			Invoke("worker", "jobs", WithInvokeID("job"), WithFinalize(normalize)),
+			On("reply", If(normalized), Target("done")),
+		),
+		Atomic("done"),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, io InvokeIO) (Value, error) {
+			io.Deliver(Event{Name: "reply"})
+			<-ctx.Done()
+			return NullValue(), nil
+		})
+	}))
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(context.Background())
+	waitActive(t, instance, "done")
+	if !data.normalized {
+		t.Fatal("finalize did not run")
+	}
+}
+
+func TestInvokeChartHandlerRoutesParentAndChildEvents(t *testing.T) {
+	t.Parallel()
+	childBuilder := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	child, err := childBuilder.build(Compound("child", "waiting", Children(
+		Atomic("waiting", On("ping", Then(Send("pong", SendTarget("#_parent"))), Target("done"))),
+		Final("done", WithDone(GoLiteral(Int64Value(7)))),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parentBuilder := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	parent, err := parentBuilder.build(Compound("parent", "running", Children(
+		Atomic("running",
+			Invoke(string(SCXMLInvokeType), "child", WithInvokeID("child")),
+			On("start", Then(Send("ping", SendTarget("#_child")))),
+			On("pong", Target("observed")),
+		),
+		Atomic("observed"),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := parentBuilder.newInstance(parent,
+		WithInvokeHandler(SCXMLInvokeType, InvokeChartHandler(child, nil)))
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(context.Background())
+	if err := instance.Send(context.Background(), Event{Name: "start"}); err != nil {
+		t.Fatal(err)
+	}
+	waitActive(t, instance, "observed")
+}
+
+func TestInvokeGeneratedIDsAreCanonicalFreshAndAvoidExplicitCollisions(t *testing.T) {
+	type model struct{ id Identifier }
+	var data *model
+	b := newTestBuilder(t, func() *model { data = &model{}; return data })
+	location, err := b.model.Location("generated-invoke-id", "v1",
+		func(data *model, _ ExecContext, _ []Value) (Value, error) {
+			value, _ := StringValue(string(data.id))
+			return value, nil
+		},
+		func(data *model, _ ExecContext, value Value, _ []Value) error {
+			text, _ := value.AsString()
+			data.id = Identifier(text)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart, err := b.build(Compound("root", "active", Children(
+		Atomic("active",
+			Invoke("worker", "", WithInvokeID("active.invoke1")),
+			Invoke("worker", "", WithInvokeIDLocation(location.At())),
+			On("leave", Target("away")),
+		),
+		Atomic("away", On("return", Target("active"))),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := make(chan InvokeRequest, 4)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, request InvokeRequest, _ InvokeIO) (Value, error) {
+			requests <- request
+			<-ctx.Done()
+			return NullValue(), nil
+		})
+	}))
+	ctx := context.Background()
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(ctx)
+	first := map[Identifier]bool{(<-requests).ID: true, (<-requests).ID: true}
+	if !first["active.invoke1"] || !first["active.invoke2"] || data.id != "active.invoke2" {
+		t.Fatalf("first-entry IDs/stored ID = %v/%q, want active.invoke1, active.invoke2 / active.invoke2", first, data.id)
+	}
+	if err := instance.Send(ctx, Event{Name: "leave"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Send(ctx, Event{Name: "return"}); err != nil {
+		t.Fatal(err)
+	}
+	second := map[Identifier]bool{(<-requests).ID: true, (<-requests).ID: true}
+	if !second["active.invoke1"] || !second["active.invoke3"] || data.id != "active.invoke3" {
+		t.Fatalf("re-entry IDs/stored ID = %v/%q, want explicit active.invoke1 and fresh active.invoke3", second, data.id)
+	}
+	if !strings.HasPrefix(string(data.id), "active.invoke") {
+		t.Fatalf("generated ID = %q, want canonical state.invokeN format", data.id)
+	}
+}
+
+func TestInvokeIDLocationRunsBeforeCanonicalParams(t *testing.T) {
+	type model struct{ id Identifier }
+	b := newTestBuilder(t, func() *model { return &model{} })
+	location, err := b.model.Location("invoke-id-before-params", "v1",
+		func(data *model, _ ExecContext, _ []Value) (Value, error) {
+			value, _ := StringValue(string(data.id))
+			return value, nil
+		},
+		func(data *model, _ ExecContext, value Value, _ []Value) error {
+			text, _ := value.AsString()
+			data.id = Identifier(text)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	param, err := b.model.Value("invoke-param-sees-id", "v1", func(data *model, _ ExecContext, _ []Value) (Value, error) {
+		value, _ := StringValue(string(data.id))
+		return value, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart, err := b.build(Atomic("active", Invoke("worker", "", WithInvokeIDLocation(location.At()),
+		WithInvokeParams(ParamDefinition{Name: "id", Expr: expressionPointer(param.Get())}))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan InvokeRequest, 1)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler { return &recordingInvokeHandler{requests: started} }))
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(context.Background())
+	request := <-started
+	params, _ := request.Data.AsMap()
+	text, _ := params["id"].AsString()
+	if request.ID != "active.invoke1" || text != string(request.ID) {
+		t.Fatalf("request ID/param = %q/%q, want active.invoke1 in both", request.ID, text)
+	}
+}
+
+func TestInvokePanickingRegisteredParamRaisesExecutionErrorWithoutStarting(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	broken, err := b.model.Value("panicking-invoke-param", "v1", func(*struct{}, ExecContext, []Value) (Value, error) {
+		panic("boom")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart, err := b.build(Compound("root", "active", Children(
+		Atomic("active", Invoke("worker", "", WithInvokeParams(ParamDefinition{Name: "bad", Expr: expressionPointer(broken.Get())})),
+			On(string(ErrEventExecution), Target("recovered"))),
+		Atomic("recovered"),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+			started <- struct{}{}
+			return NullValue(), nil
+		})
+	}))
+	if err := instance.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(context.Background())
+	waitActive(t, instance, "recovered")
+	select {
+	case <-started:
+		t.Fatal("invoke handler started despite parameter expression panic")
+	default:
 	}
 }
 
 func TestInvokeEventQueuedDuringFinalOnExitIsDroppedAfterCancellation(t *testing.T) {
-	deliverReady := make(chan func(Event), 1)
+	type model struct{ ingressed []Identifier }
+	b := newTestBuilder(t, func() *model { return &model{} })
 	exitStarted := make(chan struct{})
 	finishExit := make(chan struct{})
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, _ Value, io InvokeIO) (Value, error) {
-						deliverReady <- io.Deliver
-						<-ctx.Done()
-						return Value{}, nil
-					}, WithInvokeID("service")),
-					OnExit(func(ExecContext) error {
-						close(exitStarted)
-						<-finishExit
-						return nil
-					}),
-					On("leave", Target("b")),
-				),
-				Atomic("b", On("late", Target("wrong"))),
-				Atomic("wrong"),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	var ingressed []Identifier
-	in := New(chart, nil, WithIngressHook(func(ev Event) error {
-		ingressed = append(ingressed, ev.Name)
+	blockExit := b.action("block-final-onexit", func(*model, ExecContext) error {
+		close(exitStarted)
+		<-finishExit
 		return nil
-	}))
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	})
+	chart, err := b.build(Compound("root", "a", Children(
+		Atomic("a", Invoke("worker", "jobs", WithInvokeID("service")), OnExit(blockExit), On("leave", Target("b"))),
+		Atomic("b", On("late", Target("wrong"))),
+		Atomic("wrong"),
+	)))
+	if err != nil {
+		t.Fatal(err)
 	}
-	defer in.Stop(ctx)
+	deliverReady := make(chan func(Event), 1)
+	var ingressed []Identifier
+	instance := b.newInstance(chart,
+		WithInvokeHandler("worker", func() InvokeHandler {
+			return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, io InvokeIO) (Value, error) {
+				deliverReady <- io.Deliver
+				<-ctx.Done()
+				return NullValue(), nil
+			})
+		}),
+		WithIngressHook(func(event Event) error {
+			ingressed = append(ingressed, event.Name)
+			return nil
+		}),
+	)
+	ctx := context.Background()
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Stop(ctx)
 	deliver := <-deliverReady
-
 	leaveDone := make(chan error, 1)
-	go func() { leaveDone <- in.Send(ctx, Event{Name: "leave"}) }()
+	go func() { leaveDone <- instance.Send(ctx, Event{Name: "leave"}) }()
 	<-exitStarted
-
-	// Deliver passes its optimistic context check while the final onexit is
-	// still running, then waits in the Instance inbox. Cancellation is the
-	// last onexit operation, so the actor must revalidate the InvokeID once
-	// it reaches this request rather than accepting a now-orphaned event.
 	deliverDone := make(chan struct{})
 	go func() {
 		deliver(Event{Name: "late"})
@@ -211,412 +436,38 @@ func TestInvokeEventQueuedDuringFinalOnExitIsDroppedAfterCancellation(t *testing
 	}()
 	close(finishExit)
 	if err := <-leaveDone; err != nil {
-		t.Fatalf("Send leave: %v", err)
+		t.Fatal(err)
 	}
 	<-deliverDone
-
-	if !hasState(in.Configuration(), "b") || hasState(in.Configuration(), "wrong") {
-		t.Fatalf("configuration = %v, want b; late cancelled-invoke event must be dropped", in.Configuration())
+	if !hasState(instance.Configuration(), "b") || hasState(instance.Configuration(), "wrong") {
+		t.Fatalf("configuration = %v, want b; late cancelled-invoke event must be dropped", instance.Configuration())
 	}
 	if len(ingressed) != 1 || ingressed[0] != "leave" {
-		t.Fatalf("ingress events = %v, want only leave; late invoke event must not become durable ingress", ingressed)
+		t.Fatalf("ingress events = %v, want only leave", ingressed)
 	}
 }
 
-func TestInvokeErrorBecomesCommunicationError(t *testing.T) {
-	boom := errors.New("boom")
-	gotErr := make(chan Event, 1)
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						return Value{}, boom
-					}),
-					On(string(ErrEventCommunication), Then(Action(func(d *struct{}, ec ExecContext) error {
-						ev, _ := ec.Event()
-						gotErr <- ev
-						return nil
-					}))),
-				),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, &struct{}{})
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-
-	select {
-	case ev := <-gotErr:
-		classification, message, ok := PlatformErrorDetails(ev.Data)
-		if !ok || classification != ErrEventCommunication || message != boom.Error() {
-			t.Fatalf("error.communication Data = %v, want %v", ev.Data, boom)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("never observed error.communication for a failing invoke")
-	}
-}
-
-func TestInvokeAutoGeneratedIDFormat(t *testing.T) {
-	gotID := make(chan Identifier, 1)
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						io.Deliver(Event{Name: "ping"})
-						<-ctx.Done()
-						return Value{}, nil
-					}),
-					On("ping", Then(Action(func(d *struct{}, ec ExecContext) error {
-						ev, _ := ec.Event()
-						gotID <- ev.InvokeID
-						return nil
-					}))),
-				),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, &struct{}{})
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-
-	select {
-	case id := <-gotID:
-		if want := Identifier("a.invoke1"); id != want {
-			t.Fatalf("auto-generated InvokeID = %q, want %q", id, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("never observed the invoke's InvokeID on a delivered event")
-	}
-}
-
-func TestInvokeIDLocationRunsBeforeParamsAndStart(t *testing.T) {
-	type model struct{ id Identifier }
-	dm := &model{}
-	started := make(chan Identifier, 1)
-	chart, err := Build(Atomic("active",
-		Invoke(func(ctx context.Context, params Value, _ InvokeIO) (Value, error) {
-			text, _ := params.AsString()
-			started <- Identifier(text)
-			<-ctx.Done()
-			return Value{}, nil
-		},
-			WithInvokeIDLocation(func(ec ExecContext, id Identifier) error {
-				ec.Datamodel().(*model).id = id
-				return nil
-			}),
-			WithInvokeParams(func(ec ExecContext) Value { return testStringValue(string(ec.Datamodel().(*model).id)) }),
-		),
-	))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	in := New(chart, dm)
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-	select {
-	case got := <-started:
-		if got != "active.invoke1" || dm.id != got {
-			t.Fatalf("start param/idlocation = %q/%q, want active.invoke1 in both", got, dm.id)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("invocation did not start")
-	}
-}
-
-func TestInvokeIDLocationFailuresAbortInvocation(t *testing.T) {
-	tests := []struct {
-		name     string
-		location IDLocationFunc
-	}{
-		{"error", func(ExecContext, Identifier) error { return errors.New("no location") }},
-		{"panic", func(ExecContext, Identifier) error { panic("bad location") }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			started := make(chan struct{}, 1)
-			paramsCalled := false
-			chart, err := Build(Compound("root", "active", Children(
-				Atomic("active",
-					Invoke(func(context.Context, Value, InvokeIO) (Value, error) {
-						started <- struct{}{}
-						return Value{}, nil
-					}, WithInvokeIDLocation(tt.location), WithInvokeParams(func(ExecContext) Value {
-						paramsCalled = true
-						return Value{}
-					})),
-					On(string(ErrEventExecution), Target("recovered")),
-				),
-				Atomic("recovered"),
-			)))
-			if err != nil {
-				t.Fatalf("Build: %v", err)
-			}
-			in := New(chart, nil)
-			ctx := context.Background()
-			if err := in.Start(ctx); err != nil {
-				t.Fatalf("Start: %v", err)
-			}
-			defer in.Stop(ctx)
-			if paramsCalled || !hasState(in.Configuration(), "recovered") {
-				t.Fatalf("paramsCalled/configuration = %v/%v, want false/recovered", paramsCalled, in.Configuration())
-			}
-			select {
-			case <-started:
-				t.Fatal("invocation started after idlocation failure")
-			default:
-			}
-		})
-	}
-}
-
-func TestInvokeIDLocationAssignsFreshIDOnEachExecution(t *testing.T) {
-	var ids []Identifier
-	service := func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }
-	chart, err := Build(Compound("root", "active", Children(
-		Atomic("active",
-			Invoke(service, WithInvokeIDLocation(func(_ ExecContext, id Identifier) error {
-				ids = append(ids, id)
-				return nil
-			})),
-			On("leave", Target("away")),
-		),
-		Atomic("away", On("return", Target("active"))),
+func TestInvokeNormalCompletionEmitsDoneEventWithoutInstanceError(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Compound("root", "running", Children(
+		Atomic("running", Invoke("worker", "jobs", WithInvokeID("service")), On("done.invoke.service", Target("done"))),
+		Atomic("done"),
 	)))
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
-	ip := newInterpretation(chart, nil)
-	ip.start()
-	ip.enqueue(Event{Name: "leave", Type: EventExternal})
-	ip.processNextExternal()
-	ip.enqueue(Event{Name: "return", Type: EventExternal})
-	ip.processNextExternal()
-	if len(ids) != 2 || ids[0] != "active.invoke1" || ids[1] != "active.invoke2" {
-		t.Fatalf("assigned invoke IDs = %v, want [active.invoke1 active.invoke2]", ids)
-	}
-}
-
-func TestInvokeSendTargetRoutesToIncoming(t *testing.T) {
-	received := make(chan Event, 1)
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						select {
-						case ev := <-io.Incoming:
-							received <- ev
-						case <-ctx.Done():
-						}
-						return Value{}, nil
-					}, WithInvokeID("svc")),
-					On("poke", Then(Action(func(d *struct{}, ec ExecContext) error {
-						ec.Send("hello", SendOptions{Target: "#_svc", Data: Int64Value(42)})
-						return nil
-					}))),
-				),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, &struct{}{})
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-
-	if err := in.Send(ctx, Event{Name: "poke", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-
-	select {
-	case ev := <-received:
-		if ev.Name != "hello" || !ev.Data.Equal(Int64Value(42)) {
-			t.Fatalf("invoke received %+v, want Name=hello Data=42", ev)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("invoke never received the #_svc-targeted send")
-	}
-}
-
-// --- A "clock.pl"-style invoke: scxml.html's Appendix on <finalize>
-// (6.5) walks through a state machine that invokes an external clock
-// service (src="clock.pl"), receives periodic "ping" events carrying a
-// 12-hour clock reading, and uses <finalize> to normalize that reading
-// into a 24-hour value before a transition's guard inspects it -- so
-// <finalize> runs strictly before transition selection, not after. This
-// reproduces that scenario end to end, with a deterministic, in-process
-// stand-in for clock.pl driven by a test-controlled feed instead of a
-// real timer. ---------------------------------------------------------
-
-// clockTick is what the invoked clock service reports each time it
-// "ticks" -- the same fields scxml.html's example describes: an hour in
-// 12-hour form, a flag for AM/PM, and the fact of a new second.
-type clockTick struct {
-	Hour int // 1-12
-	IsAM bool
-}
-
-// clockService is a real, running goroutine: it forwards whatever ticks
-// arrive on feed as "ping" events until either feed is closed (natural
-// completion) or it's cancelled (the invoking state was exited).
-func clockService(feed <-chan clockTick) InvokeFunc {
-	return func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-		for {
-			select {
-			case <-ctx.Done():
-				return Value{}, nil
-			case tick, ok := <-feed:
-				if !ok {
-					return Value{}, nil
-				}
-				data, _ := MapValue(map[string]Value{"hour": testStringValue(strconv.Itoa(tick.Hour)), "isAM": BoolValue(tick.IsAM)})
-				io.Deliver(Event{Name: "ping", Data: data})
-			}
-		}
-	}
-}
-
-type store struct {
-	Hour24 int
-}
-
-// normalizeTime is <finalize>'s content in scxml.html's example, verbatim:
-// "time.setHours(_event.data.currentHour + (_event.isAm ? 0 : 12) - 1)".
-// <finalize> runs for every event carrying its invocation's InvokeID
-// (SCXML 6.5 matches by invokeid alone, not by event name), including the
-// eventual done.invoke.timer -- whose Data is whatever clockService
-// returned (nil here), not a clockTick -- so, like any real finalize
-// handler massaging a specific payload shape, it must check first.
-var normalizeTime = Action(func(s *store, ec ExecContext) error {
-	ev, _ := ec.Event()
-	tick, ok := ev.Data.AsMap()
-	if !ok {
-		return nil
-	}
-	offset := 12
-	isAM, _ := tick["isAM"].AsBool()
-	if isAM {
-		offset = 0
-	}
-	hourText, _ := tick["hour"].AsString()
-	hour, _ := strconv.Atoi(hourText)
-	s.Hour24 = hour + offset - 1
-	return nil
-})
-
-func buildClockChart(t *testing.T, feed <-chan clockTick) *Instance {
-	t.Helper()
-	afterHours := Cond(func(s *store, ec ExecContext) bool {
-		return s.Hour24 > 17 || s.Hour24 < 9
-	})
-
-	chart, err := Build(
-		Compound("root", "getTime",
-			Children(
-				Atomic("getTime",
-					Invoke(clockService(feed), WithInvokeID("timer"), WithFinalize(normalizeTime)),
-					On("ping", If(afterHours), Target("storeClosed")),
-					On("ping", Target("takeOrder")),
-					On("done.invoke.timer", Target("clockDone")),
-				),
-				Atomic("storeClosed"),
-				Atomic("takeOrder"),
-				Atomic("clockDone"),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, &store{})
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	return in
-}
-
-func TestInvokeClockFinalizeNormalizesBeforeGuardEvaluates(t *testing.T) {
-	cases := []struct {
-		name string
-		tick clockTick
-		want Identifier
-	}{
-		// 8 PM -> 19:00 -> after hours.
-		{"evening", clockTick{Hour: 8, IsAM: false}, "storeClosed"},
-		// 2 PM -> 13:00 -> open.
-		{"afternoon", clockTick{Hour: 2, IsAM: false}, "takeOrder"},
-		// 10 PM -> 21:00 -> after hours.
-		{"night", clockTick{Hour: 10, IsAM: false}, "storeClosed"},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			feed := make(chan clockTick, 1)
-			in := buildClockChart(t, feed)
-			ctx := context.Background()
-			defer in.Stop(ctx)
-
-			feed <- c.tick
-
-			deadline := time.Now().Add(2 * time.Second)
-			for !hasState(in.Configuration(), c.want) {
-				if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-					t.Fatalf("Send: %v", err)
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("configuration = %v, want %q", in.Configuration(), c.want)
-				}
-				time.Sleep(time.Millisecond)
-			}
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(context.Context, InvokeRequest, InvokeIO) (Value, error) {
+			return NullValue(), nil
 		})
-	}
-}
-
-func TestInvokeClockDoneEventOnFeedClose(t *testing.T) {
-	feed := make(chan clockTick)
-	in := buildClockChart(t, feed)
+	}))
 	ctx := context.Background()
-	defer in.Stop(ctx)
-
-	close(feed) // the clock service returns (nil, nil): natural completion
-
-	deadline := time.Now().Add(2 * time.Second)
-	for !hasState(in.Configuration(), "clockDone") {
-		if err := in.Send(ctx, Event{Name: "noop", Type: EventExternal}); err != nil {
-			t.Fatalf("Send: %v", err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("configuration = %v, want 'clockDone' after the clock's natural completion", in.Configuration())
-		}
-		time.Sleep(time.Millisecond)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := in.Err(); err != nil {
+	defer instance.Stop(ctx)
+	waitActive(t, instance, "done")
+	if err := instance.Err(); err != nil {
 		t.Fatalf("Err() = %v, want nil", err)
 	}
 }
@@ -627,292 +478,205 @@ func TestInvokeFinalizeRejectsExternalEffects(t *testing.T) {
 		forbiddenEvents int
 		timerFired      bool
 	}
+	var data *model
+	b := newTestBuilder(t, func() *model { data = &model{}; return data })
+	countError := b.action("count-finalize-execution-error", func(data *model, _ ExecContext) error { data.executionErrors++; return nil })
+	countForbidden := b.action("count-forbidden-finalize-event", func(data *model, _ ExecContext) error { data.forbiddenEvents++; return nil })
+	markTimer := b.action("mark-preserved-delayed-send", func(data *model, _ ExecContext) error { data.timerFired = true; return nil })
+	tryExternalEffects := b.action("try-finalize-external-effects", func(_ *model, ec ExecContext) error {
+		ec.Send("forbidden-send", SendOptions{})
+		ec.Raise(Event{Name: "forbidden-raise"})
+		ec.Cancel("keep")
+		return nil
+	})
 	clock := NewManualClock(time.Unix(0, 0))
 	deliverReady := make(chan func(Event), 1)
-	chart, err := Build(
-		Atomic("active",
-			OnEntry(SendEvent("timer-fired", SendOptions{SendID: "keep", Delay: time.Hour})),
-			Invoke(func(ctx context.Context, _ Value, io InvokeIO) (Value, error) {
-				deliverReady <- io.Deliver
-				<-ctx.Done()
-				return Value{}, nil
-			}, WithInvokeID("service"), WithFinalize(func(ec ExecContext) error {
-				ec.Send("forbidden-send", SendOptions{})
-				ec.Raise(Event{Name: "forbidden-raise"})
-				ec.Cancel("keep")
-				return nil
-			})),
-			On(string(ErrEventExecution), Then(Action(func(d *model, _ ExecContext) error {
-				d.executionErrors++
-				return nil
-			}))),
-			On("forbidden-send forbidden-raise", Then(Action(func(d *model, _ ExecContext) error {
-				d.forbiddenEvents++
-				return nil
-			}))),
-			On("timer-fired", Then(Action(func(d *model, _ ExecContext) error {
-				d.timerFired = true
-				return nil
-			}))),
-		),
-	)
+	chart, err := b.build(Atomic("active",
+		OnEntry(Send("timer-fired", SendID("keep"), SendDelay(time.Hour))),
+		Invoke("worker", "jobs", WithInvokeID("service"), WithFinalize(tryExternalEffects)),
+		On(string(ErrEventExecution), Then(countError)),
+		On("forbidden-send forbidden-raise", Then(countForbidden)),
+		On("timer-fired", Then(markTimer)),
+	))
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
-
-	dm := &model{}
-	in := New(chart, dm, WithClock(clock))
+	instance := b.newInstance(chart, WithClock(clock), WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, io InvokeIO) (Value, error) {
+			deliverReady <- io.Deliver
+			<-ctx.Done()
+			return NullValue(), nil
+		})
+	}))
 	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer in.Stop(ctx)
+	defer instance.Stop(ctx)
 	(<-deliverReady)(Event{Name: "reply"})
-
-	if dm.executionErrors != 3 || dm.forbiddenEvents != 0 {
-		t.Fatalf("after finalize: %+v, want three error.execution events and no send/raise effects", dm)
+	if data.executionErrors != 3 || data.forbiddenEvents != 0 {
+		t.Fatalf("after finalize: %+v, want three error.execution events and no send/raise effects", data)
 	}
-
-	// Cancel is forbidden too, so the delayed send must remain pending.
 	clock.Advance(time.Hour)
-	if err := in.Send(ctx, Event{Name: "sync"}); err != nil {
-		t.Fatalf("Send sync: %v", err)
+	if err := instance.Send(ctx, Event{Name: "sync"}); err != nil {
+		t.Fatal(err)
 	}
-	if !dm.timerFired {
+	if !data.timerFired {
 		t.Fatal("finalize cancelled a delayed send; cancel is an external effect")
 	}
 }
 
 func TestInvokeDeliverCopiesPayloadAtServiceBoundary(t *testing.T) {
 	type model struct{ received Value }
+	var data *model
+	b := newTestBuilder(t, func() *model { data = &model{}; return data })
+	record := b.action("record-delivered-copy", func(data *model, ec ExecContext) error {
+		event, _ := ec.Event()
+		data.received = event.Data
+		return nil
+	})
+	chart, err := b.build(Atomic("active", Invoke("worker", "jobs"), On("reply", Then(record))))
+	if err != nil {
+		t.Fatal(err)
+	}
 	deliverReady := make(chan func(Event), 1)
-	chart, err := Build(Atomic("active",
-		Invoke(func(ctx context.Context, _ Value, io InvokeIO) (Value, error) {
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, io InvokeIO) (Value, error) {
 			deliverReady <- io.Deliver
 			<-ctx.Done()
-			return Value{}, nil
-		}),
-		On("reply", Then(Action(func(d *model, ec ExecContext) error {
-			ev, _ := ec.Event()
-			d.received = ev.Data
-			return nil
-		}))),
-	))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	dm := &model{}
-	in := New(chart, dm)
+			return NullValue(), nil
+		})
+	}))
 	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer in.Stop(ctx)
+	defer instance.Stop(ctx)
 	originalList := []Value{Int64Value(1)}
 	original, _ := MapValue(map[string]Value{"values": ListValue(originalList)})
 	(<-deliverReady)(Event{Name: "reply", Data: original})
 	originalList[0] = Int64Value(9)
-	receivedMap, _ := dm.received.AsMap()
+	receivedMap, _ := data.received.AsMap()
 	receivedList, _ := receivedMap["values"].AsList()
 	if !receivedList[0].Equal(Int64Value(1)) {
-		t.Fatalf("received payload = %v after service mutation, want an isolated copy", dm.received)
+		t.Fatalf("received payload = %v after service mutation, want an isolated copy", data.received)
 	}
 }
 
 func TestInvokeCompletionCopiesPayloadAtServiceBoundary(t *testing.T) {
+	type model struct{ received Value }
+	var data *model
+	b := newTestBuilder(t, func() *model { data = &model{}; return data })
+	processed := make(chan struct{}, 1)
+	record := b.action("record-completion-copy", func(data *model, ec ExecContext) error {
+		event, _ := ec.Event()
+		data.received = event.Data
+		processed <- struct{}{}
+		return nil
+	})
+	chart, err := b.build(Atomic("active", Invoke("worker", "jobs", WithInvokeID("service")), On("done.invoke.service", Then(record))))
+	if err != nil {
+		t.Fatal(err)
+	}
 	resultList := []Value{Int64Value(1)}
 	result, _ := MapValue(map[string]Value{"values": ListValue(resultList)})
-	received := make(chan Value, 1)
-	chart, err := Build(Atomic("active",
-		Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return result, nil }, WithInvokeID("service")),
-		On("done.invoke.service", Then(func(ec ExecContext) error {
-			ev, _ := ec.Event()
-			received <- ev.Data
-			return nil
-		})),
-	))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(context.Context, InvokeRequest, InvokeIO) (Value, error) { return result, nil })
+	}))
 	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer in.Stop(ctx)
-	var copied Value
+	defer instance.Stop(ctx)
 	select {
-	case copied = <-received:
+	case <-processed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("done.invoke.service was not processed")
 	}
 	resultList[0] = Int64Value(9)
-	copiedMap, _ := copied.AsMap()
+	copiedMap, _ := data.received.AsMap()
 	copiedList, _ := copiedMap["values"].AsList()
 	if !copiedList[0].Equal(Int64Value(1)) {
-		t.Fatalf("completion payload = %v after service mutation, want an isolated copy", copied)
-	}
-}
-
-// --- Completing <invoke>: autoforward (SCXML 6.4.1) and "#_parent"
-// (Appendix C.1), including a real child SCXML session via InvokeChart. --
-
-func TestInvokeAutoForwardDeliversEveryExternalEvent(t *testing.T) {
-	received := make(chan Event, 8)
-	chart, err := Build(
-		// "a" has no transitions at all: autoforward must still copy
-		// every external event to the invocation regardless of whether
-		// the chart itself has a matching transition for it.
-		Atomic("a",
-			Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-				for {
-					select {
-					case ev, ok := <-io.Incoming:
-						if !ok {
-							return Value{}, nil
-						}
-						received <- ev
-					case <-ctx.Done():
-						return Value{}, nil
-					}
-				}
-			}, WithAutoForward()),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-
-	if err := in.Send(ctx, Event{Name: "one", Type: EventExternal, Data: Int64Value(1)}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if err := in.Send(ctx, Event{Name: "two", Type: EventExternal, Data: Int64Value(2)}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-
-	want := []struct {
-		name Identifier
-		data int
-	}{{"one", 1}, {"two", 2}}
-	for _, w := range want {
-		select {
-		case ev := <-received:
-			if ev.Name != w.name || !ev.Data.Equal(Int64Value(int64(w.data))) {
-				t.Fatalf("forwarded event = %+v, want Name=%q Data=%d", ev, w.name, w.data)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("never received autoforwarded event %q", w.name)
-		}
+		t.Fatalf("completion payload = %v after service mutation, want an isolated copy", data.received)
 	}
 }
 
 func TestInvokeAutoForwardStopsAfterCancellation(t *testing.T) {
-	received := make(chan Event, 8)
-	chart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-						for {
-							select {
-							case ev, ok := <-io.Incoming:
-								if !ok {
-									return Value{}, nil
-								}
-								received <- ev
-							case <-ctx.Done():
-								return Value{}, nil
-							}
-						}
-					}, WithAutoForward()),
-					On("go", Target("b")),
-				),
-				Atomic("b"),
-			),
-		),
-	)
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Compound("root", "a", Children(
+		Atomic("a", Invoke("worker", "jobs", WithAutoForward()), On("go", Target("b"))),
+		Atomic("b"),
+	)))
 	if err != nil {
-		t.Fatalf("Build: %v", err)
+		t.Fatal(err)
 	}
-
-	in := New(chart, nil)
+	received := make(chan Event, 8)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, io InvokeIO) (Value, error) {
+			for {
+				select {
+				case event := <-io.Incoming:
+					received <- event
+				case <-ctx.Done():
+					return NullValue(), nil
+				}
+			}
+		})
+	}))
 	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer in.Stop(ctx)
-
-	if err := in.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
+	defer instance.Stop(ctx)
+	if err := instance.Send(ctx, Event{Name: "go"}); err != nil {
+		t.Fatal(err)
 	}
-	if !hasState(in.Configuration(), "b") {
-		t.Fatalf("configuration = %v, want 'b'", in.Configuration())
+	waitActive(t, instance, "b")
+	if err := instance.Send(ctx, Event{Name: "after"}); err != nil {
+		t.Fatal(err)
 	}
-
-	// Whether "go" itself -- copied to the invocation as it was dequeued,
-	// before the transition it triggered was even selected -- actually
-	// got read by the invocation's own goroutine before that goroutine
-	// noticed ctx cancelled is a genuine race (Go's select makes no
-	// ordering promise between two simultaneously-ready cases), so it's
-	// deliberately not asserted here. What must be deterministic is that
-	// nothing sent after the invoking state is gone ever reaches it: by
-	// the time "after" is processed, this invocation no longer appears in
-	// invokesByID at all, so it's never even considered for forwarding,
-	// regardless of goroutine scheduling on the reading side.
-	if err := in.Send(ctx, Event{Name: "after", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	drainDeadline := time.After(200 * time.Millisecond)
+	deadline := time.After(200 * time.Millisecond)
 	for {
 		select {
-		case ev := <-received:
-			if ev.Name == "after" {
-				t.Fatalf("received %+v after the invoking state was exited; autoforward should have stopped", ev)
+		case event := <-received:
+			if event.Name == "after" {
+				t.Fatalf("received %+v after invocation cancellation", event)
 			}
-		case <-drainDeadline:
+		case <-deadline:
 			return
 		}
 	}
 }
 
-func TestInvokeAutoForwardCopiesMutablePayload(t *testing.T) {
+func TestInvokeAutoForwardCopiesNestedMutablePayload(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(Atomic("active", Invoke("worker", "jobs", WithAutoForward())))
+	if err != nil {
+		t.Fatal(err)
+	}
 	mutated := make(chan struct{})
-	chart, err := Build(Atomic("active",
-		Invoke(func(ctx context.Context, _ Value, io InvokeIO) (Value, error) {
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, io InvokeIO) (Value, error) {
 			select {
-			case ev := <-io.Incoming:
-				m, _ := ev.Data.AsMap()
-				list, _ := m["values"].AsList()
+			case event := <-io.Incoming:
+				values, _ := event.Data.AsMap()
+				list, _ := values["values"].AsList()
 				list[0] = Int64Value(9)
 				close(mutated)
 			case <-ctx.Done():
 			}
 			<-ctx.Done()
-			return Value{}, nil
-		}, WithAutoForward()),
-	))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
+			return NullValue(), nil
+		})
+	}))
 	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer in.Stop(ctx)
+	defer instance.Stop(ctx)
 	original, _ := MapValue(map[string]Value{"values": ListValue([]Value{Int64Value(1)})})
-	if err := in.Send(ctx, Event{Name: "load", Data: original}); err != nil {
-		t.Fatalf("Send: %v", err)
+	if err := instance.Send(ctx, Event{Name: "load", Data: original}); err != nil {
+		t.Fatal(err)
 	}
 	select {
 	case <-mutated:
@@ -926,426 +690,186 @@ func TestInvokeAutoForwardCopiesMutablePayload(t *testing.T) {
 	}
 }
 
-// childPingPongChart is a small, complete SCXML session in its own right:
-// it greets whatever invoked it over "#_parent" on entry, and replies
-// "pong" the same way once it's forwarded a "ping".
-func childPingPongChart(t *testing.T) *Chart {
-	t.Helper()
-	chart, err := Build(
-		Compound("croot", "start",
-			Children(
-				Atomic("start",
-					OnEntry(Action(func(d *struct{}, ec ExecContext) error {
-						ec.Send("hello", SendOptions{Target: "#_parent", Data: testStringValue("hi")})
-						return nil
-					})),
-					On("ping", Target("pinged")),
-				),
-				Atomic("pinged",
-					OnEntry(Action(func(d *struct{}, ec ExecContext) error {
-						ec.Send("pong", SendOptions{Target: "#_parent"})
-						return nil
-					})),
-				),
-			),
-		),
-	)
+func TestInvokeChartHandlerRoundTripSetsChildOriginMetadata(t *testing.T) {
+	childBuilder := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	sendHello := childBuilder.action("send-parent-hello-with-origin", func(_ *struct{}, ec ExecContext) error {
+		ec.Send("hello", SendOptions{Target: "#_parent"})
+		return nil
+	})
+	sendPong := childBuilder.action("send-parent-pong-with-origin", func(_ *struct{}, ec ExecContext) error {
+		ec.Send("pong", SendOptions{Target: "#_parent"})
+		return nil
+	})
+	child, err := childBuilder.build(Compound("child", "start", Children(
+		Atomic("start", OnEntry(sendHello), On("ping", Target("pinged"))),
+		Atomic("pinged", OnEntry(sendPong)),
+	)))
 	if err != nil {
-		t.Fatalf("Build(child): %v", err)
+		t.Fatal(err)
 	}
-	return chart
-}
-
-// TestInvokeChartRoundTripsThroughParentAndAutoForward reproduces SCXML
-// 6.4's full invoking-chart-is-the-parent picture end to end: a real
-// child *Chart* is invoked as a genuine child session (InvokeChart), its
-// own <send target="#_parent"> reaches back into the parent (Appendix
-// C.1), and the parent's autoforward relays an external event down to the
-// child with no explicit "#_<invokeid>" addressing needed.
-func TestInvokeChartRoundTripsThroughParentAndAutoForward(t *testing.T) {
-	childChart := childPingPongChart(t)
-	var childOrigin, childOriginType Identifier
-
-	parentChart, err := Build(
-		Compound("proot", "invoking",
-			Children(
-				// "invoking" (not its inner children) holds the Invoke,
-				// so the child session's lifetime spans the whole
-				// hello/ping/pong handshake -- only the final transition
-				// to "done" (which leaves "invoking" altogether) cancels
-				// it.
-				Compound("invoking", "waitingHello",
-					Children(
-						Atomic("waitingHello", On("hello", Target("waitingPong"), Then(func(ec ExecContext) error {
-							ev, _ := ec.Event()
-							childOrigin, childOriginType = ev.Origin, ev.OriginType
-							return nil
-						}))),
-						Atomic("waitingPong", On("pong", Target("done"))),
-					),
-					Invoke(
-						InvokeChart(childChart, func(params Value) any { return &struct{}{} }, nil),
-						WithInvokeID("child"),
-						WithAutoForward(),
-					),
-				),
-				Atomic("done"),
-			),
-		),
-	)
+	type model struct{ origin, originType Identifier }
+	var data *model
+	parentBuilder := newTestBuilder(t, func() *model { data = &model{}; return data })
+	recordOrigin := parentBuilder.action("record-child-origin", func(data *model, ec ExecContext) error {
+		event, _ := ec.Event()
+		data.origin, data.originType = event.Origin, event.OriginType
+		return nil
+	})
+	parent, err := parentBuilder.build(Compound("parent", "invoking", Children(
+		Compound("invoking", "waitingHello", Children(
+			Atomic("waitingHello", On("hello", Then(recordOrigin), Target("waitingPong"))),
+			Atomic("waitingPong", On("pong", Target("done"))),
+		), Invoke(string(SCXMLInvokeType), "child", WithInvokeID("child"), WithAutoForward())),
+		Atomic("done"),
+	)))
 	if err != nil {
-		t.Fatalf("Build(parent): %v", err)
+		t.Fatal(err)
 	}
-
-	parent := New(parentChart, nil)
+	instance := parentBuilder.newInstance(parent, WithInvokeHandler(SCXMLInvokeType, InvokeChartHandler(child, nil)))
 	ctx := context.Background()
-	if err := parent.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer parent.Stop(ctx)
-
-	deadline := time.Now().Add(2 * time.Second)
-	for !hasState(parent.Configuration(), "waitingPong") {
-		if time.Now().After(deadline) {
-			t.Fatalf("configuration = %v, want 'waitingPong' after the child's #_parent 'hello'", parent.Configuration())
-		}
-		time.Sleep(time.Millisecond)
+	defer instance.Stop(ctx)
+	waitActive(t, instance, "waitingPong")
+	if !strings.HasPrefix(string(data.origin), "#_scxml_") || data.originType != SCXMLEventProcessorAlias {
+		t.Fatalf("child #_parent event origin = %q/%q, want standard SCXML metadata", data.origin, data.originType)
 	}
-	if !strings.HasPrefix(string(childOrigin), "#_scxml_") || childOriginType != SCXMLEventProcessorAlias {
-		t.Fatalf("child #_parent event origin = %q/%q, want standard SCXML metadata", childOrigin, childOriginType)
+	if err := instance.Send(ctx, Event{Name: "ping"}); err != nil {
+		t.Fatal(err)
 	}
-
-	// The parent has no transition of its own for "ping" -- it only
-	// reaches the child via autoforward, with no explicit
-	// "#_<invokeid>" addressing on the parent's part.
-	if err := parent.Send(ctx, Event{Name: "ping", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-
-	deadline = time.Now().Add(2 * time.Second)
-	for !hasState(parent.Configuration(), "done") {
-		if time.Now().After(deadline) {
-			t.Fatalf("configuration = %v, want 'done' after the child's #_parent 'pong'", parent.Configuration())
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitActive(t, instance, "done")
 }
 
-// TestInvokeChartExplicitSendReachesChildWithoutAutoForward exercises the
-// other half of SCXML 6.4.4's addressing -- SendOptions{Target:
-// "#_<invokeid>"} without WithAutoForward -- against the same real child
-// session.
-func TestInvokeChartExplicitSendReachesChildWithoutAutoForward(t *testing.T) {
-	childChart := childPingPongChart(t)
-
-	parentChart, err := Build(
-		Compound("proot", "invoking",
-			Children(
-				Compound("invoking", "waitingHello",
-					Children(
-						Atomic("waitingHello",
-							On("hello", Target("waitingPong"), Then(Action(func(d *struct{}, ec ExecContext) error {
-								ec.Send("ping", SendOptions{Target: "#_child"})
-								return nil
-							}))),
-						),
-						Atomic("waitingPong", On("pong", Target("done"))),
-					),
-					Invoke(
-						InvokeChart(childChart, func(params Value) any { return &struct{}{} }, nil),
-						WithInvokeID("child"),
-					),
-				),
-				Atomic("done"),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build(parent): %v", err)
-	}
-
-	parent := New(parentChart, &struct{}{})
-	ctx := context.Background()
-	if err := parent.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer parent.Stop(ctx)
-
-	deadline := time.Now().Add(2 * time.Second)
-	for !hasState(parent.Configuration(), "done") {
-		if time.Now().After(deadline) {
-			t.Fatalf("configuration = %v, want 'done' (hello -> explicit #_child ping -> child's #_parent pong)", parent.Configuration())
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-// TestInvokeChartCancelledOnStateExitStopsChildSession confirms the child
-// session is a real Instance subject to the same exitInterpreter cleanup
-// as any other -- cancelling the invocation must actually stop it, not
-// leave it running orphaned.
-func TestInvokeChartCancelledOnStateExitStopsChildSession(t *testing.T) {
+func TestInvokeChartHandlerCancellationStopsChildAndRunsOnExit(t *testing.T) {
 	childExited := make(chan struct{})
-	childChart, err := Build(
-		Atomic("only",
-			OnExit(Action(func(d *struct{}, ec ExecContext) error {
-				close(childExited)
-				return nil
-			})),
-		),
-	)
+	childBuilder := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	markExit := childBuilder.action("mark-invoked-child-exit", func(*struct{}, ExecContext) error { close(childExited); return nil })
+	child, err := childBuilder.build(Atomic("only", OnExit(markExit)))
 	if err != nil {
-		t.Fatalf("Build(child): %v", err)
+		t.Fatal(err)
 	}
-
-	parentChart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a",
-					Invoke(InvokeChart(childChart, func(params Value) any { return &struct{}{} }, nil)),
-					On("go", Target("b")),
-				),
-				Atomic("b"),
-			),
-		),
-	)
+	parentBuilder := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	parent, err := parentBuilder.build(Compound("parent", "a", Children(
+		Atomic("a", Invoke(string(SCXMLInvokeType), "child"), On("go", Target("b"))), Atomic("b"),
+	)))
 	if err != nil {
-		t.Fatalf("Build(parent): %v", err)
+		t.Fatal(err)
 	}
-
-	parent := New(parentChart, nil)
+	instance := parentBuilder.newInstance(parent, WithInvokeHandler(SCXMLInvokeType, InvokeChartHandler(child, nil)))
 	ctx := context.Background()
-	if err := parent.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer parent.Stop(ctx)
-
-	if err := parent.Send(ctx, Event{Name: "go", Type: EventExternal}); err != nil {
-		t.Fatalf("Send: %v", err)
+	defer instance.Stop(ctx)
+	if err := instance.Send(ctx, Event{Name: "go"}); err != nil {
+		t.Fatal(err)
 	}
-
+	waitActive(t, instance, "b")
 	select {
 	case <-childExited:
 	case <-time.After(2 * time.Second):
-		t.Fatalf("child session was never stopped when the invoking state was exited")
+		t.Fatal("child session was never stopped when the invoking state was exited")
 	}
 }
 
-// TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry confirms
-// parentIOProcessor.IOProcessors includes the mandatory address of the child
-// SCXML session and forwards baseIO's advertised entries, without synthesizing
-// a reverse-direction "#_parent" entry.
-func TestInvokeChartChildIOProcessorsReflectBaseIOWithoutParentEntry(t *testing.T) {
+func TestInvokeChartHandlerChildIOProcessorsExcludeSyntheticParent(t *testing.T) {
 	seen := make(chan []IOProcessorInfo, 1)
-	childChart, err := Build(
-		Atomic("only",
-			OnEntry(Action(func(d *struct{}, ec ExecContext) error {
-				seen <- ec.IOProcessors()
-				return nil
-			})),
-		),
-	)
+	childBuilder := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	record := childBuilder.action("record-child-io-processors", func(_ *struct{}, ec ExecContext) error { seen <- ec.IOProcessors(); return nil })
+	child, err := childBuilder.build(Atomic("only", OnEntry(record)))
 	if err != nil {
-		t.Fatalf("Build(child): %v", err)
+		t.Fatal(err)
 	}
-
 	baseIO := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://base")}}}
-	parentChart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a", Invoke(InvokeChart(childChart, func(params Value) any { return &struct{}{} }, baseIO))),
-			),
-		),
-	)
+	parentBuilder := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	parent, err := parentBuilder.build(Atomic("active", Invoke(string(SCXMLInvokeType), "child")))
 	if err != nil {
-		t.Fatalf("Build(parent): %v", err)
+		t.Fatal(err)
 	}
-
-	parent := New(parentChart, nil)
+	instance := parentBuilder.newInstance(parent, WithInvokeHandler(SCXMLInvokeType, InvokeChartHandler(child, baseIO)))
 	ctx := context.Background()
-	if err := parent.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer parent.Stop(ctx)
-
+	defer instance.Stop(ctx)
 	select {
 	case got := <-seen:
 		if len(got) != 2 || got[0].Type != SCXMLEventProcessor || !strings.HasPrefix(got[0].Location.String(), "#_scxml_") || got[1].Type != "mock" || got[1].Location.String() != "mock://base" {
-			t.Fatalf("child ExecContext.IOProcessors() = %v, want its SCXML address followed by {mock mock://base}", got)
+			t.Fatalf("child IOProcessors = %v, want child SCXML entry followed by base entries and no #_parent", got)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("child's OnEntry action never ran")
+		t.Fatal("child OnEntry did not run")
 	}
 }
 
-// TestInvokeChartChildIOProcessorsIncludesSCXMLWithNilBaseIO confirms the
-// mandatory child-session SCXML address remains available with no base
-// transport configured.
-func TestInvokeChartChildIOProcessorsIncludesSCXMLWithNilBaseIO(t *testing.T) {
-	seen := make(chan []IOProcessorInfo, 1)
-	childChart, err := Build(
-		Atomic("only",
-			OnEntry(Action(func(d *struct{}, ec ExecContext) error {
-				seen <- ec.IOProcessors()
-				return nil
-			})),
-		),
-	)
+func TestInvokeChartHandlerPropagatesTopLevelDonePayload(t *testing.T) {
+	childBuilder := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	child, err := childBuilder.build(Compound("child", "done", Children(Final("done", WithDone(GoLiteral(mustTestString(t, "child result")))))))
 	if err != nil {
-		t.Fatalf("Build(child): %v", err)
+		t.Fatal(err)
 	}
-
-	parentChart, err := Build(
-		Compound("m", "a",
-			Children(
-				Atomic("a", Invoke(InvokeChart(childChart, func(params Value) any { return &struct{}{} }, nil))),
-			),
-		),
-	)
+	type model struct{ result Value }
+	var data *model
+	parentBuilder := newTestBuilder(t, func() *model { data = &model{}; return data })
+	record := parentBuilder.action("record-child-done-payload", func(data *model, ec ExecContext) error { event, _ := ec.Event(); data.result = event.Data; return nil })
+	parent, err := parentBuilder.build(Compound("parent", "working", Children(
+		Atomic("working", Invoke(string(SCXMLInvokeType), "child", WithInvokeID("child")), On("done.invoke.child", Then(record), Target("finished"))),
+		Final("finished"),
+	)))
 	if err != nil {
-		t.Fatalf("Build(parent): %v", err)
+		t.Fatal(err)
 	}
-
-	parent := New(parentChart, nil)
-	ctx := context.Background()
-	if err := parent.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	instance := parentBuilder.newInstance(parent, WithInvokeHandler(SCXMLInvokeType, InvokeChartHandler(child, nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	defer parent.Stop(ctx)
+	if err := instance.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := mustTestString(t, "child result")
+	if !data.result.Equal(want) {
+		t.Fatalf("done.invoke data = %#v, want child result", data.result)
+	}
+}
 
-	select {
-	case got := <-seen:
-		if len(got) != 1 || got[0].Type != SCXMLEventProcessor || !strings.HasPrefix(got[0].Location.String(), "#_scxml_") {
-			t.Fatalf("child ExecContext.IOProcessors() = %v, want its mandatory SCXML address", got)
+func TestInvokeFullIncomingMailboxRaisesCommunicationError(t *testing.T) {
+	type model struct{ failure Value }
+	var data *model
+	b := newTestBuilder(t, func() *model { data = &model{}; return data })
+	fill := b.action("fill-invoke-incoming-mailbox", func(_ *model, ec ExecContext) error {
+		for i := 0; i <= invokeIncomingBuffer; i++ {
+			ec.Send("message", SendOptions{Target: "#_service"})
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("child's OnEntry action never ran")
-	}
-}
-
-func TestInvokeChartPropagatesTopLevelDoneData(t *testing.T) {
-	child, err := Build(
-		Compound("child", "done", Children(
-			Final("done", WithDone(func(ExecContext) Value { return testStringValue("child result") })),
-		)),
-	)
+		return nil
+	})
+	record := b.action("record-full-mailbox-error", func(data *model, ec ExecContext) error { event, _ := ec.Event(); data.failure = event.Data; return nil })
+	chart, err := b.build(Compound("root", "active", Children(
+		Atomic("active", Invoke("worker", "jobs", WithInvokeID("service")), On("fill", Then(fill)), On(string(ErrEventCommunication), Then(record), Target("failed"))),
+		Atomic("failed"),
+	)))
 	if err != nil {
-		t.Fatalf("Build child: %v", err)
+		t.Fatal(err)
 	}
-
-	var got Value
-	parent, err := Build(
-		Compound("parent", "working", Children(
-			Atomic("working",
-				Invoke(InvokeChart(child, func(Value) any { return nil }, nil), WithInvokeID("child")),
-				On("done.invoke.child", Target("finished"), Then(func(ec ExecContext) error {
-					ev, _ := ec.Event()
-					got = ev.Data
-					return nil
-				})),
-			),
-			Final("finished"),
-		)),
-	)
-	if err != nil {
-		t.Fatalf("Build parent: %v", err)
-	}
-
-	in := New(parent, nil)
+	instance := b.newInstance(chart, WithInvokeHandler("worker", func() InvokeHandler {
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, _ InvokeIO) (Value, error) {
+			<-ctx.Done()
+			return NullValue(), nil
+		})
+	}))
 	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := in.Wait(ctx); err != nil {
-		t.Fatalf("Wait: %v", err)
+	defer instance.Stop(ctx)
+	if err := instance.Send(ctx, Event{Name: "fill"}); err != nil {
+		t.Fatal(err)
 	}
-	if !got.Equal(testStringValue("child result")) {
-		t.Fatalf("done.invoke data = %#v, want child result", got)
-	}
-}
-
-func TestInvokeFullIncomingQueueProducesCommunicationError(t *testing.T) {
-	chart, err := Build(
-		Compound("root", "active", Children(
-			Atomic("active",
-				Invoke(func(ctx context.Context, _ Value, _ InvokeIO) (Value, error) {
-					<-ctx.Done()
-					return Value{}, nil
-				}, WithInvokeID("service")),
-				On("fill", Then(func(ec ExecContext) error {
-					for i := 0; i <= invokeIncomingBuffer; i++ {
-						ec.Send("message", SendOptions{Target: "#_service"})
-					}
-					return nil
-				})),
-				On(string(ErrEventCommunication), Target("failed")),
-			),
-			Atomic("failed"),
-		)),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-	if err := in.Send(ctx, Event{Name: "fill"}); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if !hasState(in.Configuration(), "failed") {
-		t.Fatalf("configuration = %v, want failed after invocation mailbox saturation", in.Configuration())
-	}
-}
-
-func TestInvokeParamsPanicBecomesExecutionError(t *testing.T) {
-	started := false
-	chart, err := Build(
-		Compound("root", "active", Children(
-			Atomic("active",
-				Invoke(func(context.Context, Value, InvokeIO) (Value, error) {
-					started = true
-					return Value{}, nil
-				}, WithInvokeParams(func(ExecContext) Value { panic("boom") })),
-				On(string(ErrEventExecution), Target("recovered")),
-			),
-			Atomic("recovered"),
-		)),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	in := New(chart, nil)
-	ctx := context.Background()
-	if err := in.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer in.Stop(ctx)
-	if started {
-		t.Fatal("invoke started despite its params failing to evaluate")
-	}
-	if !hasState(in.Configuration(), "recovered") {
-		t.Fatalf("configuration = %v, want recovered after params panic", in.Configuration())
-	}
-}
-
-func TestInvokeGeneratedIDDoesNotCollideWithExplicitID(t *testing.T) {
-	service := func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }
-	chart, err := Build(Atomic("root",
-		Invoke(service, WithInvokeID("root.invoke1")),
-		Invoke(service),
-	))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	ip := newInterpretation(chart, nil)
-	ip.start()
-	if len(ip.invokesByID) != 2 || ip.invokesByID["root.invoke1"] == nil || ip.invokesByID["root.invoke2"] == nil {
-		t.Fatalf("active invoke IDs = %v, want root.invoke1 and root.invoke2", sortedInvokeIDs(ip.invokesByID))
+	waitActive(t, instance, "failed")
+	classification, _, ok := PlatformErrorDetails(data.failure)
+	if !ok || classification != ErrEventCommunication {
+		t.Fatalf("mailbox error Data = %v, want classification %q", data.failure, ErrEventCommunication)
 	}
 }

@@ -19,6 +19,13 @@ type actorTestDatamodelProgram struct {
 	created chan struct{}
 }
 
+type actorTestDatamodel struct{ program actorTestDatamodelProgram }
+
+func (actorTestDatamodel) Name() statecharts.Identifier { return "actor-test" }
+func (m actorTestDatamodel) Compile(*statecharts.Definition) (statecharts.DatamodelProgram, error) {
+	return m.program, nil
+}
+
 func (p actorTestDatamodelProgram) Fingerprint() []byte { return []byte("actor-test/v1") }
 
 func (actorTestDatamodelProgram) ResolveExpression(statecharts.Expression) (statecharts.CompiledExpression, error) {
@@ -68,8 +75,8 @@ func TestSpawnUsesRegisteredDatamodelProgram(t *testing.T) {
 	created := make(chan struct{}, 1)
 	chart, err := statecharts.Build(
 		statecharts.Atomic("program"),
-		statecharts.WithDatamodelProgram(actorTestDatamodelProgram{created: created}),
-		statecharts.WithVersion("test-v1"),
+		actorTestDatamodel{program: actorTestDatamodelProgram{created: created}},
+		statecharts.WithRevisionSalt("test-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -91,20 +98,9 @@ func TestSpawnUsesRegisteredDatamodelProgram(t *testing.T) {
 	}
 }
 
-func TestRegisterRejectsChartWithoutDatamodelFactory(t *testing.T) {
-	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithVersion("test-v1"))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	sys := NewSystem()
-	if err := sys.Register(chart); err == nil {
-		t.Fatalf("Register: expected error for a chart with no datamodel factory")
-	}
-}
-
 func TestRegisterRejectsDuplicateChartID(t *testing.T) {
 	build := func() *statecharts.Chart {
-		c, err := statecharts.Build(statecharts.Atomic("dup"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		c, err := statecharts.Build(statecharts.Atomic("dup"), statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
@@ -128,7 +124,7 @@ func TestSpawnRejectsUnregisteredKind(t *testing.T) {
 }
 
 func TestSpawnDurableRequiresStorageWhileEphemeralDoesNotTouchIt(t *testing.T) {
-	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -231,7 +227,7 @@ func TestPeerMessagingSetsOriginAndAllowsReply(t *testing.T) {
 
 func TestSpawnNonDurableInstanceIDMatchesName(t *testing.T) {
 	ctx := context.Background()
-	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+	chart, err := statecharts.Build(statecharts.Atomic("solo"), statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -459,7 +455,7 @@ func TestSpawnStopRaceLeavesNoOrphanedInstance(t *testing.T) {
 	// under test.
 	chart, err := statecharts.Build(
 		statecharts.Atomic("solo"),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -548,13 +544,17 @@ func TestStopHonorsContextDeadline(t *testing.T) {
 	ctx := context.Background()
 
 	release := make(chan struct{})
-	wedge := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	wedge, err := model.Action("wedge", "v1", func(_ *struct{}, _ statecharts.ExecContext, _ []statecharts.Value) error {
 		<-release // never returns until the test releases it
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	wedged, err := statecharts.Build(
-		statecharts.Atomic("wedged", statecharts.On("go", statecharts.Then(wedge))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("wedged", statecharts.On("go", statecharts.Then(wedge.Do()))),
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -599,14 +599,18 @@ func TestStopCanRetryCleanupAfterDeadline(t *testing.T) {
 	ctx := context.Background()
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	wedge := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	wedge, err := model.Action("wedge-retry", "v1", func(_ *struct{}, _ statecharts.ExecContext, _ []statecharts.Value) error {
 		close(entered)
 		<-release
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	chart, err := statecharts.Build(
-		statecharts.Atomic("wedged-retry", statecharts.On("go", statecharts.Then(wedge))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("wedged-retry", statecharts.On("go", statecharts.Then(wedge.Do()))),
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -829,7 +833,7 @@ func TestSpawnRejectsRoutingKeyAsActorID(t *testing.T) {
 	ctx := context.Background()
 	chart, err := statecharts.Build(
 		statecharts.Atomic("worker"),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -850,7 +854,7 @@ func TestSpawnRejectsRoutingKeyAsActorID(t *testing.T) {
 
 func TestIsResidentAcceptsLocalIDAndRoutingKeyWithoutPagingIn(t *testing.T) {
 	ctx := context.Background()
-	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -888,7 +892,7 @@ func TestIsResidentAcceptsLocalIDAndRoutingKeyWithoutPagingIn(t *testing.T) {
 
 func TestResidencyObserverReportsHydrationAndEviction(t *testing.T) {
 	ctx := context.Background()
-	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+	chart, err := statecharts.Build(statecharts.Atomic("worker"), statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -994,14 +998,18 @@ func TestConcurrentActivationCannotExceedMaxResident(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var enteredOnce sync.Once
-	blockStart := statecharts.Action(func(_ *struct{}, _ statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	blockStart, err := model.Action("block-start", "v1", func(_ *struct{}, _ statecharts.ExecContext, _ []statecharts.Value) error {
 		enteredOnce.Do(func() { close(entered) })
 		<-release
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	chart, err := statecharts.Build(
-		statecharts.Atomic("blocked", statecharts.OnEntry(blockStart)),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("blocked", statecharts.OnEntry(blockStart.Do())),
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -1054,20 +1062,24 @@ func TestPeerDispatchDoesNotCreateOneBlockedGoroutinePerMessage(t *testing.T) {
 	ctx := context.Background()
 	receiver, err := statecharts.Build(
 		statecharts.Atomic("slow-receiver", statecharts.On("message")),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
 	const messages = 200
-	sendBurst := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+	senderModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	sendBurst, err := senderModel.Action("send-burst", "v1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		for i := 0; i < messages; i++ {
 			ec.Send("message", statecharts.SendOptions{Target: "slow"})
 		}
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sender, err := statecharts.Build(
-		statecharts.Atomic("burst-sender", statecharts.On("go", statecharts.Then(sendBurst))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("burst-sender", statecharts.On("go", statecharts.Then(sendBurst.Do()))),
+		senderModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1107,20 +1119,24 @@ func TestPeerDispatchQueueOverflowRaisesCommunicationError(t *testing.T) {
 	ctx := context.Background()
 	receiver, err := statecharts.Build(
 		statecharts.Atomic("overflow-receiver", statecharts.On("message")),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
-	sendBurst := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+	senderModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	sendBurst, err := senderModel.Action("send-overflow-burst", "v1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ec.Send("message", statecharts.SendOptions{Target: "receiver"})
 		ec.Send("message", statecharts.SendOptions{Target: "receiver", SendID: "overflowed"})
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sender, err := statecharts.Build(
 		statecharts.Compound("overflow-sender", "idle",
 			statecharts.Children(
 				statecharts.Atomic("idle",
-					statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(sendBurst)),
+					statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(sendBurst.Do())),
 				),
 				statecharts.Atomic("waiting",
 					statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("failed")),
@@ -1128,7 +1144,7 @@ func TestPeerDispatchQueueOverflowRaisesCommunicationError(t *testing.T) {
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		senderModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1190,22 +1206,27 @@ func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T
 	ctx := context.Background()
 	hello := mustStringValue(t, "hello")
 	var localDeliveries int
+	receiverModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	recordDelivery, err := receiverModel.Action("record-local-delivery", "v1", func(_ *struct{}, _ statecharts.ExecContext, _ []statecharts.Value) error {
+		localDeliveries++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	receiver, err := statecharts.Build(
 		statecharts.Atomic("typed-receiver", statecharts.On("frame", statecharts.Then(
-			statecharts.Action(func(_ *struct{}, _ statecharts.ExecContext) error {
-				localDeliveries++
-				return nil
-			}),
+			recordDelivery.Do(),
 		))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		receiverModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
 	sender, err := statecharts.Build(
 		statecharts.Atomic("typed-sender", statecharts.On("go", statecharts.Then(
-			statecharts.SendEvent("frame", statecharts.SendOptions{Target: "output", Type: "browser", Data: hello}),
+			statecharts.Send("frame", statecharts.SendTarget("output"), statecharts.SendType("browser"), statecharts.SendContent(statecharts.GoLiteral(hello))),
 		))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1247,24 +1268,29 @@ func TestActorDeliveryIsolatesMutablePayloadAndUsesSCXMLOriginType(t *testing.T)
 	original := map[string]statecharts.Value{"count": statecharts.Int64Value(1)}
 	payload := mustMapValue(t, original)
 	received := make(chan statecharts.Event, 1)
+	receiverModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	recordPayload, err := receiverModel.Action("record-payload", "v1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		got, ok := ev.Data.AsMap()
+		if !ok {
+			return fmt.Errorf("payload data is not a map: %#v", ev.Data)
+		}
+		got["count"] = statecharts.Int64Value(9)
+		received <- ev
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	receiver, err := statecharts.Build(
-		statecharts.Atomic("payload-receiver", statecharts.On("payload", statecharts.Then(func(ec statecharts.ExecContext) error {
-			ev, _ := ec.Event()
-			got, ok := ev.Data.AsMap()
-			if !ok {
-				return fmt.Errorf("payload data is not a map: %#v", ev.Data)
-			}
-			got["count"] = statecharts.Int64Value(9)
-			received <- ev
-			return nil
-		}))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("payload-receiver", statecharts.On("payload", statecharts.Then(recordPayload.Do()))),
+		receiverModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
 	sender, err := statecharts.Build(
-		statecharts.Atomic("payload-sender", statecharts.OnEntry(statecharts.SendEvent("payload", statecharts.SendOptions{Target: "receiver", Data: payload}))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("payload-sender", statecharts.OnEntry(statecharts.Send("payload", statecharts.SendTarget("receiver"), statecharts.SendContent(statecharts.GoLiteral(payload))))),
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1306,14 +1332,19 @@ func TestFallbackAdvertisesRegisteredIOProcessor(t *testing.T) {
 	processor := &registeredIOProcessor{infos: []statecharts.IOProcessorInfo{{Type: "browser", Location: want}}}
 	var got statecharts.Location
 	var ok bool
+	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	inspect, err := model.Action("inspect-browser-location", "v1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		got, ok = ec.IOProcessorLocation("browser")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	chart, err := statecharts.Build(
 		statecharts.Atomic("describer", statecharts.On("check", statecharts.Then(
-			statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
-				got, ok = ec.IOProcessorLocation("browser")
-				return nil
-			}),
+			inspect.Do(),
 		))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		model, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -1340,30 +1371,39 @@ func TestFallbackAdvertisesRegisteredIOProcessor(t *testing.T) {
 func TestUnsupportedPeerIOProcessorTypeRaisesExecutionError(t *testing.T) {
 	ctx := context.Background()
 	var deliveries int
+	receiverModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	recordDelivery, err := receiverModel.Action("record-typed-delivery", "v1", func(_ *struct{}, _ statecharts.ExecContext, _ []statecharts.Value) error {
+		deliveries++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	receiver, err := statecharts.Build(
 		statecharts.Atomic("typed-receiver", statecharts.On("ping", statecharts.Then(
-			statecharts.Action(func(_ *struct{}, _ statecharts.ExecContext) error {
-				deliveries++
-				return nil
-			}),
+			recordDelivery.Do(),
 		))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		receiverModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
-	send := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+	senderModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	send, err := senderModel.Action("send-unsupported-type", "v1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ec.Send("ping", statecharts.SendOptions{Target: "typed-target", Type: "unsupported"})
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sender, err := statecharts.Build(
 		statecharts.Compound("typed-sender", "idle",
 			statecharts.Children(
-				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(send))),
+				statecharts.Atomic("idle", statecharts.On("go", statecharts.Target("waiting"), statecharts.Then(send.Do()))),
 				statecharts.Atomic("waiting", statecharts.On(string(statecharts.ErrEventExecution), statecharts.Target("failed"))),
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		senderModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1402,7 +1442,7 @@ func TestAsyncDeliveryFailurePreservesPlatformMetadataAndDurability(t *testing.T
 	store := &toggleLoadSnapshotStore{Storage: log}
 	target, err := statecharts.Build(
 		statecharts.Atomic("async-failure-target"),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build target: %v", err)
 	}
@@ -1465,7 +1505,12 @@ func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
 		order []int
 	}
 	var receiverModels []*orderModel
-	record := statecharts.Action(func(d *orderModel, ec statecharts.ExecContext) error {
+	receiverModel := statecharts.NewGoModel(func() *orderModel {
+		d := &orderModel{}
+		receiverModels = append(receiverModels, d)
+		return d
+	})
+	record, err := receiverModel.Action("record-fifo-item", "v1", func(d *orderModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		nText, ok := ev.Data.AsNumber()
 		if !ok {
@@ -1481,25 +1526,28 @@ func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
 		d.mu.Unlock()
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	receiver, err := statecharts.Build(
-		statecharts.Atomic("fifo-receiver", statecharts.On("item", statecharts.Then(record))),
-		statecharts.WithNewDatamodel(func() any {
-			d := &orderModel{}
-			receiverModels = append(receiverModels, d)
-			return d
-		}), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("fifo-receiver", statecharts.On("item", statecharts.Then(record.Do()))),
+		receiverModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
-	send := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+	senderModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	send, err := senderModel.Action("send-fifo-items", "v1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		for i := 0; i < messages; i++ {
 			ec.Send("item", statecharts.SendOptions{Target: "receiver", Data: statecharts.Int64Value(int64(i))})
 		}
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sender, err := statecharts.Build(
-		statecharts.Atomic("fifo-sender", statecharts.On("go", statecharts.Then(send))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("fifo-sender", statecharts.On("go", statecharts.Then(send.Do()))),
+		senderModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -1556,7 +1604,7 @@ func (h *systemInvokeHandler) Start(ctx context.Context, _ statecharts.InvokeReq
 func declarativeInvokeChart(t *testing.T) *statecharts.Chart {
 	t.Helper()
 	definition := statecharts.Definition{
-		ID: "invoke-system-test", Datamodel: "go",
+		ID: "invoke-system-test", Datamodel: "go", RevisionSalt: "test-v1",
 		Root: statecharts.StateDefinition{
 			ID: statecharts.StateDefinitionID{Value: "invoke-system-test"}, Kind: statecharts.KindCompound,
 			Initial: &statecharts.TransitionDefinition{Targets: []statecharts.Identifier{"active"}},

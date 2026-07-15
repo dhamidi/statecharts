@@ -271,7 +271,7 @@ func (c *Chart) Prepare(opts ...Option) error {
 	}
 	for _, state := range c.order {
 		for _, invoke := range state.invokes {
-			if !invoke.declarative || invoke.hasTypeExpr {
+			if invoke.hasTypeExpr {
 				continue
 			}
 			if cfg.invokeHandlers[canonicalInvokeType(invoke.staticType)] == nil {
@@ -280,23 +280,6 @@ func (c *Chart) Prepare(opts ...Option) error {
 		}
 	}
 	return nil
-}
-
-// New constructs an Instance for chart, bound to the given datamodel value
-// (typically a pointer to the caller's own struct). It assigns the
-// Instance's session id: an explicit WithSessionID if given, otherwise one
-// minted by the configured IDGenerator (see Instance.ID). The interpreter
-// goroutine is not started until Start is called.
-func New(chart *Chart, datamodel any, opts ...Option) *Instance {
-	if err := chart.Prepare(opts...); err != nil {
-		panic(err)
-	}
-	session := newLegacyDatamodelSession(datamodel)
-	in, err := newInstanceForSession(chart, session, opts...)
-	if err != nil {
-		panic(err)
-	}
-	return in
 }
 
 type datamodelSessionFactory func() (DatamodelSession, error)
@@ -341,7 +324,7 @@ func newInstanceForSession(chart *Chart, session DatamodelSession, opts ...Optio
 	if id == "" {
 		id = cfg.idGen.NewID()
 	}
-	ip := newInterpretation(chart, legacySessionValue(session))
+	ip := newInterpretation(chart)
 	ip.session = session
 	if cfg.deliveryNamespace != "" {
 		ip.deliveryNamespace = cfg.deliveryNamespace
@@ -349,14 +332,6 @@ func newInstanceForSession(chart *Chart, session DatamodelSession, opts ...Optio
 		ip.deliveryNamespace = fmt.Sprintf("incarnation-%d", incarnationSeq.Add(1))
 	}
 	return newInstance(chart, ip, session, cfg, id), nil
-}
-
-func legacySessionValue(session DatamodelSession) any {
-	legacy, _ := session.(interface{ legacyValue() any })
-	if legacy == nil {
-		return nil
-	}
-	return legacy.legacyValue()
 }
 
 func newInstance(chart *Chart, ip *interpretation, session DatamodelSession, cfg instanceConfig, id SessionID) *Instance {
@@ -429,29 +404,20 @@ func (in *Instance) startInvoke(request InvokeRequest, spec *compiledInvoke) (ca
 	// that already happened once, live (ADR 0010). A no-op cancel and nil
 	// incoming are indistinguishable, from the interpreter core's side, from
 	// an invocation that simply never receives any "#_<invokeid>" traffic.
-	if spec.declarative {
-		factory := in.invokeHandlers[canonicalInvokeType(request.Type)]
-		if factory == nil {
-			return nil, nil, invokeHandlerUnavailableError{request.Type}
-		}
-		if in.suppressInvoke.Load() {
-			return func() {}, nil, nil
-		}
-		handler, err := makeInvokeHandler(factory, request.Type)
-		if err != nil {
-			return nil, nil, err
-		}
-		request = cloneInvokeRequest(request)
-		cancel, incoming = in.runInvokeGoroutine(request.ID, func(ctx context.Context, io InvokeIO) (Value, error) {
-			return handler.Start(ctx, request, io)
-		})
-		return cancel, incoming, nil
+	factory := in.invokeHandlers[canonicalInvokeType(request.Type)]
+	if factory == nil {
+		return nil, nil, invokeHandlerUnavailableError{request.Type}
 	}
 	if in.suppressInvoke.Load() {
 		return func() {}, nil, nil
 	}
+	handler, err := makeInvokeHandler(factory, request.Type)
+	if err != nil {
+		return nil, nil, err
+	}
+	request = cloneInvokeRequest(request)
 	cancel, incoming = in.runInvokeGoroutine(request.ID, func(ctx context.Context, io InvokeIO) (Value, error) {
-		return spec.start(ctx, request.Data, io)
+		return handler.Start(ctx, request, io)
 	})
 	return cancel, incoming, nil
 }
@@ -505,17 +471,6 @@ func (in *Instance) resumeInvokesAfterReplay() {
 			// this one, e.g. by exiting a parallel region both belonged to.
 			continue
 		}
-		spec := ri.spec
-		if !spec.declarative && spec.resume == nil {
-			in.ip.enqueueInternal(Event{
-				Name:     ErrEventCommunication,
-				Type:     EventPlatform,
-				InvokeID: id,
-				Data:     PlatformErrorValue(ErrEventCommunication, fmt.Errorf("statecharts: Rehydrate: invoke %q was active before restart; its continuation cannot be guaranteed", id)),
-			})
-			in.ip.runToStable()
-			continue
-		}
 		// _event is unbound here (SCXML 5.10.1), not the tail of replay.
 		ec := in.ip.execContext()
 		ec.event, ec.hasEvent = Event{}, false
@@ -525,33 +480,29 @@ func (in *Instance) resumeInvokesAfterReplay() {
 			continue
 		}
 		var run func(context.Context, InvokeIO) (Value, error)
-		if spec.declarative {
-			factory := in.invokeHandlers[canonicalInvokeType(request.Type)]
-			if factory == nil {
-				in.ip.reportError(invokeHandlerUnavailableError{request.Type})
-				in.ip.runToStable()
-				continue
-			}
-			handler, err := makeInvokeHandler(factory, request.Type)
-			if err != nil {
-				in.ip.enqueueInternal(Event{Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id, Data: PlatformErrorValue(ErrEventCommunication, err)})
-				in.ip.runToStable()
-				continue
-			}
-			resumable, ok := handler.(ResumableInvokeHandler)
-			if !ok {
-				in.ip.enqueueInternal(Event{
-					Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id,
-					Data: PlatformErrorValue(ErrEventCommunication, fmt.Errorf("statecharts: Rehydrate: invoke %q handler type %q cannot resume", id, request.Type)),
-				})
-				in.ip.runToStable()
-				continue
-			}
-			request = cloneInvokeRequest(request)
-			run = func(ctx context.Context, io InvokeIO) (Value, error) { return resumable.Resume(ctx, request, io) }
-		} else {
-			run = func(ctx context.Context, io InvokeIO) (Value, error) { return spec.resume(ctx, id, request.Data, io) }
+		factory := in.invokeHandlers[canonicalInvokeType(request.Type)]
+		if factory == nil {
+			in.ip.reportError(invokeHandlerUnavailableError{request.Type})
+			in.ip.runToStable()
+			continue
 		}
+		handler, err := makeInvokeHandler(factory, request.Type)
+		if err != nil {
+			in.ip.enqueueInternal(Event{Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id, Data: PlatformErrorValue(ErrEventCommunication, err)})
+			in.ip.runToStable()
+			continue
+		}
+		resumable, ok := handler.(ResumableInvokeHandler)
+		if !ok {
+			in.ip.enqueueInternal(Event{
+				Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id,
+				Data: PlatformErrorValue(ErrEventCommunication, fmt.Errorf("statecharts: Rehydrate: invoke %q handler type %q cannot resume", id, request.Type)),
+			})
+			in.ip.runToStable()
+			continue
+		}
+		request = cloneInvokeRequest(request)
+		run = func(ctx context.Context, io InvokeIO) (Value, error) { return resumable.Resume(ctx, request, io) }
 		cancel, incoming := in.runInvokeGoroutine(id, run)
 		ri.cancel = cancel
 		ri.incoming = incoming
@@ -562,7 +513,7 @@ func (in *Instance) resumeInvokesAfterReplay() {
 // building ctx/InvokeIO, spawning the goroutine that runs run, recovering a
 // panic, and turning run's return into done.invoke.<id> or
 // error.communication via Deliver, exactly as SCXML 6.4.3 requires of an
-// InvokeFunc's own return. It is written once so a resumed invocation is
+// invoke handler's own return. It is written once so a resumed invocation is
 // genuinely "the same invocation, still going" rather than a parallel
 // mechanism with its own edge cases to keep in sync by hand. ctx is
 // cancelled by the returned cancel func, which interpretation.cancelInvokes

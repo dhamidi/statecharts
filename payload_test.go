@@ -11,22 +11,41 @@ func TestSendClonesCanonicalValueAtEvaluation(t *testing.T) {
 	// their inputs; this specifically verifies the interpreter boundary.
 	source := map[string]Value{"count": Int64Value(1)}
 	payload := Value{kind: ValueKindMap, object: source}
-	mutateAfterSend := Action(func(_ *struct{}, ec ExecContext) error {
-		ec.Send("sent", SendOptions{Data: payload})
+	var data *struct{}
+	model := NewGoModel(func() *struct{} {
+		data = &struct{}{}
+		return data
+	})
+	mutateAfterSend, err := model.Action("payload.mutate-source-after-send", "v1", func(_ *struct{}, _ ExecContext, _ []Value) error {
 		source["count"] = Int64Value(9)
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("register send action: %v", err)
+	}
 	var got Value
-	record := Action(func(_ *struct{}, ec ExecContext) error {
+	record, err := model.Action("payload.record-received", "v1", func(_ *struct{}, ec ExecContext, _ []Value) error {
 		ev, _ := ec.Event()
 		got = ev.Data
 		return nil
 	})
-	chart, err := Build(Atomic("ready", On("go", Then(mutateAfterSend)), On("sent", Then(record))))
+	if err != nil {
+		t.Fatalf("register record action: %v", err)
+	}
+	chart, err := Build(Atomic("ready",
+		On("go", Then(Send("sent", SendContent(GoLiteral(payload))), mutateAfterSend.Do())),
+		On("sent", Then(record.Do())),
+	), model)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	in := New(chart, &struct{}{})
+	in, err := chart.NewInstance()
+	if err != nil {
+		t.Fatalf("NewInstance: %v", err)
+	}
+	if data == nil {
+		t.Fatal("NewInstance did not create datamodel")
+	}
 	if err := in.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

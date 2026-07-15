@@ -149,13 +149,17 @@ func TestFallbackSendDoesNotBlockSender(t *testing.T) {
 
 	release := make(chan struct{})
 
-	wedge := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+	wedgedModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	wedge, err := wedgedModel.Action("bridge.wedge-target", "v1", func(_ *struct{}, _ statecharts.ExecContext, _ []statecharts.Value) error {
 		<-release // never returns until the test releases it
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("register wedge action: %v", err)
+	}
 	wedgedChart, err := statecharts.Build(
-		statecharts.Atomic("wedged", statecharts.On("ping", statecharts.Then(wedge))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("wedged", statecharts.On("ping", statecharts.Then(wedge.Do()))),
+		wedgedModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build(wedgedChart): %v", err)
 	}
@@ -168,13 +172,12 @@ func TestFallbackSendDoesNotBlockSender(t *testing.T) {
 		t.Fatalf("Spawn(wedged-1): %v", err)
 	}
 
-	sendPing := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
-		ec.Send("ping", statecharts.SendOptions{Target: "wedged-1@warehouse-b"})
-		return nil
-	})
+	callerModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
 	callerChart, err := statecharts.Build(
-		statecharts.Atomic("idle", statecharts.On("go", statecharts.Then(sendPing))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("idle", statecharts.On("go", statecharts.Then(
+			statecharts.Send("ping", statecharts.SendTarget("wedged-1@warehouse-b")),
+		))),
+		callerModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build(callerChart): %v", err)
 	}
@@ -251,14 +254,18 @@ func TestBridgeUsesSystemNodeNamesForQualifiedRoundTrip(t *testing.T) {
 func TestBridgePreservesNestedValueAndDeliveryIdentity(t *testing.T) {
 	ctx := context.Background()
 	received := make(chan statecharts.Event, 1)
-	record := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+	targetModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	record, err := targetModel.Action("bridge.record-nested-delivery", "v1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		received <- ev
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("register record action: %v", err)
+	}
 	targetChart, err := statecharts.Build(
-		statecharts.Atomic("bridge-value-target", statecharts.On("nested", statecharts.Then(record))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("bridge-value-target", statecharts.On("nested", statecharts.Then(record.Do()))),
+		targetModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build target: %v", err)
 	}
@@ -320,14 +327,18 @@ func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 	ctx := context.Background()
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	targetAction := statecharts.Action(func(_ *struct{}, _ statecharts.ExecContext) error {
+	targetModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	targetAction, err := targetModel.Action("bridge.block-target-delivery", "v1", func(_ *struct{}, _ statecharts.ExecContext, _ []statecharts.Value) error {
 		close(entered)
 		<-release
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("register target action: %v", err)
+	}
 	targetChart, err := statecharts.Build(
-		statecharts.Atomic("bridge-target", statecharts.On("ping", statecharts.Then(targetAction))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("bridge-target", statecharts.On("ping", statecharts.Then(targetAction.Do()))),
+		targetModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build target: %v", err)
 	}
@@ -338,13 +349,12 @@ func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 	if err := sysB.Spawn(ctx, "target", targetChart.ID()); err != nil {
 		t.Fatalf("Spawn target: %v", err)
 	}
-	send := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
-		ec.Send("ping", statecharts.SendOptions{Target: "target@warehouse-b"})
-		return nil
-	})
+	sourceModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
 	sourceChart, err := statecharts.Build(
-		statecharts.Atomic("bridge-source", statecharts.On("go", statecharts.Then(send))),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.Atomic("bridge-source", statecharts.On("go", statecharts.Then(
+			statecharts.Send("ping", statecharts.SendTarget("target@warehouse-b")),
+		))),
+		sourceModel, statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build source: %v", err)
 	}
@@ -390,7 +400,7 @@ func TestBridgeAsyncFailureReturnsToSendingActor(t *testing.T) {
 	store := &toggleLoadSnapshotStore{Storage: log}
 	target, err := statecharts.Build(
 		statecharts.Atomic("bridge-failure-target"),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build target: %v", err)
 	}

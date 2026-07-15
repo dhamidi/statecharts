@@ -1,47 +1,37 @@
-// Package statecharts implements the state machine semantics defined by
-// the W3C SCXML specification (State Chart XML), without SCXML's XML
-// document syntax: charts are built directly in Go.
+// Package statecharts implements statechart semantics with a Go-first
+// authoring API.
 //
-// A chart is a tree of states built with Atomic, Compound, Parallel,
-// Final, and History, with transitions attached using On or Eventless.
-// Build compiles and validates a tree into a *Chart, which can then be run
-// any number of times.
+// Atomic, Compound, Parallel, Final, History, On, and Eventless construct a
+// mutable, syntax-neutral Definition. Build validates that definition and
+// compiles it with a Datamodel into an immutable *Chart. Compile accepts the
+// same Definition directly, so a definition obtained from Chart.Definition
+// can be encoded, edited, decoded, and compiled through exactly the same path.
+// Chart.Definition always returns an independently editable deep copy.
 //
-// Running a chart produces an Instance: a single goroutine that processes
-// events one at a time, applying the SCXML interpretation algorithm --
-// selecting transitions, resolving conflicts between simultaneously active
-// parallel regions, and entering and exiting states in the correct order.
-// Instance's methods (Send, Stop, Wait, Configuration) are plain function
-// calls; no channel appears anywhere in the public API.
+// GoModel is the default datamodel. Applications register typed actions,
+// conditions, value producers, and locations under explicit names and
+// versions. Builder nodes store those stable references rather than Go
+// function values, making the complete definition deterministic and
+// inspectable while each running Instance still owns ordinary typed Go data.
+// Other datamodels can implement Datamodel, DatamodelProgram, and
+// DatamodelSession without changing the interpreter.
 //
-// There is no expression language. Wherever SCXML would evaluate an
-// expression against a datamodel -- a transition's condition, or the
-// executable content of a transition or an onentry/onexit handler -- this
-// package calls a Go function instead. Action and Cond adapt a callback
-// written against the chart's own datamodel type into the untyped
-// ActionFunc and CondFunc that a chart's tree stores; ExecContext gives
-// that callback access to the event being processed, the In() predicate,
-// and the ability to raise, send, cancel, or log against the owning
-// Instance.
+// An Instance processes events serially, selecting transitions, resolving
+// conflicts between parallel regions, and entering and exiting states in
+// document order. Send, Stop, Wait, and Configuration provide its lifecycle
+// API. ExecContext supplies registered model functions with the current event,
+// active-state predicate, session metadata, and controlled raise, send,
+// cancel, and logging capabilities.
 //
-// All communication with the world outside a running Instance goes through
-// an IOProcessor, isolating every real side effect behind one interface.
-// Invoke attaches a longer-lived external service to a state instead: an
-// InvokeFunc runs in its own goroutine for as long as the state is active,
-// delivering events back through InvokeIO and cancelled automatically if
-// the state is exited first. Diagnostic output -- what a chart is doing,
-// for a human or a log aggregator to read -- goes through a separate,
-// simpler seam, Logger, since it never crosses a session boundary and
-// never produces an event a transition could match against.
+// Communication outside an Instance goes through IOProcessor. Longer-lived
+// services are declared with Invoke and supplied at instance creation as
+// environment-scoped InvokeHandler factories; handler capabilities never
+// enter a Definition or model snapshot. Logger is the separate diagnostic
+// output seam.
 //
-// A running chart's state -- its active configuration, recorded history,
-// queued events, and outstanding delayed sends -- can be captured with
-// Instance.Snapshot and later restored with Restore. The primary way to
-// persist a chart across restarts, though, is a Log: recording every
-// message that arrives at an Instance (an application's calls to Send, and
-// delayed-send timers firing) is enough to reconstruct its state exactly,
-// by feeding those same messages back through a fresh Instance. Rehydrate
-// does this, using a Snapshot only as a shortcut so a long-running session
-// doesn't need to replay from its very first message. The sqllog
-// subpackage provides a database/sql-backed Log.
+// Instance.Snapshot captures a disposable restoration cache. Chart.Restore
+// reconstructs from that cache, while Chart.Rehydrate rebuilds authoritative
+// state from a Log and uses a compatible snapshot only to skip older replay.
+// The sqllog package provides database/sql-backed durable storage, and the
+// optional sqllog/sqlite3 package supplies a configured SQLite driver.
 package statecharts

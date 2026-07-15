@@ -331,14 +331,35 @@ func TestDeclarativeInvokePreservesAutoforwardFinalizeAndCancellation(t *testing
 	if err := instance.Send(ctx, Event{Name: "barrier"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := instance.Configuration(); !hasState(got, "outside") || hasState(got, "failed") {
+	if got := instance.Configuration(); !containsID(got, "outside") || containsID(got, "failed") {
 		t.Fatalf("late cancelled delivery changed configuration: %v", got)
 	}
 	_ = instance.Stop(ctx)
 }
 
 func TestInvokeChartHandlerRunsADeclarativelyInvokedChild(t *testing.T) {
-	child := childPingPongChart(t)
+	childModel := NewGoModel(func() *struct{} { return &struct{}{} })
+	sendHello, err := childModel.Action("send-parent-hello", "v1", func(_ *struct{}, ec ExecContext, _ []Value) error {
+		ec.Send("hello", SendOptions{Target: "#_parent"})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendPong, err := childModel.Action("send-parent-pong", "v1", func(_ *struct{}, ec ExecContext, _ []Value) error {
+		ec.Send("pong", SendOptions{Target: "#_parent"})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := Build(Compound("croot", "start", Children(
+		Atomic("start", OnEntry(sendHello.Do()), On("ping", Target("pinged"))),
+		Atomic("pinged", OnEntry(sendPong.Do())),
+	)), childModel, WithRevisionSalt("ping-pong-v1"))
+	if err != nil {
+		t.Fatalf("Build child: %v", err)
+	}
 	waitingHello := compileTestState("waitingHello", KindAtomic)
 	waitingHello.Transitions = []TransitionDefinition{{Events: []Identifier{"hello"}, Targets: []Identifier{"waitingPong"}}}
 	waitingPong := compileTestState("waitingPong", KindAtomic)
@@ -355,7 +376,7 @@ func TestInvokeChartHandlerRunsADeclarativelyInvokedChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	instance, err := chart.NewInstance(WithInvokeHandler(SCXMLInvokeType,
-		InvokeChartHandler(child, func(Value) any { return &struct{}{} }, nil)))
+		InvokeChartHandler(child, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +387,7 @@ func TestInvokeChartHandlerRunsADeclarativelyInvokedChild(t *testing.T) {
 	waitForConfiguration := func(id Identifier) {
 		t.Helper()
 		deadline := time.Now().Add(time.Second)
-		for !hasState(instance.Configuration(), id) {
+		for !containsID(instance.Configuration(), id) {
 			if time.Now().After(deadline) {
 				t.Fatalf("configuration = %v, want %q", instance.Configuration(), id)
 			}
@@ -520,22 +541,4 @@ func TestResumeKeepsEvaluatedDynamicTypeAndSource(t *testing.T) {
 		t.Fatal("invoke was not resumed")
 	}
 	_ = rehydrated.Stop(ctx)
-}
-
-func TestInvokeDefinitionIDsAreGeneratedAndUnique(t *testing.T) {
-	definition := invokeTestDefinition(InvokeDefinition{Type: "one"}, InvokeDefinition{Type: "two"})
-	chart, err := Compile(definition, NewGoModel(func() *compileTestModel { return &compileTestModel{} }))
-	if err != nil {
-		t.Fatal(err)
-	}
-	invokes := chart.Definition().Root.Children[0].Invokes
-	if invokes[0].DefinitionID == "" || invokes[1].DefinitionID == "" || invokes[0].DefinitionID == invokes[1].DefinitionID {
-		t.Fatalf("generated invoke definition IDs = %+v", invokes)
-	}
-	duplicate := definition
-	duplicate.Root.Children[0].Invokes[0].DefinitionID = "same"
-	duplicate.Root.Children[0].Invokes[1].DefinitionID = "same"
-	if err := duplicate.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate invoke definition ID") {
-		t.Fatalf("duplicate validation error = %v", err)
-	}
 }

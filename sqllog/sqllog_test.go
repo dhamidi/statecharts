@@ -430,23 +430,44 @@ func TestRehydrateAgainstRealDatabase(t *testing.T) {
 	ctx := context.Background()
 	sessionID := statecharts.SessionID("door-1")
 
-	notLocked := statecharts.Cond(func(d *doorModel, ec statecharts.ExecContext) bool { return !d.Locked })
-	recordOpen := statecharts.Action(func(d *doorModel, ec statecharts.ExecContext) error { d.OpenCount++; return nil })
+	var models []*doorModel
+	model := statecharts.NewGoModel(func() *doorModel {
+		d := &doorModel{}
+		models = append(models, d)
+		return d
+	})
+	notLocked, err := model.Condition("door.not-locked", "v1", func(d *doorModel, _ statecharts.ExecContext, _ []statecharts.Value) (bool, error) {
+		return !d.Locked, nil
+	})
+	if err != nil {
+		t.Fatalf("register condition: %v", err)
+	}
+	recordOpen, err := model.Action("door.record-open", "v1", func(d *doorModel, _ statecharts.ExecContext, _ []statecharts.Value) error {
+		d.OpenCount++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("register action: %v", err)
+	}
 	chart, err := statecharts.Build(
 		statecharts.Compound("door", "closed",
 			statecharts.Children(
 				statecharts.Atomic("closed", statecharts.On("open.request",
-					statecharts.Target("open"), statecharts.If(notLocked), statecharts.Then(recordOpen))),
+					statecharts.Target("open"), statecharts.If(notLocked.If()), statecharts.Then(recordOpen.Do()))),
 				statecharts.Atomic("open", statecharts.On("close.request", statecharts.Target("closed"))),
 			),
 		),
+		model,
+		statecharts.WithRevisionSalt("sqllog-door-test-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	d := &doorModel{}
-	in := statecharts.New(chart, d)
+	in, err := chart.NewInstance()
+	if err != nil {
+		t.Fatalf("NewInstance: %v", err)
+	}
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -464,8 +485,7 @@ func TestRehydrateAgainstRealDatabase(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	d2 := &doorModel{}
-	in2, err := statecharts.Rehydrate(ctx, chart, d2, log, log, sessionID, statecharts.NoopIOProcessor)
+	in2, err := chart.Rehydrate(ctx, log, log, sessionID, statecharts.NoopIOProcessor)
 	if err != nil {
 		t.Fatalf("Rehydrate: %v", err)
 	}
@@ -479,8 +499,8 @@ func TestRehydrateAgainstRealDatabase(t *testing.T) {
 	if !found {
 		t.Fatalf("rehydrated configuration = %v, want to contain 'open'", cfg)
 	}
-	if d2.OpenCount != 1 {
-		t.Fatalf("d2.OpenCount = %d, want 1", d2.OpenCount)
+	if got := models[len(models)-1].OpenCount; got != 1 {
+		t.Fatalf("rehydrated OpenCount = %d, want 1", got)
 	}
 	if err := in2.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)

@@ -48,72 +48,65 @@ func (k HistoryKind) String() string {
 	return "shallow"
 }
 
-// StateSpec is the uncompiled description of one node in a chart's state
-// tree, built via Atomic/Compound/Parallel/Final/History and StateOptions,
-// then compiled once by Build.
-type StateSpec struct {
-	ID                Identifier
-	Kind              StateKind
-	Initial           Identifier      // first target of a compound/history default transition
-	DefaultTransition *TransitionSpec // additional default-transition targets and executable content
-	HistoryKind       HistoryKind
-	OnEntry           []ActionFunc
-	OnExit            []ActionFunc
-	Transitions       []TransitionSpec
-	Children          []StateSpec // preserved in call order == SCXML document order
-	Invokes           []InvokeSpec
-	Done              DoneDataFunc
-	onEntryBlocks     []actionBlock
-	onExitBlocks      []actionBlock
-}
-
-// WithInitial enriches a compound state's eventless, unconditional default
-// transition with additional targets and executable content. The initial
-// argument passed to Compound remains its first target; pass an empty initial
-// when Target supplies the complete state specification.
+// WithInitial configures a compound state's eventless, unconditional default
+// transition. The initial argument passed to Compound remains its first
+// target; pass an empty initial when Target supplies every target.
 func WithInitial(opts ...TransitionOption) StateOption {
-	return func(s *StateSpec) {
-		t := &TransitionSpec{}
-		for _, opt := range opts {
-			opt(t)
+	return func(s *StateDefinition) {
+		if s.Initial == nil {
+			s.Initial = &TransitionDefinition{}
 		}
-		s.DefaultTransition = t
+		for _, opt := range opts {
+			opt(s.Initial)
+		}
 	}
 }
 
-// StateOption configures a StateSpec being built by Atomic/Compound/etc.
-type StateOption func(*StateSpec)
+// StateOption appends serializable authoring data to a state definition.
+type StateOption func(*StateDefinition)
 
 // Children attaches child states, in document order.
-func Children(children ...StateSpec) StateOption {
-	return func(s *StateSpec) { s.Children = append(s.Children, children...) }
+func Children(children ...StateDefinition) StateOption {
+	return func(s *StateDefinition) {
+		for _, child := range children {
+			s.Children = append(s.Children, child.clone())
+		}
+	}
 }
 
 // OnEntry attaches executable content run when the state is entered.
-func OnEntry(actions ...ActionFunc) StateOption {
-	return func(s *StateSpec) {
-		s.OnEntry = append(s.OnEntry, actions...)
-		s.onEntryBlocks = append(s.onEntryBlocks, legacyActionBlock(actions))
+func OnEntry(actions ...Executable) StateOption {
+	return func(s *StateDefinition) {
+		s.OnEntry = append(s.OnEntry, cloneExecutableBlock(actions))
 	}
 }
 
 // OnExit attaches executable content run when the state is exited.
-func OnExit(actions ...ActionFunc) StateOption {
-	return func(s *StateSpec) {
-		s.OnExit = append(s.OnExit, actions...)
-		s.onExitBlocks = append(s.onExitBlocks, legacyActionBlock(actions))
+func OnExit(actions ...Executable) StateOption {
+	return func(s *StateDefinition) {
+		s.OnExit = append(s.OnExit, cloneExecutableBlock(actions))
 	}
 }
 
-// WithDone sets the done-data callback for a Final state.
-func WithDone(fn DoneDataFunc) StateOption {
-	return func(s *StateSpec) { s.Done = fn }
+// WithDone sets a final state's whole result payload expression.
+func WithDone(content Expression) StateOption {
+	return func(s *StateDefinition) {
+		value := content.Clone()
+		s.DoneData = &DoneDataDefinition{Content: &value}
+	}
+}
+
+// WithDoneParams sets a final state's named result payload expressions.
+func WithDoneParams(params ...ParamDefinition) StateOption {
+	return func(s *StateDefinition) {
+		s.DoneData = &DoneDataDefinition{Params: cloneParams(params)}
+	}
 }
 
 // On attaches a transition matching the space-separated event descriptors.
 func On(events string, opts ...TransitionOption) StateOption {
-	return func(s *StateSpec) {
-		t := TransitionSpec{Events: parseEventDescriptors(events)}
+	return func(s *StateDefinition) {
+		t := TransitionDefinition{Events: parseEventDescriptors(events)}
 		for _, opt := range opts {
 			opt(&t)
 		}
@@ -124,8 +117,8 @@ func On(events string, opts ...TransitionOption) StateOption {
 // Eventless attaches an eventless (automatic) transition, evaluated whenever
 // no event is required for it to fire -- only its Cond gates it.
 func Eventless(opts ...TransitionOption) StateOption {
-	return func(s *StateSpec) {
-		t := TransitionSpec{}
+	return func(s *StateDefinition) {
+		t := TransitionDefinition{}
 		for _, opt := range opts {
 			opt(&t)
 		}
@@ -142,8 +135,16 @@ func parseEventDescriptors(events string) []Identifier {
 	return ids
 }
 
-func newSpec(id Identifier, kind StateKind, opts ...StateOption) StateSpec {
-	s := StateSpec{ID: id, Kind: kind}
+func cloneExecutableBlock(actions []Executable) ExecutableBlock {
+	block := make(ExecutableBlock, len(actions))
+	for i := range actions {
+		block[i] = actions[i].clone()
+	}
+	return block
+}
+
+func newStateDefinition(id Identifier, kind StateKind, opts ...StateOption) StateDefinition {
+	s := StateDefinition{ID: StateDefinitionID{Value: id, Generated: id == ""}, Kind: kind}
 	for _, opt := range opts {
 		opt(&s)
 	}
@@ -151,44 +152,47 @@ func newSpec(id Identifier, kind StateKind, opts ...StateOption) StateSpec {
 }
 
 // Atomic declares a leaf state with no children.
-func Atomic(id Identifier, opts ...StateOption) StateSpec {
-	return newSpec(id, KindAtomic, opts...)
+func Atomic(id Identifier, opts ...StateOption) StateDefinition {
+	return newStateDefinition(id, KindAtomic, opts...)
 }
 
 // Compound declares a state with children. initial is the first target of its
 // default transition; WithInitial may add targets and executable content. If
 // initial is empty and WithInitial is absent, the first child is the default,
 // as required by SCXML.
-func Compound(id Identifier, initial Identifier, opts ...StateOption) StateSpec {
-	s := newSpec(id, KindCompound, opts...)
-	s.Initial = initial
+func Compound(id Identifier, initial Identifier, opts ...StateOption) StateDefinition {
+	s := newStateDefinition(id, KindCompound, opts...)
+	if initial != "" {
+		if s.Initial == nil {
+			s.Initial = &TransitionDefinition{}
+		}
+		s.Initial.Targets = append([]Identifier{initial}, s.Initial.Targets...)
+	}
 	return s
 }
 
 // Parallel declares a state whose children are all simultaneously active
 // (each child is one region).
-func Parallel(id Identifier, opts ...StateOption) StateSpec {
-	return newSpec(id, KindParallel, opts...)
+func Parallel(id Identifier, opts ...StateOption) StateDefinition {
+	return newStateDefinition(id, KindParallel, opts...)
 }
 
 // Final declares a final state.
-func Final(id Identifier, opts ...StateOption) StateSpec {
-	return newSpec(id, KindFinal, opts...)
+func Final(id Identifier, opts ...StateOption) StateDefinition {
+	return newStateDefinition(id, KindFinal, opts...)
 }
 
 // History declares a history pseudostate belonging to whichever compound or
 // parallel state contains it. defaultTarget is entered when the history has
 // never recorded a configuration (i.e. on first entry to the parent). opts
 // may add targets and executable content to that default transition.
-func History(id Identifier, kind HistoryKind, defaultTarget Identifier, opts ...TransitionOption) StateSpec {
-	s := StateSpec{ID: id, Kind: KindHistory, HistoryKind: kind, Initial: defaultTarget}
-	if len(opts) == 0 {
-		return s
+func History(id Identifier, kind HistoryKind, defaultTarget Identifier, opts ...TransitionOption) StateDefinition {
+	s := StateDefinition{
+		ID: StateDefinitionID{Value: id, Generated: id == ""}, Kind: KindHistory, History: kind,
+		Initial: &TransitionDefinition{Targets: []Identifier{defaultTarget}},
 	}
-	t := &TransitionSpec{}
 	for _, opt := range opts {
-		opt(t)
+		opt(s.Initial)
 	}
-	s.DefaultTransition = t
 	return s
 }

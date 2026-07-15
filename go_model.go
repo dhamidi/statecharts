@@ -135,6 +135,20 @@ func (r GoLocationRef) Expression(args ...Expression) Expression {
 	return refExpression(goLocationKind, r.name, r.version, args)
 }
 
+// If returns this registered condition as a serializable expression.
+func (r GoConditionRef) If(args ...Expression) Expression { return r.Expression(args...) }
+
+// Do returns this registered action as a serializable executable node.
+func (r GoActionRef) Do(args ...Expression) Executable {
+	return NewScriptExecutable(ScriptDefinition{Expr: r.Expression(args...)})
+}
+
+// Get returns this registered value computation as a serializable expression.
+func (r GoValueRef) Get(args ...Expression) Expression { return r.Expression(args...) }
+
+// At returns this registered readable/writable location as a serializable expression.
+func (r GoLocationRef) At(args ...Expression) Expression { return r.Expression(args...) }
+
 func (m *GoModel[D]) register(n Identifier, v string, r goRegistration[D]) error {
 	if err := validatePlainIdentifier(n); err != nil {
 		return fmt.Errorf("statecharts: invalid Go function name %q: %w", n, err)

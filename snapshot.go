@@ -162,29 +162,6 @@ func (in *Instance) buildSnapshot() (Snapshot, error) {
 	return snap, nil
 }
 
-// Restore reconstructs a paused Instance directly from a Snapshot, without
-// re-running any onentry/initial-transition executable content (those
-// already ran historically). Its session id follows the same precedence as
-// Instance.ID: an explicit WithSessionID, then snap.ID, then the configured
-// IDGenerator. It validates that every state ID mentioned in snap still
-// exists in chart, returning an error on drift. Pending sends are rebuilt as
-// inert records, then armed against the configured Clock by Start (or, for
-// Rehydrate, only after log replay catches up); Start fires already-overdue
-// sends before returning. ActiveInvokes are reconstructed as bookkeeping
-// only -- routing a <finalize> or a "#_<invokeid>" send still works, but no
-// invocation goroutine is started; Rehydrate is what decides whether each
-// one gets error.communication or a real InvokeResumeFunc call. The Instance
-// is constructed but not started; call Start to spawn its goroutine.
-func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Instance, error) {
-	if err := chart.Prepare(opts...); err != nil {
-		return nil, err
-	}
-	if err := validateSnapshotHeader(chart, snap); err != nil {
-		return nil, err
-	}
-	return restoreInstanceForSession(chart, newLegacyDatamodelSession(datamodel), snap, opts...)
-}
-
 // Restore reconstructs a paused Instance from snap with a fresh session from
 // the chart's DatamodelProgram. The session owns decoding the opaque model
 // snapshot bytes. The returned instance is not started.
@@ -246,7 +223,7 @@ func restoreInstanceForSession(chart *Chart, session DatamodelSession, snap Snap
 	if id == "" {
 		id = cfg.idGen.NewID()
 	}
-	ip := newInterpretation(chart, legacySessionValue(session))
+	ip := newInterpretation(chart)
 	ip.session = session
 	if cfg.deliveryNamespace != "" {
 		ip.deliveryNamespace = cfg.deliveryNamespace
@@ -259,7 +236,6 @@ func restoreInstanceForSession(chart *Chart, session DatamodelSession, snap Snap
 	if err := session.DecodeSnapshot(snap.Datamodel); err != nil {
 		return nil, fmt.Errorf("%w: decode datamodel: %v", ErrInvalidSnapshot, err)
 	}
-	ip.datamodel = legacySessionValue(session)
 	in := newInstance(chart, ip, session, cfg, id)
 	keepSession = true
 	return in, nil
@@ -355,13 +331,11 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 		if spec.owner != s {
 			return fmt.Errorf("statecharts: restore: invoke definition %q belongs to state %q, not %q", ai.DefinitionID, spec.owner.id, ai.State)
 		}
-		if spec.declarative {
-			if ai.Type == "" {
-				return fmt.Errorf("statecharts: restore: invoke definition %q has an empty handler type", ai.DefinitionID)
-			}
-			if !spec.hasTypeExpr && ai.Type != spec.staticType {
-				return fmt.Errorf("statecharts: restore: invoke definition %q handler type %q does not match static type %q", ai.DefinitionID, ai.Type, spec.staticType)
-			}
+		if ai.Type == "" {
+			return fmt.Errorf("statecharts: restore: invoke definition %q has an empty handler type", ai.DefinitionID)
+		}
+		if !spec.hasTypeExpr && ai.Type != spec.staticType {
+			return fmt.Errorf("statecharts: restore: invoke definition %q handler type %q does not match static type %q", ai.DefinitionID, ai.Type, spec.staticType)
 		}
 		if restoredDefinitions[ai.DefinitionID] {
 			return fmt.Errorf("statecharts: restore: duplicate active invoke definition %q", ai.DefinitionID)

@@ -16,11 +16,24 @@ func hasState(ids []Identifier, want Identifier) bool {
 	return false
 }
 
-func TestInterpreterBasicTransitionAndGuard(t *testing.T) {
-	notLocked := Cond(func(d *Door, ec ExecContext) bool { return !d.Locked })
-	recordOpen := Action(func(d *Door, ec ExecContext) error { d.OpenCount++; return nil })
+func newTestInterpretation(t testing.TB, chart *Chart) *interpretation {
+	t.Helper()
+	session, err := chart.program.NewSession(SessionOptions{})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	ip := newInterpretation(chart)
+	ip.session = session
+	return ip
+}
 
-	chart, err := Build(
+func TestInterpreterBasicTransitionAndGuard(t *testing.T) {
+	d := &Door{Locked: true}
+	b := newTestBuilder(t, func() *Door { return d })
+	notLocked := b.condition("basic-not-locked", func(d *Door, ec ExecContext) bool { return !d.Locked })
+	recordOpen := b.action("basic-record-open", func(d *Door, ec ExecContext) error { d.OpenCount++; return nil })
+
+	chart, err := b.build(
 		Compound("door", "closed",
 			Children(
 				Atomic("closed",
@@ -36,8 +49,7 @@ func TestInterpreterBasicTransitionAndGuard(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	d := &Door{Locked: true}
-	ip := newInterpretation(chart, d)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 
 	if got := ip.activeStates(); !hasState(got, "closed") {
@@ -67,7 +79,8 @@ func TestInterpreterBasicTransitionAndGuard(t *testing.T) {
 }
 
 func TestInterpreterParallelRegionsIndependent(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(
 		Parallel("machine",
 			Children(
 				Compound("motor", "off",
@@ -89,7 +102,7 @@ func TestInterpreterParallelRegionsIndependent(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 
 	got := ip.activeStates()
@@ -118,11 +131,12 @@ func TestInterpreterParallelRegionsIndependent(t *testing.T) {
 }
 
 func TestInterpreterInitialTransitionActionsOrderingAndExplicitEntry(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var got []string
-	record := func(v string) ActionFunc {
-		return Action(func(_ *struct{}, _ ExecContext) error { got = append(got, v); return nil })
+	record := func(v string) Executable {
+		return b.effect("initial-order-"+Identifier(v), func(_ ExecContext) error { got = append(got, v); return nil })
 	}
-	chart, err := Build(Compound("root", "outside", Children(
+	chart, err := b.build(Compound("root", "outside", Children(
 		Atomic("outside", On("default", Target("parent")), On("explicit", Target("child"))),
 		Compound("parent", "child", WithInitial(Then(record("default"))), OnEntry(record("parent")), On("reset", Target("outside")), Children(
 			Atomic("child", OnEntry(record("child"))),
@@ -131,7 +145,7 @@ func TestInterpreterInitialTransitionActionsOrderingAndExplicitEntry(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	ip := newInterpretation(chart, &struct{}{})
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "default", Type: EventExternal})
 	ip.processNextExternal()
@@ -149,11 +163,12 @@ func TestInterpreterInitialTransitionActionsOrderingAndExplicitEntry(t *testing.
 }
 
 func TestInterpreterMultiTargetInitialDoesNotDefaultExplicitParallelRegions(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var defaults []string
-	record := func(v string) ActionFunc {
-		return func(ExecContext) error { defaults = append(defaults, v); return nil }
+	record := func(v string) Executable {
+		return b.effect("multi-target-default-"+Identifier(v), func(ExecContext) error { defaults = append(defaults, v); return nil })
 	}
-	chart, err := Build(Compound("root", "left.second", WithInitial(Target("right.second")), Children(
+	chart, err := b.build(Compound("root", "left.second", WithInitial(Target("right.second")), Children(
 		Parallel("regions", Children(
 			Compound("left", "left.first", WithInitial(Then(record("left"))), Children(
 				Atomic("left.first"), Atomic("left.second"),
@@ -166,7 +181,7 @@ func TestInterpreterMultiTargetInitialDoesNotDefaultExplicitParallelRegions(t *t
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	got := ip.activeStates()
 	if len(defaults) != 0 || !hasState(got, "left.second") || !hasState(got, "right.second") || hasState(got, "left.first") || hasState(got, "right.first") {
@@ -175,11 +190,12 @@ func TestInterpreterMultiTargetInitialDoesNotDefaultExplicitParallelRegions(t *t
 }
 
 func TestInterpreterHistoryDefaultActionsAndMultiTarget(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var got []string
-	record := func(v string) ActionFunc {
-		return Action(func(_ *struct{}, _ ExecContext) error { got = append(got, v); return nil })
+	record := func(v string) Executable {
+		return b.effect("history-order-"+Identifier(v), func(_ ExecContext) error { got = append(got, v); return nil })
 	}
-	chart, err := Build(Compound("root", "away", Children(
+	chart, err := b.build(Compound("root", "away", Children(
 		Atomic("away", On("resume", Target("hist"))),
 		Parallel("work", OnEntry(record("work")), Children(
 			Compound("left", "l1", Children(Atomic("l1", OnEntry(record("l1"))), Atomic("l2"))),
@@ -190,7 +206,7 @@ func TestInterpreterHistoryDefaultActionsAndMultiTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ip := newInterpretation(chart, &struct{}{})
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	got = nil
 	ip.enqueue(Event{Name: "resume", Type: EventExternal})
@@ -209,7 +225,8 @@ func TestInterpreterHistoryDefaultActionsAndMultiTarget(t *testing.T) {
 }
 
 func TestInterpreterShallowHistory(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(
 		Compound("app", "running",
 			Children(
 				Compound("running", "step1",
@@ -229,7 +246,7 @@ func TestInterpreterShallowHistory(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 
 	ip.enqueue(Event{Name: "next", Type: EventExternal})
@@ -253,7 +270,8 @@ func TestInterpreterShallowHistory(t *testing.T) {
 }
 
 func TestInterpreterDeepHistory(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(
 		Compound("app", "running",
 			Children(
 				Compound("running", "phase1",
@@ -276,7 +294,7 @@ func TestInterpreterDeepHistory(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 
 	ip.enqueue(Event{Name: "next", Type: EventExternal})
@@ -304,9 +322,10 @@ func TestInterpreterDeepHistory(t *testing.T) {
 func TestInterpreterEventlessTransition(t *testing.T) {
 	type counter struct{ n int }
 	c := &counter{}
-	incr := Action(func(d *counter, ec ExecContext) error { d.n++; return nil })
+	b := newTestBuilder(t, func() *counter { return c })
+	incr := b.action("eventless-increment", func(d *counter, ec ExecContext) error { d.n++; return nil })
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("m", "a",
 			Children(
 				Atomic("a", OnEntry(incr), Eventless(Target("b"))),
@@ -318,7 +337,7 @@ func TestInterpreterEventlessTransition(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, c)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 
 	got := ip.activeStates()
@@ -333,7 +352,8 @@ func TestInterpreterEventlessTransition(t *testing.T) {
 func TestInterpreterInternalVsExternalTransition(t *testing.T) {
 	type counter struct{ entries int }
 	c := &counter{}
-	incr := Action(func(d *counter, ec ExecContext) error { d.entries++; return nil })
+	b := newTestBuilder(t, func() *counter { return c })
+	incr := b.action("internal-external-increment", func(d *counter, ec ExecContext) error { d.entries++; return nil })
 
 	// The internal/external distinction only matters when the transition's
 	// own source is the compound state whose re-entry is in question (here,
@@ -345,7 +365,7 @@ func TestInterpreterInternalVsExternalTransition(t *testing.T) {
 		if internal {
 			opts = append(opts, AsInternal())
 		}
-		chart, err := Build(
+		chart, err := b.build(
 			Compound("root", "parent",
 				Children(
 					Compound("parent", "child1",
@@ -369,7 +389,7 @@ func TestInterpreterInternalVsExternalTransition(t *testing.T) {
 	// onEntry runs a second time.
 	c.entries = 0
 	chart := buildChart(false)
-	ip := newInterpretation(chart, c)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	if c.entries != 1 {
 		t.Fatalf("initial parent onEntry count = %d, want 1", c.entries)
@@ -383,7 +403,7 @@ func TestInterpreterInternalVsExternalTransition(t *testing.T) {
 	// internal: parent is NOT exited/re-entered.
 	c.entries = 0
 	chart = buildChart(true)
-	ip = newInterpretation(chart, c)
+	ip = newTestInterpretation(t, chart)
 	ip.start()
 	if c.entries != 1 {
 		t.Fatalf("initial parent onEntry count = %d, want 1", c.entries)
@@ -400,7 +420,8 @@ func TestInterpreterInternalVsExternalTransition(t *testing.T) {
 }
 
 func TestInterpreterDoneStateEvent(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(
 		Compound("app", "working",
 			Children(
 				Compound("working", "step1",
@@ -418,7 +439,7 @@ func TestInterpreterDoneStateEvent(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "finish", Type: EventExternal})
 	ip.processNextExternal()
@@ -430,7 +451,8 @@ func TestInterpreterDoneStateEvent(t *testing.T) {
 }
 
 func TestInterpreterTopLevelFinalStops(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(
 		Compound("app", "running",
 			Children(
 				Atomic("running", On("finish", Target("done"))),
@@ -442,7 +464,7 @@ func TestInterpreterTopLevelFinalStops(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	if !ip.running {
 		t.Fatalf("expected running=true after start")
@@ -461,14 +483,12 @@ func TestInterpreterTopLevelFinalStops(t *testing.T) {
 // different path than genuinely external ones (which only ever attach
 // SendID to the IOProcessor's SendRequest) and silently dropped it.
 func TestInterpreterSendIDPropagatesToSelfDeliveredEvents(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var gotSendID Identifier
-	chart, err := Build(
+	chart, err := b.build(
 		Atomic("only",
-			OnEntry(Action(func(d *struct{}, ec ExecContext) error {
-				ec.Send("ping", SendOptions{SendID: "my-id", Target: "#_internal"})
-				return nil
-			})),
-			On("ping", Then(Action(func(d *struct{}, ec ExecContext) error {
+			OnEntry(Send("ping", SendID("my-id"), SendTarget("#_internal"))),
+			On("ping", Then(b.effect("send-id-record", func(ec ExecContext) error {
 				ev, _ := ec.Event()
 				gotSendID = ev.SendID
 				return nil
@@ -479,7 +499,7 @@ func TestInterpreterSendIDPropagatesToSelfDeliveredEvents(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, &struct{}{})
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 
 	if gotSendID != "my-id" {
@@ -494,15 +514,16 @@ func TestInterpreterSendIDPropagatesToSelfDeliveredEvents(t *testing.T) {
 // final state is exactly the case a naive "just stop the loop"
 // implementation misses.
 func TestInterpreterExitInterpreterRunsRemainingOnExit(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var exitOrder []Identifier
-	record := func(id Identifier) ActionFunc {
-		return func(ec ExecContext) error {
+	record := func(id Identifier) Executable {
+		return b.effect("exit-order-"+id, func(ec ExecContext) error {
 			exitOrder = append(exitOrder, id)
 			return nil
-		}
+		})
 	}
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("root", "running",
 			Children(
 				Parallel("running",
@@ -529,7 +550,7 @@ func TestInterpreterExitInterpreterRunsRemainingOnExit(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "go", Type: EventExternal})
 	ip.processNextExternal()
@@ -558,23 +579,25 @@ func TestInterpreterExitInterpreterRunsRemainingOnExit(t *testing.T) {
 	}
 }
 
-// A non-nil error returned by an ActionFunc is reported as an
+// A non-nil error returned by a registered Go action is reported as an
 // error.execution platform event (SCXML 5.10.2/C.1), not returned to any
 // caller as a Go error -- a sibling transition armed against it must be
 // able to match and fire on it, mirroring how error.communication already
 // works for a failing <invoke> (see TestInvokeErrorBecomesCommunicationError).
 func TestInterpreterActionErrorBecomesExecutionErrorEvent(t *testing.T) {
 	boom := errors.New("boom")
-	failing := Action(func(d *Door, ec ExecContext) error { return boom })
+	d := &Door{}
+	b := newTestBuilder(t, func() *Door { return d })
+	failing := b.action("action-error-fail", func(d *Door, ec ExecContext) error { return boom })
 
 	var gotErr string
-	recordErr := Action(func(d *Door, ec ExecContext) error {
+	recordErr := b.action("action-error-record", func(d *Door, ec ExecContext) error {
 		ev, _ := ec.Event()
 		_, gotErr, _ = PlatformErrorDetails(ev.Data)
 		return nil
 	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("m", "a",
 			Children(
 				Atomic("a",
@@ -589,8 +612,7 @@ func TestInterpreterActionErrorBecomesExecutionErrorEvent(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	d := &Door{}
-	ip := newInterpretation(chart, d)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 
 	if got := ip.activeStates(); !hasState(got, "b") {
@@ -602,16 +624,18 @@ func TestInterpreterActionErrorBecomesExecutionErrorEvent(t *testing.T) {
 }
 
 func TestInterpreterDeduplicatesTargetlessAncestorTransitionAcrossParallelRegions(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	count := 0
-	chart, err := Build(
+	tick := b.effect("deduplicate-tick", func(ExecContext) error {
+		count++
+		return nil
+	})
+	chart, err := b.build(
 		Compound("root", "parallel",
 			Children(
 				Parallel("parallel",
 					Children(Atomic("left"), Atomic("right")),
-					On("tick", Then(func(ExecContext) error {
-						count++
-						return nil
-					})),
+					On("tick", Then(tick)),
 				),
 			),
 		),
@@ -620,7 +644,7 @@ func TestInterpreterDeduplicatesTargetlessAncestorTransitionAcrossParallelRegion
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "tick", Type: EventExternal})
 	ip.processNextExternal()
@@ -631,21 +655,22 @@ func TestInterpreterDeduplicatesTargetlessAncestorTransitionAcrossParallelRegion
 }
 
 func TestInterpreterStopsOnlyTheFailingExecutableContentBlock(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var order []string
-	fail := func(ExecContext) error {
+	fail := b.effect("block-fail", func(ExecContext) error {
 		order = append(order, "fail")
 		return errors.New("boom")
-	}
-	skipped := func(ExecContext) error {
+	})
+	skipped := b.effect("block-skipped", func(ExecContext) error {
 		order = append(order, "skipped")
 		return nil
-	}
-	nextBlock := func(ExecContext) error {
+	})
+	nextBlock := b.effect("block-next", func(ExecContext) error {
 		order = append(order, "next-block")
 		return nil
-	}
+	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("root", "active",
 			Children(
 				Atomic("active",
@@ -661,7 +686,7 @@ func TestInterpreterStopsOnlyTheFailingExecutableContentBlock(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 
 	want := []string{"fail", "next-block"}
@@ -674,11 +699,13 @@ func TestInterpreterStopsOnlyTheFailingExecutableContentBlock(t *testing.T) {
 }
 
 func TestInterpreterActionPanicBecomesExecutionError(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	panicAction := b.effect("action-panic", func(ExecContext) error { panic("boom") })
+	chart, err := b.build(
 		Compound("root", "active",
 			Children(
 				Atomic("active",
-					OnEntry(func(ExecContext) error { panic("boom") }),
+					OnEntry(panicAction),
 					On(string(ErrEventExecution), Target("recovered")),
 				),
 				Atomic("recovered"),
@@ -689,7 +716,7 @@ func TestInterpreterActionPanicBecomesExecutionError(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	if !hasState(ip.activeStates(), "recovered") {
 		t.Fatalf("configuration = %v, want recovered after action panic", ip.activeStates())
@@ -697,19 +724,22 @@ func TestInterpreterActionPanicBecomesExecutionError(t *testing.T) {
 }
 
 func TestInterpreterConditionPanicBecomesExecutionError(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	fallbackEntered := false
-	chart, err := Build(
+	panicCondition := b.condition("condition-panic", func(*struct{}, ExecContext) bool { panic("boom") })
+	recordFallback := b.effect("condition-panic-fallback", func(ExecContext) error {
+		fallbackEntered = true
+		return nil
+	})
+	chart, err := b.build(
 		Compound("root", "active",
 			Children(
 				Atomic("active",
-					On("go", If(func(ExecContext) bool { panic("boom") }), Target("wrong")),
+					On("go", If(panicCondition), Target("wrong")),
 					On("go", Target("fallback")),
 				),
 				Atomic("fallback",
-					OnEntry(func(ExecContext) error {
-						fallbackEntered = true
-						return nil
-					}),
+					OnEntry(recordFallback),
 					On(string(ErrEventExecution), Target("recovered")),
 				),
 				Atomic("wrong"),
@@ -721,7 +751,7 @@ func TestInterpreterConditionPanicBecomesExecutionError(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "go", Type: EventExternal})
 	ip.processNextExternal()
@@ -735,21 +765,22 @@ func TestInterpreterConditionPanicBecomesExecutionError(t *testing.T) {
 
 func TestTypedConditionDatamodelMismatchBecomesExecutionError(t *testing.T) {
 	type expectedModel struct{}
-	type actualModel struct{}
-
+	b := newTestBuilder(t, func() *expectedModel { return &expectedModel{} })
 	fallbackEntered := false
-	chart, err := Build(
+	mismatched := b.condition("typed-condition-mismatch", func(*expectedModel, ExecContext) bool { panic("datamodel mismatch") })
+	recordFallback := b.effect("typed-condition-fallback", func(ExecContext) error {
+		fallbackEntered = true
+		return nil
+	})
+	chart, err := b.build(
 		Compound("root", "active",
 			Children(
 				Atomic("active",
-					On("go", If(Cond(func(*expectedModel, ExecContext) bool { return true })), Target("wrong")),
+					On("go", If(mismatched), Target("wrong")),
 					On("go", Target("fallback")),
 				),
 				Atomic("fallback",
-					OnEntry(func(ExecContext) error {
-						fallbackEntered = true
-						return nil
-					}),
+					OnEntry(recordFallback),
 					On(string(ErrEventExecution), Target("recovered")),
 				),
 				Atomic("wrong"),
@@ -761,7 +792,7 @@ func TestTypedConditionDatamodelMismatchBecomesExecutionError(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, &actualModel{})
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "go", Type: EventExternal})
 	ip.processNextExternal()
@@ -774,12 +805,17 @@ func TestTypedConditionDatamodelMismatchBecomesExecutionError(t *testing.T) {
 }
 
 func TestInterpreterDoneDataPanicBecomesExecutionError(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	done, err := b.model.Value("done-data-panic", "v1", func(*struct{}, ExecContext, []Value) (Value, error) { panic("boom") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart, err := b.build(
 		Compound("root", "parent",
 			Children(
 				Compound("parent", "working", Children(
 					Atomic("working", On("finish", Target("done"))),
-					Final("done", WithDone(func(ExecContext) Value { panic("boom") })),
+					Final("done", WithDone(done.Get())),
 				)),
 				Atomic("recovered"),
 			),
@@ -790,7 +826,7 @@ func TestInterpreterDoneDataPanicBecomesExecutionError(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "finish", Type: EventExternal})
 	ip.processNextExternal()
@@ -800,8 +836,14 @@ func TestInterpreterDoneDataPanicBecomesExecutionError(t *testing.T) {
 }
 
 func TestInterpreterDoneStateEventIsPlatformEvent(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var got EventType
-	chart, err := Build(
+	record := b.effect("done-state-platform-record", func(ec ExecContext) error {
+		ev, _ := ec.Event()
+		got = ev.Type
+		return nil
+	})
+	chart, err := b.build(
 		Compound("root", "parent",
 			Children(
 				Compound("parent", "working", Children(
@@ -810,18 +852,14 @@ func TestInterpreterDoneStateEventIsPlatformEvent(t *testing.T) {
 				)),
 				Atomic("finished"),
 			),
-			On("done.state.parent", Target("finished"), Then(func(ec ExecContext) error {
-				ev, _ := ec.Event()
-				got = ev.Type
-				return nil
-			})),
+			On("done.state.parent", Target("finished"), Then(record)),
 		),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "finish", Type: EventExternal})
 	ip.processNextExternal()
@@ -831,25 +869,24 @@ func TestInterpreterDoneStateEventIsPlatformEvent(t *testing.T) {
 }
 
 func TestInterpreterGeneratedSendIDIsNotExposedOnDeliveredEvent(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var got Identifier
-	chart, err := Build(
+	record := b.effect("generated-send-id-record", func(ec ExecContext) error {
+		ev, _ := ec.Event()
+		got = ev.SendID
+		return nil
+	})
+	chart, err := b.build(
 		Atomic("root",
-			OnEntry(func(ec ExecContext) error {
-				ec.Send("ping", SendOptions{Target: "#_internal"})
-				return nil
-			}),
-			On("ping", Then(func(ec ExecContext) error {
-				ev, _ := ec.Event()
-				got = ev.SendID
-				return nil
-			})),
+			OnEntry(Send("ping", SendTarget("#_internal"))),
+			On("ping", Then(record)),
 		),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	if got != "" {
 		t.Fatalf("generated send ID exposed as _event.sendid %q, want blank", got)
@@ -862,30 +899,30 @@ func TestInterpreterSendIDLocationAssignsAndExposesGeneratedID(t *testing.T) {
 		delivered Identifier
 	}
 	dm := &model{}
-	chart, err := Build(Atomic("root",
-		OnEntry(func(ec ExecContext) error {
-			ec.Send("ping", SendOptions{
-				Target: "#_internal",
-				IDLocation: func(locationEC ExecContext, id Identifier) error {
-					locationEC.Datamodel().(*model).assigned = id
-					return nil
-				},
-			})
-			if dm.assigned == "" {
-				return errors.New("idlocation was not assigned synchronously")
-			}
-			return nil
-		}),
-		On("ping", Then(func(ec ExecContext) error {
-			ev, _ := ec.Event()
-			dm.delivered = ev.SendID
-			return nil
-		})),
-	))
+	b := newTestBuilder(t, func() *model { return dm })
+	send := b.effect("send-id-location-send", func(ec ExecContext) error {
+		ec.Send("ping", SendOptions{
+			Target: "#_internal",
+			IDLocation: func(_ ExecContext, id Identifier) error {
+				dm.assigned = id
+				return nil
+			},
+		})
+		if dm.assigned == "" {
+			return errors.New("idlocation was not assigned synchronously")
+		}
+		return nil
+	})
+	record := b.effect("send-id-location-record", func(ec ExecContext) error {
+		ev, _ := ec.Event()
+		dm.delivered = ev.SendID
+		return nil
+	})
+	chart, err := b.build(Atomic("root", OnEntry(send), On("ping", Then(record))))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	ip := newInterpretation(chart, dm)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	if dm.assigned != "send.1" || dm.delivered != dm.assigned {
 		t.Fatalf("assigned/delivered send IDs = %q/%q, want send.1 in both", dm.assigned, dm.delivered)
@@ -893,27 +930,27 @@ func TestInterpreterSendIDLocationAssignsAndExposesGeneratedID(t *testing.T) {
 }
 
 func TestInterpreterSendIDLocationCanCancelDelayedSend(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	clock := NewManualClock(time.Unix(0, 0))
 	var assigned Identifier
 	delivered := false
-	chart, err := Build(Atomic("root",
-		OnEntry(func(ec ExecContext) error {
-			ec.Send("timeout", SendOptions{
-				Delay: time.Hour,
-				IDLocation: func(_ ExecContext, id Identifier) error {
-					assigned = id
-					return nil
-				},
-			})
-			ec.Cancel(assigned)
-			return nil
-		}),
-		On("timeout", Then(func(ExecContext) error { delivered = true; return nil })),
-	))
+	send := b.effect("cancel-delayed-send", func(ec ExecContext) error {
+		ec.Send("timeout", SendOptions{
+			Delay: time.Hour,
+			IDLocation: func(_ ExecContext, id Identifier) error {
+				assigned = id
+				return nil
+			},
+		})
+		ec.Cancel(assigned)
+		return nil
+	})
+	record := b.effect("cancel-delayed-delivered", func(ExecContext) error { delivered = true; return nil })
+	chart, err := b.build(Atomic("root", OnEntry(send), On("timeout", Then(record))))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.clock = clock
 	ip.start()
 	if assigned != "send.1" || len(ip.pending) != 0 {
@@ -926,6 +963,7 @@ func TestInterpreterSendIDLocationCanCancelDelayedSend(t *testing.T) {
 }
 
 func TestInterpreterSendIDLocationFailuresDiscardSend(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	tests := []struct {
 		name       string
 		sendID     Identifier
@@ -936,25 +974,29 @@ func TestInterpreterSendIDLocationFailuresDiscardSend(t *testing.T) {
 		{"panic", "", func(ExecContext, Identifier) error { panic("bad location") }, "send.1"},
 		{"id and idlocation", "explicit", func(ExecContext, Identifier) error { return nil }, "explicit"},
 	}
-	for _, tt := range tests {
+	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var errorEvent Event
 			delivered := false
-			chart, err := Build(Atomic("root",
-				OnEntry(func(ec ExecContext) error {
-					ec.Send("forbidden", SendOptions{SendID: tt.sendID, IDLocation: tt.location, Target: "#_internal"})
-					return nil
-				}),
-				On(string(ErrEventExecution), Then(func(ec ExecContext) error {
-					errorEvent, _ = ec.Event()
-					return nil
-				})),
-				On("forbidden", Then(func(ExecContext) error { delivered = true; return nil })),
+			suffix := Identifier(fmt.Sprintf("%d", i))
+			send := b.effect("failed-location-send-"+suffix, func(ec ExecContext) error {
+				ec.Send("forbidden", SendOptions{SendID: tt.sendID, IDLocation: tt.location, Target: "#_internal"})
+				return nil
+			})
+			recordError := b.effect("failed-location-error-"+suffix, func(ec ExecContext) error {
+				errorEvent, _ = ec.Event()
+				return nil
+			})
+			recordDelivery := b.effect("failed-location-delivery-"+suffix, func(ExecContext) error { delivered = true; return nil })
+			chart, err := b.build(Atomic("root",
+				OnEntry(send),
+				On(string(ErrEventExecution), Then(recordError)),
+				On("forbidden", Then(recordDelivery)),
 			))
 			if err != nil {
 				t.Fatalf("Build: %v", err)
 			}
-			ip := newInterpretation(chart, nil)
+			ip := newTestInterpretation(t, chart)
 			ip.start()
 			if errorEvent.Name != ErrEventExecution || errorEvent.SendID != tt.wantSendID || delivered {
 				t.Fatalf("error event/delivered = %+v/%v, want error.execution sendid=%q and no delivery", errorEvent, delivered, tt.wantSendID)
@@ -964,31 +1006,24 @@ func TestInterpreterSendIDLocationFailuresDiscardSend(t *testing.T) {
 }
 
 func TestExecContextRaiseNormalizesInternalEventMetadata(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var got Event
-	chart, err := Build(
+	raise := b.effect("raise-metadata", func(ec ExecContext) error {
+		ec.Raise(Event{Name: "raised", Type: EventExternal, SendID: "send", Origin: "origin", OriginType: "transport", InvokeID: "invoke"})
+		return nil
+	})
+	record := b.effect("raise-metadata-record", func(ec ExecContext) error { got, _ = ec.Event(); return nil })
+	chart, err := b.build(
 		Atomic("root",
-			OnEntry(func(ec ExecContext) error {
-				ec.Raise(Event{
-					Name:       "raised",
-					Type:       EventExternal,
-					SendID:     "send",
-					Origin:     "origin",
-					OriginType: "transport",
-					InvokeID:   "invoke",
-				})
-				return nil
-			}),
-			On("raised", Then(func(ec ExecContext) error {
-				got, _ = ec.Event()
-				return nil
-			})),
+			OnEntry(raise),
+			On("raised", Then(record)),
 		),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	if got.Type != EventInternal || got.SendID != "" || got.Origin != "" || got.OriginType != "" || got.InvokeID != "" {
 		t.Fatalf("raised event metadata = %+v, want internal with blank provenance fields", got)
@@ -996,10 +1031,12 @@ func TestExecContextRaiseNormalizesInternalEventMetadata(t *testing.T) {
 }
 
 func TestInterpreterResolvesHistoryDefaultChainsWithoutDepthTruncation(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	exits := 0
-	children := []StateSpec{
+	recordExit := b.effect("history-chain-exit", func(ExecContext) error { exits++; return nil })
+	children := []StateDefinition{
 		Atomic("active",
-			OnExit(func(ExecContext) error { exits++; return nil }),
+			OnExit(recordExit),
 			On("again", Target("h00")),
 		),
 	}
@@ -1011,12 +1048,12 @@ func TestInterpreterResolvesHistoryDefaultChainsWithoutDepthTruncation(t *testin
 		}
 		children = append(children, History(id, Shallow, target))
 	}
-	chart, err := Build(Compound("root", "active", Children(children...)))
+	chart, err := b.build(Compound("root", "active", Children(children...)))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	ip := newInterpretation(chart, nil)
+	ip := newTestInterpretation(t, chart)
 	ip.start()
 	ip.enqueue(Event{Name: "again", Type: EventExternal})
 	ip.processNextExternal()

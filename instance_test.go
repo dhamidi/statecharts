@@ -9,10 +9,12 @@ import (
 )
 
 func TestInstanceBasicLifecycle(t *testing.T) {
-	notLocked := Cond(func(d *Door, ec ExecContext) bool { return !d.Locked })
-	recordOpen := Action(func(d *Door, ec ExecContext) error { d.OpenCount++; return nil })
+	var data *Door
+	b := newTestBuilder(t, func() *Door { data = &Door{}; return data })
+	notLocked := b.condition("TestInstanceBasicLifecycle.condition.2", func(d *Door, ec ExecContext) bool { return !d.Locked })
+	recordOpen := b.action("TestInstanceBasicLifecycle.action.1", func(d *Door, ec ExecContext) error { d.OpenCount++; return nil })
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("door", "closed",
 			Children(
 				Atomic("closed", On("open.request", Target("open"), If(notLocked), Then(recordOpen))),
@@ -24,8 +26,7 @@ func TestInstanceBasicLifecycle(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	d := &Door{}
-	in := New(chart, d)
+	in := b.newInstance(chart)
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -40,8 +41,8 @@ func TestInstanceBasicLifecycle(t *testing.T) {
 	if !hasState(in.Configuration(), "open") {
 		t.Fatalf("configuration after Send = %v, want 'open'", in.Configuration())
 	}
-	if d.OpenCount != 1 {
-		t.Fatalf("OpenCount = %d, want 1", d.OpenCount)
+	if data.OpenCount != 1 {
+		t.Fatalf("OpenCount = %d, want 1", data.OpenCount)
 	}
 
 	if err := in.Stop(ctx); err != nil {
@@ -62,12 +63,13 @@ func TestInstanceBasicLifecycle(t *testing.T) {
 }
 
 func TestInstanceSendStopOrdering(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var enteredB bool
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("m", "a",
 			Children(
 				Atomic("a", On("go", Target("b"))),
-				Atomic("b", OnEntry(Action(func(d *struct{}, ec ExecContext) error {
+				Atomic("b", OnEntry(b.action("TestInstanceSendStopOrdering.action.1", func(d *struct{}, ec ExecContext) error {
 					enteredB = true
 					return nil
 				}))),
@@ -78,7 +80,7 @@ func TestInstanceSendStopOrdering(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, &struct{}{})
+	in := b.newInstance(chart)
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -105,11 +107,12 @@ func TestInstanceSendStopOrdering(t *testing.T) {
 }
 
 func TestInstanceStopRunsOnExitForRemainingStates(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var exited bool
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("m", "a",
 			Children(
-				Atomic("a", OnExit(Action(func(d *struct{}, ec ExecContext) error {
+				Atomic("a", OnExit(b.action("TestInstanceStopRunsOnExitForRemainingStates.action.1", func(d *struct{}, ec ExecContext) error {
 					exited = true
 					return nil
 				}))),
@@ -120,7 +123,7 @@ func TestInstanceStopRunsOnExitForRemainingStates(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, &struct{}{})
+	in := b.newInstance(chart)
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -134,7 +137,8 @@ func TestInstanceStopRunsOnExitForRemainingStates(t *testing.T) {
 }
 
 func TestInstanceNaturalTerminationRunsOnExitForRemainingStates(t *testing.T) {
-	// The chart's root StateSpec plays the role of SCXML's own <scxml>
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	// The chart's root StateDefinition plays the role of SCXML's own <scxml>
 	// wrapper element -- never itself a member of the configuration (see
 	// interpretation.start(), which stops addAncestorStatesToEnter before
 	// reaching it) -- so "done" must be a direct child of root for
@@ -142,19 +146,19 @@ func TestInstanceNaturalTerminationRunsOnExitForRemainingStates(t *testing.T) {
 	// intermediate, real ancestor whose onexit must still fire once it
 	// does.
 	var exitedApp, exitedFinal bool
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("root", "app",
 			Children(
 				Compound("app", "a",
 					Children(
 						Atomic("a", On("go", Target("done"))),
 					),
-					OnExit(Action(func(d *struct{}, ec ExecContext) error {
+					OnExit(b.action("TestInstanceNaturalTerminationRunsOnExitForRemainingStates.action.1", func(d *struct{}, ec ExecContext) error {
 						exitedApp = true
 						return nil
 					})),
 				),
-				Final("done", OnExit(Action(func(d *struct{}, ec ExecContext) error {
+				Final("done", OnExit(b.action("TestInstanceNaturalTerminationRunsOnExitForRemainingStates.action.2", func(d *struct{}, ec ExecContext) error {
 					exitedFinal = true
 					return nil
 				}))),
@@ -165,7 +169,7 @@ func TestInstanceNaturalTerminationRunsOnExitForRemainingStates(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, &struct{}{})
+	in := b.newInstance(chart)
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -182,11 +186,12 @@ func TestInstanceNaturalTerminationRunsOnExitForRemainingStates(t *testing.T) {
 }
 
 func TestInstanceActionPanicBecomesExecutionError(t *testing.T) {
-	boom := Action(func(d *struct{}, ec ExecContext) error {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	boom := b.action("TestInstanceActionPanicBecomesExecutionError.action.1", func(d *struct{}, ec ExecContext) error {
 		panic("boom")
 	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("m", "a",
 			Children(
 				Atomic("a",
@@ -202,7 +207,7 @@ func TestInstanceActionPanicBecomesExecutionError(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, &struct{}{})
+	in := b.newInstance(chart)
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -223,12 +228,13 @@ func TestInstanceActionPanicBecomesExecutionError(t *testing.T) {
 }
 
 func TestInstanceDelayedSendFiresAndCanBeCancelled(t *testing.T) {
-	scheduleTimeout := Action(func(d *struct{}, ec ExecContext) error {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	scheduleTimeout := b.action("TestInstanceDelayedSendFiresAndCanBeCancelled.action.1", func(d *struct{}, ec ExecContext) error {
 		ec.Send("timeout", SendOptions{SendID: "t1", Delay: 5 * time.Second})
 		return nil
 	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("m", "waiting",
 			Children(
 				Atomic("waiting", OnEntry(scheduleTimeout), On("timeout", Target("done"))),
@@ -241,7 +247,7 @@ func TestInstanceDelayedSendFiresAndCanBeCancelled(t *testing.T) {
 	}
 
 	clock := NewManualClock(time.Unix(0, 0))
-	in := New(chart, &struct{}{}, WithClock(clock))
+	in := b.newInstance(chart, WithClock(clock))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -261,10 +267,15 @@ func TestInstanceDelayedSendFiresAndCanBeCancelled(t *testing.T) {
 }
 
 func TestInstanceDefaultSessionIDIsNonEmptyAndVaries(t *testing.T) {
-	chart := doorChart(t)
+	var data *Door
+	b := newTestBuilder(t, func() *Door { data = &Door{}; return data })
+	chart, err := b.build(Atomic("door"))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
 
-	in1 := New(chart, &Door{})
-	in2 := New(chart, &Door{})
+	in1 := b.newInstance(chart)
+	in2 := b.newInstance(chart)
 
 	if in1.ID() == "" {
 		t.Fatalf("Instance.ID() = %q, want non-empty", in1.ID())
@@ -278,11 +289,16 @@ func TestInstanceDefaultSessionIDIsNonEmptyAndVaries(t *testing.T) {
 }
 
 func TestInstanceWithIDGeneratorOverridesDefault(t *testing.T) {
-	chart := doorChart(t)
+	var data *Door
+	b := newTestBuilder(t, func() *Door { data = &Door{}; return data })
+	chart, err := b.build(Atomic("door"))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
 	gen := &ManualIDGenerator{}
 
-	in1 := New(chart, &Door{}, WithIDGenerator(gen))
-	in2 := New(chart, &Door{}, WithIDGenerator(gen))
+	in1 := b.newInstance(chart, WithIDGenerator(gen))
+	in2 := b.newInstance(chart, WithIDGenerator(gen))
 
 	if in1.ID() != "id-1" {
 		t.Fatalf("in1.ID() = %q, want %q", in1.ID(), "id-1")
@@ -293,34 +309,41 @@ func TestInstanceWithIDGeneratorOverridesDefault(t *testing.T) {
 }
 
 func TestInstanceWithSessionIDTakesPriorityOverGenerator(t *testing.T) {
-	chart := doorChart(t)
+	var data *Door
+	b := newTestBuilder(t, func() *Door { data = &Door{}; return data })
+	chart, err := b.build(Atomic("door"))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
 	gen := &ManualIDGenerator{}
 
-	in := New(chart, &Door{}, WithIDGenerator(gen), WithSessionID("explicit-id"))
+	in := b.newInstance(chart, WithIDGenerator(gen), WithSessionID("explicit-id"))
 	if in.ID() != "explicit-id" {
 		t.Fatalf("in.ID() = %q, want %q (WithSessionID must win over WithIDGenerator)", in.ID(), "explicit-id")
 	}
 }
 
 func TestExecContextSessionIDAndNameInsideActionAndGuard(t *testing.T) {
+	var data *Door
+	b := newTestBuilder(t, func() *Door { data = &Door{}; return data })
 	var gotSessionID string
 	var gotName string
 	var guardSessionID string
 	var guardName string
 
-	recordAndOpen := Action(func(d *Door, ec ExecContext) error {
+	recordAndOpen := b.action("TestExecContextSessionIDAndNameInsideActionAndGuard.action.1", func(d *Door, ec ExecContext) error {
 		gotSessionID = ec.SessionID()
 		gotName = ec.Name()
 		d.OpenCount++
 		return nil
 	})
-	guardSeesIdentity := Cond(func(d *Door, ec ExecContext) bool {
+	guardSeesIdentity := b.condition("TestExecContextSessionIDAndNameInsideActionAndGuard.condition.2", func(d *Door, ec ExecContext) bool {
 		guardSessionID = ec.SessionID()
 		guardName = ec.Name()
 		return true
 	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("door", "closed",
 			Children(
 				Atomic("closed", On("open.request", Target("open"), If(guardSeesIdentity), Then(recordAndOpen))),
@@ -333,8 +356,7 @@ func TestExecContextSessionIDAndNameInsideActionAndGuard(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	d := &Door{}
-	in := New(chart, d, WithSessionID("sess-xyz"))
+	in := b.newInstance(chart, WithSessionID("sess-xyz"))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -362,27 +384,28 @@ func TestExecContextSessionIDAndNameInsideActionAndGuard(t *testing.T) {
 }
 
 func TestExecContextPlatformVariablesProtectsBindings(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	provided := map[string]any{"transport": "configured"}
 	var actionValue, guardValue any
 	var actionAdded, guardAdded bool
-	chart, err := Build(Atomic("root",
-		OnEntry(func(ec ExecContext) error {
+	chart, err := b.build(Atomic("root",
+		OnEntry(b.effect("TestExecContextPlatformVariablesProtectsBindings.effect.1", func(ec ExecContext) error {
 			variables := ec.PlatformVariables()
 			actionValue, actionAdded = variables["transport"], variables["added"] != nil
 			variables["transport"] = "action mutation"
 			variables["added"] = true
 			return nil
-		}),
-		On("inspect", If(func(ec ExecContext) bool {
+		})),
+		On("inspect", If(b.condition("TestExecContextPlatformVariablesProtectsBindings.condition.2", func(_ *struct{}, ec ExecContext) bool {
 			variables := ec.PlatformVariables()
 			guardValue, guardAdded = variables["transport"], variables["added"] != nil
 			return true
-		})),
+		}))),
 	))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	in := New(chart, nil, WithPlatformVariables(provided))
+	in := b.newInstance(chart, WithPlatformVariables(provided))
 	provided["transport"] = "caller mutation"
 	provided["added"] = true
 	ctx := context.Background()
@@ -428,18 +451,20 @@ func mustLocation(t *testing.T, s string) Location {
 }
 
 func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
+	var data *Door
+	b := newTestBuilder(t, func() *Door { data = &Door{}; return data })
 	var gotList []IOProcessorInfo
 	var gotLocation Location
 	var gotOK bool
 
-	recordAndOpen := Action(func(d *Door, ec ExecContext) error {
+	recordAndOpen := b.action("TestExecContextIOProcessorsSurfacesDescriberEntries.action.1", func(d *Door, ec ExecContext) error {
 		gotList = ec.IOProcessors()
 		gotLocation, gotOK = ec.IOProcessorLocation("mock")
 		d.OpenCount++
 		return nil
 	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("door", "closed",
 			Children(
 				Atomic("closed", On("open.request", Target("open"), Then(recordAndOpen))),
@@ -452,8 +477,7 @@ func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
 	}
 
 	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://door-1")}}}
-	d := &Door{}
-	in := New(chart, d, WithIOProcessor(SCXMLEventProcessor, io))
+	in := b.newInstance(chart, WithIOProcessor(SCXMLEventProcessor, io))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -475,18 +499,20 @@ func TestExecContextIOProcessorsSurfacesDescriberEntries(t *testing.T) {
 }
 
 func TestExecContextIOProcessorsIncludesDefaultSCXMLProcessor(t *testing.T) {
+	var data *Door
+	b := newTestBuilder(t, func() *Door { data = &Door{}; return data })
 	var gotList []IOProcessorInfo
 	var gotLocation Location
 	var gotOK bool
 
-	record := Action(func(d *Door, ec ExecContext) error {
+	record := b.action("TestExecContextIOProcessorsIncludesDefaultSCXMLProcessor.action.1", func(d *Door, ec ExecContext) error {
 		gotList = ec.IOProcessors()
 		gotLocation, gotOK = ec.IOProcessorLocation(SCXMLEventProcessor)
 		d.OpenCount++
 		return nil
 	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("door", "closed",
 			Children(
 				Atomic("closed", On("open.request", Target("open"), Then(record))),
@@ -498,8 +524,7 @@ func TestExecContextIOProcessorsIncludesDefaultSCXMLProcessor(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	d := &Door{}
-	in := New(chart, d, WithSessionID("door-1"))
+	in := b.newInstance(chart, WithSessionID("door-1"))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -521,15 +546,17 @@ func TestExecContextIOProcessorsIncludesDefaultSCXMLProcessor(t *testing.T) {
 }
 
 func TestExecContextIOProcessorLocationUnknownTypeReturnsNotOK(t *testing.T) {
+	var data *Door
+	b := newTestBuilder(t, func() *Door { data = &Door{}; return data })
 	var gotOK bool
 
-	record := Action(func(d *Door, ec ExecContext) error {
+	record := b.action("TestExecContextIOProcessorLocationUnknownTypeReturnsNotOK.action.1", func(d *Door, ec ExecContext) error {
 		_, gotOK = ec.IOProcessorLocation("does-not-exist")
 		d.OpenCount++
 		return nil
 	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("door", "closed",
 			Children(
 				Atomic("closed", On("open.request", Target("open"), Then(record))),
@@ -542,8 +569,7 @@ func TestExecContextIOProcessorLocationUnknownTypeReturnsNotOK(t *testing.T) {
 	}
 
 	io := &describingIOProcessor{infos: []IOProcessorInfo{{Type: "mock", Location: mustLocation(t, "mock://door-1")}}}
-	d := &Door{}
-	in := New(chart, d, WithIOProcessor(SCXMLEventProcessor, io))
+	in := b.newInstance(chart, WithIOProcessor(SCXMLEventProcessor, io))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -562,13 +588,14 @@ func TestExecContextIOProcessorLocationUnknownTypeReturnsNotOK(t *testing.T) {
 }
 
 func TestInstanceCancelledSendNeverFires(t *testing.T) {
-	scheduleAndCancel := Action(func(d *struct{}, ec ExecContext) error {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	scheduleAndCancel := b.action("TestInstanceCancelledSendNeverFires.action.1", func(d *struct{}, ec ExecContext) error {
 		ec.Send("timeout", SendOptions{SendID: "t1", Delay: 5 * time.Second})
 		ec.Cancel("t1")
 		return nil
 	})
 
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("m", "waiting",
 			Children(
 				Atomic("waiting", OnEntry(scheduleAndCancel), On("timeout", Target("done"))),
@@ -581,7 +608,7 @@ func TestInstanceCancelledSendNeverFires(t *testing.T) {
 	}
 
 	clock := NewManualClock(time.Unix(0, 0))
-	in := New(chart, &struct{}{}, WithClock(clock))
+	in := b.newInstance(chart, WithClock(clock))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -598,14 +625,15 @@ func TestInstanceCancelledSendNeverFires(t *testing.T) {
 }
 
 func TestInstanceStopCancelsAndForgetsPendingSends(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	clock := NewManualClock(time.Unix(0, 0))
-	chart, err := Build(
-		Atomic("waiting", OnEntry(SendEvent("timeout", SendOptions{Delay: 24 * time.Hour}))),
+	chart, err := b.build(
+		Atomic("waiting", OnEntry(Send("timeout", SendDelay(24*time.Hour)))),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	in := New(chart, nil, WithClock(clock))
+	in := b.newInstance(chart, WithClock(clock))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -644,10 +672,11 @@ func (invalidSendTestError) Error() string       { return "unsupported send targ
 func (invalidSendTestError) SendExecutionError() {}
 
 func TestInstanceDefaultIOProcessorReportsUndeliverableSend(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(
 		Compound("root", "active", Children(
 			Atomic("active",
-				OnEntry(SendEvent("outbound", SendOptions{Target: "missing"})),
+				OnEntry(Send("outbound", SendTarget("missing"))),
 				On("error", Target("failed")),
 			),
 			Atomic("failed"),
@@ -657,7 +686,7 @@ func TestInstanceDefaultIOProcessorReportsUndeliverableSend(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil)
+	in := b.newInstance(chart)
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -669,17 +698,18 @@ func TestInstanceDefaultIOProcessorReportsUndeliverableSend(t *testing.T) {
 }
 
 func TestInstanceSendAlwaysEntersThroughExternalQueue(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var got EventType
-	chart, err := Build(Atomic("root", On("go", Then(func(ec ExecContext) error {
+	chart, err := b.build(Atomic("root", On("go", Then(b.effect("TestInstanceSendAlwaysEntersThroughExternalQueue.effect.1", func(ec ExecContext) error {
 		ev, _ := ec.Event()
 		got = ev.Type
 		return nil
-	}))))
+	})))))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil)
+	in := b.newInstance(chart)
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -694,19 +724,20 @@ func TestInstanceSendAlwaysEntersThroughExternalQueue(t *testing.T) {
 }
 
 func TestInstanceSelfSendPopulatesSCXMLOriginMetadata(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var got Event
-	chart, err := Build(Atomic("root",
-		OnEntry(SendEvent("self", SendOptions{})),
-		On("self", Then(func(ec ExecContext) error {
+	chart, err := b.build(Atomic("root",
+		OnEntry(Send("self")),
+		On("self", Then(b.effect("TestInstanceSelfSendPopulatesSCXMLOriginMetadata.effect.1", func(ec ExecContext) error {
 			got, _ = ec.Event()
 			return nil
-		})),
+		}))),
 	))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithSessionID("session-1"))
+	in := b.newInstance(chart, WithSessionID("session-1"))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -718,19 +749,20 @@ func TestInstanceSelfSendPopulatesSCXMLOriginMetadata(t *testing.T) {
 }
 
 func TestInstanceExplicitOwnSCXMLTargetRoutesToExternalQueue(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	var received bool
-	chart, err := Build(Atomic("root",
-		OnEntry(SendEvent("self", SendOptions{Target: "#_scxml_session-1"})),
-		On("self", Then(func(ExecContext) error {
+	chart, err := b.build(Atomic("root",
+		OnEntry(Send("self", SendTarget("#_scxml_session-1"))),
+		On("self", Then(b.effect("TestInstanceExplicitOwnSCXMLTargetRoutesToExternalQueue.effect.1", func(ExecContext) error {
 			received = true
 			return nil
-		})),
+		}))),
 	))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithSessionID("session-1"))
+	in := b.newInstance(chart, WithSessionID("session-1"))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -742,17 +774,18 @@ func TestInstanceExplicitOwnSCXMLTargetRoutesToExternalQueue(t *testing.T) {
 }
 
 func TestInstanceFailedSendErrorCarriesGeneratedSendID(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	processor := &captureIOProcessor{err: errors.New("offline")}
 	var got Identifier
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("root", "active", Children(
 			Atomic("active",
-				OnEntry(SendEvent("outbound", SendOptions{Target: "service"})),
-				On(string(ErrEventCommunication), Then(func(ec ExecContext) error {
+				OnEntry(Send("outbound", SendTarget("service"))),
+				On(string(ErrEventCommunication), Then(b.effect("TestInstanceFailedSendErrorCarriesGeneratedSendID.effect.1", func(ec ExecContext) error {
 					ev, _ := ec.Event()
 					got = ev.SendID
 					return nil
-				})),
+				}))),
 			),
 		)),
 	)
@@ -760,7 +793,7 @@ func TestInstanceFailedSendErrorCarriesGeneratedSendID(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, processor))
+	in := b.newInstance(chart, WithIOProcessor(SCXMLEventProcessor, processor))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -772,13 +805,14 @@ func TestInstanceFailedSendErrorCarriesGeneratedSendID(t *testing.T) {
 }
 
 func TestInstanceSendUsesDefaultSCXMLEventProcessorType(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	processor := &captureIOProcessor{}
-	chart, err := Build(Atomic("root", OnEntry(SendEvent("outbound", SendOptions{Target: "service"}))))
+	chart, err := b.build(Atomic("root", OnEntry(Send("outbound", SendTarget("service")))))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, processor))
+	in := b.newInstance(chart, WithIOProcessor(SCXMLEventProcessor, processor))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -793,14 +827,15 @@ func TestInstanceSendUsesDefaultSCXMLEventProcessorType(t *testing.T) {
 }
 
 func TestInstanceCustomIOProcessorReceivesEmptyAndInternalTargets(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	for _, target := range []Identifier{"", "#_internal"} {
 		t.Run(string(target), func(t *testing.T) {
 			processor := &captureIOProcessor{}
-			chart, err := Build(Atomic("root", OnEntry(SendEvent("outbound", SendOptions{Target: target, Type: "custom"}))))
+			chart, err := b.build(Atomic("root", OnEntry(Send("outbound", SendTarget(string(target)), SendType("custom")))))
 			if err != nil {
 				t.Fatalf("Build: %v", err)
 			}
-			in := New(chart, nil, WithIOProcessor("custom", processor))
+			in := b.newInstance(chart, WithIOProcessor("custom", processor))
 			ctx := context.Background()
 			if err := in.Start(ctx); err != nil {
 				t.Fatalf("Start: %v", err)
@@ -814,12 +849,13 @@ func TestInstanceCustomIOProcessorReceivesEmptyAndInternalTargets(t *testing.T) 
 }
 
 func TestInstanceSCXMLAliasUsesMandatoryProcessorAndCanonicalRequestType(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	processor := &captureIOProcessor{}
-	chart, err := Build(Atomic("root", OnEntry(SendEvent("outbound", SendOptions{Target: "service", Type: SCXMLEventProcessorAlias}))))
+	chart, err := b.build(Atomic("root", OnEntry(Send("outbound", SendTarget("service"), SendType(string(SCXMLEventProcessorAlias))))))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, processor))
+	in := b.newInstance(chart, WithIOProcessor(SCXMLEventProcessor, processor))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -831,6 +867,7 @@ func TestInstanceSCXMLAliasUsesMandatoryProcessorAndCanonicalRequestType(t *test
 }
 
 func TestDelayedSCXMLSelfSendSnapshotsPayloadWhenEvaluated(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	originalValues := map[string]Value{"count": Int64Value(1)}
 	original, err := MapValue(originalValues)
 	if err != nil {
@@ -838,18 +875,18 @@ func TestDelayedSCXMLSelfSendSnapshotsPayloadWhenEvaluated(t *testing.T) {
 	}
 	var received Value
 	clock := NewManualClock(time.Unix(0, 0))
-	chart, err := Build(Atomic("root",
-		OnEntry(SendEvent("later", SendOptions{Data: original, Delay: time.Second})),
-		On("later", Then(func(ec ExecContext) error {
+	chart, err := b.build(Atomic("root",
+		OnEntry(Send("later", SendContent(GoLiteral(original)), SendDelay(time.Second))),
+		On("later", Then(b.effect("TestDelayedSCXMLSelfSendSnapshotsPayloadWhenEvaluated.effect.1", func(ec ExecContext) error {
 			ev, _ := ec.Event()
 			received = ev.Data
 			return nil
-		})),
+		}))),
 	))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	in := New(chart, nil, WithClock(clock))
+	in := b.newInstance(chart, WithClock(clock))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -870,11 +907,12 @@ func TestDelayedSCXMLSelfSendSnapshotsPayloadWhenEvaluated(t *testing.T) {
 }
 
 func TestInstanceUnsupportedSendProducesExecutionError(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	processor := &captureIOProcessor{err: invalidSendTestError{}}
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("root", "active", Children(
 			Atomic("active",
-				OnEntry(SendEvent("outbound", SendOptions{Target: "unsupported"})),
+				OnEntry(Send("outbound", SendTarget("unsupported"))),
 				On(string(ErrEventExecution), Target("execution-error")),
 				On(string(ErrEventCommunication), Target("communication-error")),
 			),
@@ -886,7 +924,7 @@ func TestInstanceUnsupportedSendProducesExecutionError(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithIOProcessor(SCXMLEventProcessor, processor))
+	in := b.newInstance(chart, WithIOProcessor(SCXMLEventProcessor, processor))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -898,10 +936,11 @@ func TestInstanceUnsupportedSendProducesExecutionError(t *testing.T) {
 }
 
 func TestInstanceDefaultProcessorReportsUnsupportedTypeAsExecutionError(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(
 		Compound("root", "active", Children(
 			Atomic("active",
-				OnEntry(SendEvent("outbound", SendOptions{Target: "service", Type: "unsupported"})),
+				OnEntry(Send("outbound", SendTarget("service"), SendType("unsupported"))),
 				On(string(ErrEventExecution), Target("execution-error")),
 				On(string(ErrEventCommunication), Target("communication-error")),
 			),
@@ -913,7 +952,7 @@ func TestInstanceDefaultProcessorReportsUnsupportedTypeAsExecutionError(t *testi
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil)
+	in := b.newInstance(chart)
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -925,17 +964,18 @@ func TestInstanceDefaultProcessorReportsUnsupportedTypeAsExecutionError(t *testi
 }
 
 func TestInstanceDelayedInternalSendRetainsInternalEventType(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	clock := NewManualClock(time.Unix(0, 0))
 	var got EventType
-	chart, err := Build(
+	chart, err := b.build(
 		Compound("root", "active", Children(
 			Atomic("active",
-				OnEntry(SendEvent("later", SendOptions{Target: "#_internal", Delay: time.Second})),
-				On("later", Target("done"), Then(func(ec ExecContext) error {
+				OnEntry(Send("later", SendTarget("#_internal"), SendDelay(time.Second))),
+				On("later", Target("done"), Then(b.effect("TestInstanceDelayedInternalSendRetainsInternalEventType.effect.1", func(ec ExecContext) error {
 					ev, _ := ec.Event()
 					got = ev.Type
 					return nil
-				})),
+				}))),
 			),
 			Atomic("done"),
 		)),
@@ -944,7 +984,7 @@ func TestInstanceDelayedInternalSendRetainsInternalEventType(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithClock(clock))
+	in := b.newInstance(chart, WithClock(clock))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -960,25 +1000,26 @@ func TestInstanceDelayedInternalSendRetainsInternalEventType(t *testing.T) {
 }
 
 func TestInstanceDelayedSendsWithSameIDKeepTheirOwnDeadlines(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	clock := NewManualClock(time.Unix(0, 0))
 	var received []Identifier
-	chart, err := Build(Atomic("root",
-		OnEntry(func(ec ExecContext) error {
+	chart, err := b.build(Atomic("root",
+		OnEntry(b.effect("TestInstanceDelayedSendsWithSameIDKeepTheirOwnDeadlines.effect.1", func(ec ExecContext) error {
 			ec.Send("first", SendOptions{SendID: "shared", Delay: time.Hour})
 			ec.Send("second", SendOptions{SendID: "shared", Delay: 2 * time.Hour})
 			return nil
-		}),
-		On("first second", Then(func(ec ExecContext) error {
+		})),
+		On("first second", Then(b.effect("TestInstanceDelayedSendsWithSameIDKeepTheirOwnDeadlines.effect.2", func(ec ExecContext) error {
 			ev, _ := ec.Event()
 			received = append(received, ev.Name)
 			return nil
-		})),
+		}))),
 	))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithClock(clock))
+	in := b.newInstance(chart, WithClock(clock))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1010,25 +1051,26 @@ func TestInstanceDelayedSendsWithSameIDKeepTheirOwnDeadlines(t *testing.T) {
 }
 
 func TestInstanceCancelStopsAllDelayedSendsSharingAnID(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	clock := NewManualClock(time.Unix(0, 0))
 	var received []Identifier
-	chart, err := Build(Atomic("root",
+	chart, err := b.build(Atomic("root",
 		OnEntry(
-			SendEvent("first", SendOptions{SendID: "shared", Delay: time.Hour}),
-			SendEvent("second", SendOptions{SendID: "shared", Delay: 2 * time.Hour}),
+			Send("first", SendID("shared"), SendDelay(time.Hour)),
+			Send("second", SendID("shared"), SendDelay(2*time.Hour)),
 			CancelSend("shared"),
 		),
-		On("first second", Then(func(ec ExecContext) error {
+		On("first second", Then(b.effect("TestInstanceCancelStopsAllDelayedSendsSharingAnID.effect.1", func(ec ExecContext) error {
 			ev, _ := ec.Event()
 			received = append(received, ev.Name)
 			return nil
-		})),
+		}))),
 	))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithClock(clock))
+	in := b.newInstance(chart, WithClock(clock))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1044,24 +1086,25 @@ func TestInstanceCancelStopsAllDelayedSendsSharingAnID(t *testing.T) {
 }
 
 func TestInstanceCancelDoesNotMatchUnexposedGeneratedSendID(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	clock := NewManualClock(time.Unix(0, 0))
 	received := false
-	chart, err := Build(Atomic("root",
+	chart, err := b.build(Atomic("root",
 		OnEntry(
-			SendEvent("explicit", SendOptions{SendID: "send.1", Delay: time.Hour}),
-			SendEvent("generated", SendOptions{Delay: time.Hour}),
+			Send("explicit", SendID("send.1"), SendDelay(time.Hour)),
+			Send("generated", SendDelay(time.Hour)),
 			CancelSend("send.1"),
 		),
-		On("generated", Then(func(ExecContext) error {
+		On("generated", Then(b.effect("TestInstanceCancelDoesNotMatchUnexposedGeneratedSendID.effect.1", func(ExecContext) error {
 			received = true
 			return nil
-		})),
+		}))),
 	))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil, WithClock(clock))
+	in := b.newInstance(chart, WithClock(clock))
 	ctx := context.Background()
 	if err := in.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1077,25 +1120,26 @@ func TestInstanceCancelDoesNotMatchUnexposedGeneratedSendID(t *testing.T) {
 }
 
 func TestInstanceRestorePreservesEqualDeadlineSendOrder(t *testing.T) {
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	clock := NewManualClock(time.Unix(0, 0))
 	var received []Identifier
-	chart, err := Build(Atomic("root",
+	chart, err := b.build(Atomic("root",
 		OnEntry(
-			SendEvent("z-first", SendOptions{SendID: "z", Delay: time.Hour}),
-			SendEvent("a-second", SendOptions{SendID: "a", Delay: time.Hour}),
+			Send("z-first", SendID("z"), SendDelay(time.Hour)),
+			Send("a-second", SendID("a"), SendDelay(time.Hour)),
 		),
-		On("z-first a-second", Then(func(ec ExecContext) error {
+		On("z-first a-second", Then(b.effect("TestInstanceRestorePreservesEqualDeadlineSendOrder.effect.1", func(ec ExecContext) error {
 			ev, _ := ec.Event()
 			received = append(received, ev.Name)
 			return nil
-		})),
+		}))),
 	))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
 	ctx := context.Background()
-	original := New(chart, nil, WithClock(clock))
+	original := b.newInstance(chart, WithClock(clock))
 	if err := original.Start(ctx); err != nil {
 		t.Fatalf("Start original: %v", err)
 	}
@@ -1107,7 +1151,7 @@ func TestInstanceRestorePreservesEqualDeadlineSendOrder(t *testing.T) {
 		t.Fatalf("Stop original: %v", err)
 	}
 
-	restored, err := Restore(chart, nil, snap, WithClock(clock))
+	restored, err := chart.Restore(snap, WithClock(clock))
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -1125,16 +1169,17 @@ func TestInstanceRestorePreservesEqualDeadlineSendOrder(t *testing.T) {
 }
 
 func TestInstanceResultUsesTopLevelFinalDoneData(t *testing.T) {
-	chart, err := Build(
+	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
+	chart, err := b.build(
 		Compound("root", "done", Children(
-			Final("done", WithDone(func(ExecContext) Value { return testStringValue("root result") })),
+			Final("done", WithDone(GoLiteral(testStringValue("root result")))),
 		)),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
-	in := New(chart, nil)
+	in := b.newInstance(chart)
 	if err := in.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

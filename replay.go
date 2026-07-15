@@ -84,12 +84,6 @@ func (g *replayGate) recover(ctx context.Context) error {
 // Finally, remaining timers are activated against the configured Clock --
 // including synchronously applying overdue sends -- and active invocations
 // are reconciled before the returned Instance is considered live.
-func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapshots SnapshotStore, sessionID SessionID, realIO IOProcessor, opts ...Option) (*Instance, error) {
-	return rehydrateInstanceFromFactory(ctx, chart, func() (DatamodelSession, error) {
-		return newLegacyDatamodelSession(datamodel), nil
-	}, log, snapshots, sessionID, realIO, opts...)
-}
-
 // Rehydrate reconstructs a running Instance using fresh sessions from the
 // chart's DatamodelProgram. Snapshot model state is decoded into one fresh
 // session; an incompatible cache is discarded before replay starts with

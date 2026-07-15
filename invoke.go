@@ -72,131 +72,87 @@ func canonicalInvokeType(typ Identifier) Identifier {
 	return typ
 }
 
-// InvokeFunc is the body of one <invoke> instance (SCXML 6.4): it starts
-// when its containing state is entered (deferred to the point the
-// containing macrostep settles, so a state entered and exited again within
-// the same macrostep is never invoked at all) and runs for as long as the
-// external service it represents is alive, in its own goroutine. ctx is
-// cancelled when the containing state is exited before the service
-// finishes -- SCXML 6.4.2's "cancel operation MUST act as if it were the
-// final onexit handler in the invoking state" -- or when the Instance
-// stops; InvokeFunc should return promptly once ctx is done. A nil error
-// return is the service's own normal completion, on which the interpreter
-// synthesizes done.invoke.<id> (carrying the returned data) onto the
-// invoking chart's external queue, mirroring SCXML 6.4.3; a non-nil error
-// instead reports error.communication on the internal queue. Neither event
-// is generated if ctx was already cancelled by the time InvokeFunc returns.
-type InvokeFunc func(ctx context.Context, params Value, io InvokeIO) (data Value, err error)
+// InvokeOption appends serializable authoring data to an invocation.
+type InvokeOption func(*InvokeDefinition)
 
-// InvokeResumeFunc reattaches to a possibly-still-running invocation after
-// Rehydrate, instead of starting a fresh one via Start. id is the
-// invocation's own id, preserved exactly as it was before the restart --
-// whatever identity a resumable invocation uses to find the real-world
-// resource it was talking to (a subprocess's PID, a job id in an external
-// queue, a container name) has to be either id itself or something params
-// encodes, since nothing else about the pre-restart invocation survives.
-// params is recomputed fresh, by calling Params again against the
-// fully-restored datamodel; there is no separate "original params"
-// preserved anywhere. Unlike a live invocation's Params call, _event is
-// unbound during this recomputation (SCXML 5.10.1's rule for before the
-// first event is processed): there is no single well-defined triggering
-// event left once replay has caught up. Write a Params callback meant to
-// run again during Resume so its result depends on datamodel state, not on
-// the current event.
-//
-// Resume's return is treated exactly like Start's: a non-nil error becomes
-// error.communication, a nil error with data becomes done.invoke.<id>
-// immediately (the work finished while nothing was watching it), and
-// blocking on ctx or io.Incoming continues the invocation exactly as if it
-// had never stopped.
-type InvokeResumeFunc func(ctx context.Context, id Identifier, params Value, io InvokeIO) (data Value, err error)
-
-// InvokeSpec is the uncompiled description of one <invoke> attached to a
-// state, built via Invoke and InvokeOptions.
-type InvokeSpec struct {
-	ID             Identifier // empty = auto-generated ("<stateid>.invoke<n>") at invoke time
-	Start          InvokeFunc
-	Params         func(ExecContext) Value // evaluated once, synchronously, when the invocation starts; nil => null params
-	Finalize       []ActionFunc
-	AutoForward    bool
-	Resume         InvokeResumeFunc
-	IDLocation     IDLocationFunc
-	finalizeBlocks []actionBlock
+// WithInvokeDefinitionID sets the stable declaration identity used by
+// snapshots and hot-deployment revision pinning.
+func WithInvokeDefinitionID(id Identifier) InvokeOption {
+	return func(invoke *InvokeDefinition) { invoke.DefinitionID = id }
 }
-
-// InvokeOption configures an InvokeSpec being built by Invoke.
-type InvokeOption func(*InvokeSpec)
 
 // WithInvokeID sets an explicit invoke ID, e.g. for targeting it later via
 // SendOptions{Target: "#_" + id}. Left unset, an ID unique within the
 // session is generated when the invocation actually starts.
 func WithInvokeID(id Identifier) InvokeOption {
-	return func(s *InvokeSpec) { s.ID = id }
+	return func(invoke *InvokeDefinition) { invoke.ID = id }
 }
 
-// WithInvokeIDLocation assigns the generated invoke ID synchronously when the
-// invocation is evaluated, before params and Start. It is mutually exclusive
-// with WithInvokeID; an assignment error or panic produces error.execution
-// and aborts the invocation.
-func WithInvokeIDLocation(fn IDLocationFunc) InvokeOption {
-	return func(s *InvokeSpec) { s.IDLocation = fn }
-}
-
-// WithInvokeParams sets the callback that computes the data passed to
-// Start (SCXML's <param>/namelist equivalent), evaluated synchronously
-// against the state being entered, before Start's goroutine is spawned.
-func WithInvokeParams(fn func(ExecContext) Value) InvokeOption {
-	return func(s *InvokeSpec) { s.Params = fn }
-}
-
-// WithFinalize attaches executable content run whenever an event carrying
-// this invocation's InvokeID is processed, immediately before transitions
-// are selected for it (SCXML 6.5): the mechanism for normalizing data an
-// invoked service returns before any transition's guard inspects it. Send,
-// Raise, and Cancel are rejected with error.execution in this content.
-// Since actions are arbitrary Go, applications are responsible for not doing
-// direct external I/O from a finalize callback.
-func WithFinalize(actions ...ActionFunc) InvokeOption {
-	return func(s *InvokeSpec) {
-		s.Finalize = append(s.Finalize, actions...)
-		s.finalizeBlocks = append(s.finalizeBlocks, legacyActionBlock(actions))
+// WithInvokeIDLocation stores a generated runtime ID in a model location.
+func WithInvokeIDLocation(location Expression) InvokeOption {
+	return func(invoke *InvokeDefinition) {
+		value := location.Clone()
+		invoke.IDLocation = &value
 	}
 }
 
-// WithAutoForward makes the chart forward an exact copy of every external
-// event it processes to this invocation's InvokeIO.Incoming, for as long
-// as it's active -- SCXML 6.4.1's 'autoforward' attribute. The copy is
-// unconditional: unlike <finalize>, it happens whether or not the event's
-// own InvokeID matches this invocation.
+// WithInvokeTypeExpression selects a handler type from the datamodel.
+func WithInvokeTypeExpression(expression Expression) InvokeOption {
+	return func(invoke *InvokeDefinition) {
+		value := expression.Clone()
+		invoke.Type = ""
+		invoke.TypeExpr = &value
+	}
+}
+
+// WithInvokeSourceExpression selects a handler source from the datamodel.
+func WithInvokeSourceExpression(expression Expression) InvokeOption {
+	return func(invoke *InvokeDefinition) {
+		value := expression.Clone()
+		invoke.Src = ""
+		invoke.SrcExpr = &value
+	}
+}
+
+// WithInvokeParams sets named invocation input expressions.
+func WithInvokeParams(params ...ParamDefinition) InvokeOption {
+	return func(invoke *InvokeDefinition) { invoke.Params = cloneParams(params) }
+}
+
+// WithInvokeContent sets one whole invocation input expression.
+func WithInvokeContent(content Expression) InvokeOption {
+	return func(invoke *InvokeDefinition) {
+		value := content.Clone()
+		invoke.Content = &value
+	}
+}
+
+// WithFinalize attaches executable blocks run before processing an event
+// returned by this invocation. Each call creates one independent block.
+func WithFinalize(actions ...Executable) InvokeOption {
+	return func(invoke *InvokeDefinition) {
+		invoke.Finalize = append(invoke.Finalize, cloneExecutableBlock(actions))
+	}
+}
+
+// WithAutoForward forwards each external event to the active invocation.
 func WithAutoForward() InvokeOption {
-	return func(s *InvokeSpec) { s.AutoForward = true }
+	return func(invoke *InvokeDefinition) { invoke.AutoForward = true }
 }
 
-// WithInvokeResume sets the callback Rehydrate calls, once replay catches
-// up, to reattach to this invocation instead of assuming it is gone. Left
-// unset, Rehydrate reports error.communication for this invocation
-// unconditionally, the only honest default for one with no way to check.
-func WithInvokeResume(fn InvokeResumeFunc) InvokeOption {
-	return func(s *InvokeSpec) { s.Resume = fn }
-}
-
-// Invoke attaches an external service instance to a state (SCXML's
-// <invoke>) -- fn is any Go function willing to run in its own goroutine
-// and talk back through InvokeIO. Use InvokeChart to run another *Chart as
-// a full child SCXML session (SCXML 6.4's
-// type="http://www.w3.org/TR/scxml/" case) rather than writing fn by hand.
-func Invoke(fn InvokeFunc, opts ...InvokeOption) StateOption {
-	return func(s *StateSpec) {
-		spec := InvokeSpec{Start: fn}
+// Invoke attaches a declarative external service to a state. Runtime
+// behavior is supplied separately through WithInvokeHandler.
+func Invoke(typ, source string, opts ...InvokeOption) StateOption {
+	return func(state *StateDefinition) {
+		definition := InvokeDefinition{Type: typ, Src: source}
 		for _, opt := range opts {
-			opt(&spec)
+			opt(&definition)
 		}
-		s.Invokes = append(s.Invokes, spec)
+		state.Invokes = append(state.Invokes, definition.clone())
 	}
 }
 
-// compiledInvoke is the compiled form of one InvokeSpec, owned by the
-// compiledState it was declared on.
+// compiledInvoke is the immutable runtime form of one InvokeDefinition.
 type compiledInvoke struct {
 	definitionID       Identifier
 	owner              *compiledState
@@ -212,13 +168,6 @@ type compiledInvoke struct {
 	hasModelIDLocation bool
 	finalize           []actionBlock
 	autoForward        bool
-	declarative        bool
-
-	// Temporary callback-builder path, removed by issue #15.
-	start      InvokeFunc
-	params     func(ExecContext) Value
-	resume     InvokeResumeFunc
-	idLocation IDLocationFunc
 }
 
 // runningInvoke is the interpreter-core bookkeeping for one active
@@ -323,75 +272,50 @@ func (p *parentIOProcessor) IOProcessors() []IOProcessorInfo {
 	return append([]IOProcessorInfo{self}, infos...)
 }
 
-// InvokeChart returns an InvokeFunc that runs chart as a full child SCXML
-// session -- SCXML 6.4's type="http://www.w3.org/TR/scxml/" case -- rather
-// than an arbitrary external service. newDatamodel builds the child's
-// datamodel from whatever Params produced (SCXML's <param>/namelist
-// equivalent); baseIO is used for any send target other than "#_parent"
-// (nil means no fallback transport for those targets).
-//
-// The child's own Send(name, SendOptions{Target: "#_parent"}) reaches
-// back into this invocation's InvokeIO.Deliver, tagged with this
-// invocation's InvokeID by the interpreter as usual (Appendix C.1: "the
-// Processor MUST add the event to the external event queue of the SCXML
-// session that invoked the sending session"). Every event the parent
-// forwards to this invocation -- an explicit SendOptions{Target:
-// "#_<invokeid>"}, or, with WithAutoForward, a copy of every external
-// event the parent processes -- is delivered to the child exactly as an
-// application calling Send on it directly would (SCXML 6.4's
-// autoforwarding). The child is stopped, and its own onexit handlers run
-// via exitInterpreter, when this invocation is cancelled; reaching its
-// own top-level final state is this invocation's own natural completion,
-// generating done.invoke.<id> on the parent exactly as for any other
-// InvokeFunc.
-func InvokeChart(chart *Chart, newDatamodel func(params Value) any, baseIO IOProcessor) InvokeFunc {
-	return func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
-		datamodel := newDatamodel(params)
-		child := New(chart, datamodel, WithIOProcessor(SCXMLEventProcessor, &parentIOProcessor{deliver: io.Deliver, next: baseIO}))
-
-		// Start's own actor goroutine runs regardless of whether Start
-		// itself returns early because ctx raced its way to already
-		// being cancelled (e.g. the invoking state was exited again
-		// immediately) -- so the child must always be stopped, even when
-		// Start reports an error, or it would keep running orphaned.
-		defer child.Stop(context.Background())
-
-		if err := child.Start(ctx); err != nil {
-			return Value{}, err
-		}
-
-		go func() {
-			for {
-				select {
-				case ev, ok := <-io.Incoming:
-					if !ok {
-						return
-					}
-					if child.Send(ctx, ev) != nil {
-						return
-					}
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-
-		if err := child.Wait(ctx); err != nil {
-			return Value{}, err
-		}
-		return child.Result()
-	}
-}
-
 // InvokeChartHandler returns an environment-scoped handler factory for the
-// standard child-chart invocation type. The child chart, datamodel factory,
-// and fallback transport remain runtime capabilities; only their source key
-// belongs in a serializable InvokeDefinition.
-func InvokeChartHandler(chart *Chart, newDatamodel func(data Value) any, baseIO IOProcessor) InvokeHandlerFactory {
+// standard child-chart invocation type. The child chart and fallback
+// transport remain runtime capabilities; only the invocation source key
+// belongs in a serializable InvokeDefinition. Child input should be modeled
+// explicitly by the child definition rather than by replacing its model.
+func InvokeChartHandler(chart *Chart, baseIO IOProcessor) InvokeHandlerFactory {
 	return func() InvokeHandler {
-		run := InvokeChart(chart, newDatamodel, baseIO)
-		return InvokeHandlerFunc(func(ctx context.Context, request InvokeRequest, io InvokeIO) (Value, error) {
-			return run(ctx, request.Data.Clone(), io)
+		return InvokeHandlerFunc(func(ctx context.Context, _ InvokeRequest, io InvokeIO) (Value, error) {
+			child, err := chart.NewInstance(WithIOProcessor(SCXMLEventProcessor, &parentIOProcessor{deliver: io.Deliver, next: baseIO}))
+			if err != nil {
+				return Value{}, err
+			}
+
+			// Start's own actor goroutine runs regardless of whether Start
+			// itself returns early because ctx raced its way to already
+			// being cancelled (e.g. the invoking state was exited again
+			// immediately) -- so the child must always be stopped, even when
+			// Start reports an error, or it would keep running orphaned.
+			defer child.Stop(context.Background())
+
+			if err := child.Start(ctx); err != nil {
+				return Value{}, err
+			}
+
+			go func() {
+				for {
+					select {
+					case ev, ok := <-io.Incoming:
+						if !ok {
+							return
+						}
+						if child.Send(ctx, ev) != nil {
+							return
+						}
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+
+			if err := child.Wait(ctx); err != nil {
+				return Value{}, err
+			}
+			return child.Result()
 		})
 	}
 }

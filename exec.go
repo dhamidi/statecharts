@@ -1,19 +1,13 @@
 package statecharts
 
 import (
-	"fmt"
 	"time"
 )
 
-// ExecContext is passed to every ActionFunc, CondFunc, and DoneDataFunc. It
-// exposes the SCXML datamodel touchpoints (_event, the In() predicate) that
-// would otherwise be evaluated against an expression language -- since the
-// only supported datamodel is Go itself, these become plain method calls
-// instead.
+// ExecContext exposes the runtime context supplied to datamodel operations.
 type ExecContext struct {
 	event             Event
 	hasEvent          bool
-	datamodel         any
 	sessionID         string
 	name              string
 	platformVariables map[string]any
@@ -53,12 +47,6 @@ func (ec ExecContext) Raise(ev Event) {
 	ev.OriginType = ""
 	ev.InvokeID = ""
 	ec.raise(ev)
-}
-
-// Datamodel returns the raw datamodel value passed to New/Restore, escaping
-// the Action[D]/Cond[D] adapters for callers that need untyped access.
-func (ec ExecContext) Datamodel() any {
-	return ec.datamodel
 }
 
 // SessionID returns this session's id, bound for its entire lifetime, per
@@ -148,25 +136,8 @@ func (ec ExecContext) Log(label string, data Value) {
 	}
 }
 
-// ActionFunc is executable content: <onentry>/<onexit>/transition content.
-// A non-nil error is reported into the chart as an error.execution event
-// (SCXML's own error model), not returned to the caller as a Go error.
-type ActionFunc func(ExecContext) error
-
-// CondFunc is a transition guard (the "cond" attribute). A panic is treated
-// as false and reported to the chart as error.execution, per SCXML 5.9.1.
-// Conditions that need ordinary, expected failure handling should still
-// express it as state plus a preceding action instead.
-type CondFunc func(ExecContext) bool
-
-// DoneDataFunc produces the canonical payload for a final state's done event.
-type DoneDataFunc func(ExecContext) Value
-
 type compiledAction struct {
-	callback ActionFunc
-	model    CompiledExpression
-	useModel bool
-	op       *compiledOperation
+	op *compiledOperation
 }
 
 type compiledOperation struct {
@@ -195,51 +166,5 @@ type compiledData struct {
 }
 
 // actionBlock is one statechart block of executable content. An error skips
-// the rest of this block without affecting later blocks. callback is the
-// temporary Go-builder path; model is the datamodel-neutral compiled path.
+// the rest of this block without affecting later blocks.
 type actionBlock []compiledAction
-
-func legacyActionBlock(actions []ActionFunc) actionBlock {
-	block := make(actionBlock, len(actions))
-	for i, action := range actions {
-		block[i] = compiledAction{callback: action}
-	}
-	return block
-}
-
-func modelAction(expression CompiledExpression) compiledAction {
-	return compiledAction{model: expression, useModel: true}
-}
-
-// Action adapts a callback operating on the chart's concrete datamodel type
-// D into an ActionFunc. A chart is bound to exactly one D for its entire
-// life; a mismatch (only reachable via programmer error pairing the wrong
-// Instance datamodel with this chart) is reported as an error rather than a
-// panic.
-func Action[D any](fn func(*D, ExecContext) error) ActionFunc {
-	return func(ec ExecContext) error {
-		d, ok := ec.datamodel.(*D)
-		if !ok {
-			var zero D
-			return fmt.Errorf("statecharts: Action[%T]: datamodel is %T, not *%T", zero, ec.datamodel, zero)
-		}
-		return fn(d, ec)
-	}
-}
-
-// Cond adapts a typed guard callback into a CondFunc. A datamodel type
-// mismatch is an expression-evaluation error: it evaluates to false and
-// reports error.execution when run by an interpreter.
-func Cond[D any](fn func(*D, ExecContext) bool) CondFunc {
-	return func(ec ExecContext) bool {
-		d, ok := ec.datamodel.(*D)
-		if !ok {
-			if ec.reportError != nil {
-				var zero D
-				ec.reportError(fmt.Errorf("statecharts: Cond[%T]: datamodel is %T, not *%T", zero, ec.datamodel, zero))
-			}
-			return false
-		}
-		return fn(d, ec)
-	}
-}

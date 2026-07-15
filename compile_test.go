@@ -214,7 +214,7 @@ func TestCompileDefinitionIsNormalizedAndIsolated(t *testing.T) {
 		t.Fatalf("Compile: %v", err)
 	}
 	first := chart.Definition()
-	if first == nil || first.Root.Initial == nil || first.Root.Children[0].ID.Value == "" {
+	if first.Root.Initial == nil || first.Root.Children[0].ID.Value == "" {
 		t.Fatalf("Definition was not normalized: %+v", first)
 	}
 	generated := first.Root.Children[0].ID.Value
@@ -248,7 +248,7 @@ func TestCompileDefinitionIsNormalizedAndIsolated(t *testing.T) {
 		if err := instance.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if got := instance.Configuration(); !hasState(got, generated) {
+		if got := instance.Configuration(); !containsID(got, generated) {
 			t.Fatalf("encoded/recompiled configuration = %v, want %q", got, generated)
 		}
 		_ = instance.Stop(context.Background())
@@ -293,7 +293,7 @@ func TestCompileConditionErrorFallsThroughToLaterTransition(t *testing.T) {
 	if err := instance.Send(ctx, Event{Name: "go"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := instance.Configuration(); !hasState(got, "recovered") || hasState(got, "wrong") {
+	if got := instance.Configuration(); !containsID(got, "recovered") || containsID(got, "wrong") {
 		t.Fatalf("configuration = %v, want recovered", got)
 	}
 	if err := instance.Stop(ctx); err != nil {
@@ -482,7 +482,7 @@ func TestCompileStateKindsHistoryAndInitialActionOrder(t *testing.T) {
 		if err := instance.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if got := instance.Configuration(); !hasState(got, "left-active") || !hasState(got, "right-active") {
+		if got := instance.Configuration(); !containsID(got, "left-active") || !containsID(got, "right-active") {
 			t.Fatalf("parallel configuration = %v", got)
 		}
 		_ = instance.Stop(context.Background())
@@ -520,7 +520,7 @@ func TestCompileStateKindsHistoryAndInitialActionOrder(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if got := instance.Configuration(); !hasState(got, "b") {
+		if got := instance.Configuration(); !containsID(got, "b") {
 			t.Fatalf("history configuration = %v, want b", got)
 		}
 		_ = instance.Stop(ctx)
@@ -576,119 +576,6 @@ func TestCompileDataInitializersUseRealContextAndDefinitionOrder(t *testing.T) {
 		t.Fatalf("second initializer = %d, want 11", number)
 	}
 	_ = instance.Stop(context.Background())
-}
-
-func TestCompileMatchesCallbackChart(t *testing.T) {
-	callbackMark := func(value string) ActionFunc {
-		return Action(func(data *compileParityModel, _ ExecContext) error {
-			data.Trace = append(data.Trace, value)
-			return nil
-		})
-	}
-	callbackChart, err := Build(Compound("root", "container", Children(
-		Compound("container", "leaf",
-			OnEntry(callbackMark("container")),
-			WithInitial(Then(callbackMark("initial"))),
-			Children(Atomic("leaf", OnEntry(callbackMark("leaf")), On("go", Target("outside")))),
-		),
-		Atomic("outside"),
-	)))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	model := NewGoModel(func() *compileParityModel { return &compileParityModel{} })
-	mark, err := model.Action("mark", "v1", func(data *compileParityModel, _ ExecContext, args []Value) error {
-		value, _ := args[0].AsString()
-		data.Trace = append(data.Trace, value)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	definitionMark := func(value string) ExecutableBlock {
-		return ExecutableBlock{NewScriptExecutable(ScriptDefinition{Expr: mark.Expression(GoLiteral(mustTestString(t, value)))})}
-	}
-	leaf := compileTestState("leaf", KindAtomic)
-	leaf.OnEntry = []ExecutableBlock{definitionMark("leaf")}
-	leaf.Transitions = []TransitionDefinition{{Events: []Identifier{"go"}, Targets: []Identifier{"outside"}}}
-	container := compileTestState("container", KindCompound, leaf)
-	container.OnEntry = []ExecutableBlock{definitionMark("container")}
-	container.Initial = &TransitionDefinition{Targets: []Identifier{"leaf"}, Actions: []ExecutableBlock{definitionMark("initial")}}
-	root := compileTestState("root", KindCompound, container, compileTestState("outside", KindAtomic))
-	root.Initial = &TransitionDefinition{Targets: []Identifier{"container"}}
-	definitionChart, err := Compile(compileTestDefinition(root), model)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	callbackData := &compileParityModel{}
-	callbackInstance := New(callbackChart, callbackData,
-		WithSessionID("parity-session"), WithDeliveryNamespace("parity-delivery"))
-	definitionInstance, err := definitionChart.NewInstance(
-		WithSessionID("parity-session"), WithDeliveryNamespace("parity-delivery"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	for _, instance := range []*Instance{callbackInstance, definitionInstance} {
-		if err := instance.Start(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	compare := func(stage string) {
-		t.Helper()
-		if got, want := definitionInstance.Configuration(), callbackInstance.Configuration(); !reflect.DeepEqual(got, want) {
-			t.Fatalf("%s configuration: compiled %v, callback %v", stage, got, want)
-		}
-		definitionTrace := definitionInstance.session.(*goSession[compileParityModel]).data.Trace
-		if !reflect.DeepEqual(definitionTrace, callbackData.Trace) {
-			t.Fatalf("%s action trace: compiled %v, callback %v", stage, definitionTrace, callbackData.Trace)
-		}
-		callbackSnapshot, err := callbackInstance.Snapshot(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		definitionSnapshot, err := definitionInstance.Snapshot(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// The sessions intentionally own different datamodel encodings. Every
-		// interpreter-owned field must nevertheless match exactly.
-		callbackSnapshot.Datamodel = nil
-		definitionSnapshot.Datamodel = nil
-		if !reflect.DeepEqual(definitionSnapshot, callbackSnapshot) {
-			t.Fatalf("%s snapshot:\ncompiled: %#v\ncallback: %#v", stage, definitionSnapshot, callbackSnapshot)
-		}
-	}
-	compare("after start")
-	for _, instance := range []*Instance{callbackInstance, definitionInstance} {
-		if err := instance.Send(ctx, Event{Name: "go"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	compare("after go")
-	_ = callbackInstance.Stop(ctx)
-	_ = definitionInstance.Stop(ctx)
-
-	log := newMemLog()
-	if _, err := log.Append(ctx, LogEntry{
-		SessionID: "parity-replay", Kind: KindExternalEvent,
-		Timestamp: time.Unix(100, 0).UTC(), Event: Event{Name: "go", Type: EventExternal},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	replayed, err := definitionChart.Rehydrate(ctx, log, newMemSnapshotStore(), "parity-replay", NoopIOProcessor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := replayed.Configuration(); !hasState(got, "outside") {
-		t.Fatalf("replayed configuration = %v, want outside", got)
-	}
-	if got := replayed.session.(*goSession[compileParityModel]).data.Trace; !reflect.DeepEqual(got, []string{"container", "initial", "leaf"}) {
-		t.Fatalf("replayed action trace = %v", got)
-	}
-	_ = replayed.Stop(ctx)
 }
 
 func expressionPointer(expression Expression) *Expression { return &expression }

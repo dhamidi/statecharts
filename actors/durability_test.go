@@ -97,6 +97,9 @@ func TestDurableSpawnPersistsAndResumesViaLogWithoutDoubleApplying(t *testing.T)
 	if !hasStateID(inst2.Configuration(), "s3") {
 		t.Fatalf("resumed configuration = %v, want 's3'", inst2.Configuration())
 	}
+	if err := sys2.Tell(ctx, "counter-1", statecharts.Event{Name: "inspect", Type: statecharts.EventExternal}); err != nil {
+		t.Fatalf("Tell inspect (sys2): %v", err)
+	}
 	// The checkpoint includes the datamodel after all 3 "inc" events. As
 	// above, the live datamodel is the last one produced (Register's own
 	// ok-check consumes the first).
@@ -618,13 +621,15 @@ func TestTimerFireLogPreservesDispatchMetadata(t *testing.T) {
 		statecharts.Compound("metadata-sender", "idle",
 			statecharts.Children(
 				statecharts.Atomic("idle", statecharts.On("go", statecharts.Then(
-					statecharts.SendEvent("work.abort", statecharts.SendOptions{
-						SendID: "abort-work", Target: "metadata-receiver", Delay: 2 * time.Second,
-					}),
+					statecharts.Send("work.abort",
+						statecharts.SendID("abort-work"),
+						statecharts.SendTarget("metadata-receiver"),
+						statecharts.SendDelay(2*time.Second),
+					),
 				))),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
 	}
@@ -635,7 +640,7 @@ func TestTimerFireLogPreservesDispatchMetadata(t *testing.T) {
 				statecharts.Atomic("aborted"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build receiver: %v", err)
 	}
@@ -721,13 +726,13 @@ func TestDurableOutboxRecoversOnlyThroughSelectedProcessor(t *testing.T) {
 	storage := openTestLog(t)
 	chart, err := statecharts.Build(
 		statecharts.Atomic("outbox-sender",
-			statecharts.OnEntry(statecharts.SendEvent("work", statecharts.SendOptions{
-				Target: "external-worker",
-				Type:   "custom",
-			})),
+			statecharts.OnEntry(statecharts.Send("work",
+				statecharts.SendTarget("external-worker"),
+				statecharts.SendType("custom"),
+			)),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-		statecharts.WithVersion("test-v1"),
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }),
+		statecharts.WithRevisionSalt("test-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -781,10 +786,10 @@ func TestDurableOutboxRejectsMissingProcessorDuringRecovery(t *testing.T) {
 	storage := openTestLog(t)
 	chart, err := statecharts.Build(
 		statecharts.Atomic("missing-processor-sender",
-			statecharts.OnEntry(statecharts.SendEvent("work", statecharts.SendOptions{Target: "external-worker", Type: "custom"})),
+			statecharts.OnEntry(statecharts.Send("work", statecharts.SendTarget("external-worker"), statecharts.SendType("custom"))),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-		statecharts.WithVersion("test-v1"),
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }),
+		statecharts.WithRevisionSalt("test-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -896,14 +901,14 @@ func buildVersionedSenderChart(version string) *statecharts.Chart {
 		statecharts.Compound("versioned-sender", "ready",
 			statecharts.Children(
 				statecharts.Atomic("ready",
-					statecharts.OnEntry(statecharts.SendEvent("work", statecharts.SendOptions{Target: "external-worker", Type: "custom"})),
+					statecharts.OnEntry(statecharts.Send("work", statecharts.SendTarget("external-worker"), statecharts.SendType("custom"))),
 					statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("failed")),
 				),
 				statecharts.Atomic("failed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-		statecharts.WithVersion(version),
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }),
+		statecharts.WithRevisionSalt(version),
 	)
 	if err != nil {
 		panic(err)
@@ -986,12 +991,12 @@ func buildOrderedOutboxChart() *statecharts.Chart {
 	chart, err := statecharts.Build(
 		statecharts.Atomic("ordered-outbox",
 			statecharts.OnEntry(
-				statecharts.SendEvent("custom-work", statecharts.SendOptions{Target: "custom-target", Type: "custom"}),
-				statecharts.SendEvent("scxml-work", statecharts.SendOptions{Target: "remote@peer"}),
+				statecharts.Send("custom-work", statecharts.SendTarget("custom-target"), statecharts.SendType("custom")),
+				statecharts.Send("scxml-work", statecharts.SendTarget("remote@peer")),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-		statecharts.WithVersion("test-v1"),
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }),
+		statecharts.WithRevisionSalt("test-v1"),
 	)
 	if err != nil {
 		panic(err)
@@ -1081,19 +1086,23 @@ func TestCustomIOProcessorAttachmentIsIsolatedPerActor(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex
 	replies := map[statecharts.SessionID]int{}
-	recordReply := func(ec statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	recordReply, err := model.Action("record-reply", "v1", func(_ *struct{}, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		mu.Lock()
 		replies[statecharts.SessionID(ec.SessionID())]++
 		mu.Unlock()
 		return nil
+	})
+	if err != nil {
+		t.Fatalf("register record-reply action: %v", err)
 	}
 	chart, err := statecharts.Build(
 		statecharts.Atomic("processor-client",
-			statecharts.On("go", statecharts.Then(statecharts.SendEvent("request", statecharts.SendOptions{Target: "service", Type: "custom"}))),
-			statecharts.On("reply", statecharts.Then(recordReply)),
+			statecharts.On("go", statecharts.Then(statecharts.Send("request", statecharts.SendTarget("service"), statecharts.SendType("custom")))),
+			statecharts.On("reply", statecharts.Then(recordReply.Do())),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }),
-		statecharts.WithVersion("test-v1"),
+		model,
+		statecharts.WithRevisionSalt("test-v1"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -1202,6 +1211,12 @@ func TestResidencyLimitNeverEvictsActorWithActiveInvoke(t *testing.T) {
 		WithStorage(log),
 		WithMaxResident(1),
 		WithClock(clock),
+		WithInvokeHandler("actors.test.blocking", func() statecharts.InvokeHandler {
+			return statecharts.InvokeHandlerFunc(func(ctx context.Context, _ statecharts.InvokeRequest, _ statecharts.InvokeIO) (statecharts.Value, error) {
+				<-ctx.Done()
+				return statecharts.NullValue(), nil
+			})
+		}),
 	)
 	if err := sys.Register(invokingChart); err != nil {
 		t.Fatalf("Register(invokingChart): %v", err)
@@ -1250,6 +1265,12 @@ func TestIdleTimeoutNeverEvictsActorWithActiveInvoke(t *testing.T) {
 		WithStorage(log),
 		WithIdleTimeout(time.Minute),
 		WithClock(clock),
+		WithInvokeHandler("actors.test.blocking", func() statecharts.InvokeHandler {
+			return statecharts.InvokeHandlerFunc(func(ctx context.Context, _ statecharts.InvokeRequest, _ statecharts.InvokeIO) (statecharts.Value, error) {
+				<-ctx.Done()
+				return statecharts.NullValue(), nil
+			})
+		}),
 	)
 	if err := sys.Register(invokingChart); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -1448,20 +1469,26 @@ func TestDurableInvokeCompletionIsWriteAheadLogged(t *testing.T) {
 		statecharts.Compound("durable-invoke", "working",
 			statecharts.Children(
 				statecharts.Atomic("working",
-					statecharts.Invoke(func(context.Context, statecharts.Value, statecharts.InvokeIO) (statecharts.Value, error) {
-						<-complete
-						return statecharts.NullValue(), nil
-					}, statecharts.WithInvokeID("job")),
+					statecharts.Invoke("durability-test", "completion-job", statecharts.WithInvokeID("job")),
 					statecharts.On("done.invoke.job", statecharts.Target("completed")),
 				),
 				statecharts.Atomic("completed"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	sys := NewSystem(WithStorage(log), WithIdleTimeout(0))
+	sys := NewSystem(
+		WithStorage(log),
+		WithIdleTimeout(0),
+		WithInvokeHandler("durability-test", func() statecharts.InvokeHandler {
+			return statecharts.InvokeHandlerFunc(func(context.Context, statecharts.InvokeRequest, statecharts.InvokeIO) (statecharts.Value, error) {
+				<-complete
+				return statecharts.NullValue(), nil
+			})
+		}),
+	)
 	if err := sys.Register(chart); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -1593,27 +1620,30 @@ func TestDurableActorDoesNotRestartInitialInvokeAfterCrashBeforeFirstMessage(t *
 			statecharts.Compound("initial-invoke", "invoking",
 				statecharts.Children(
 					statecharts.Atomic("invoking",
-						statecharts.Invoke(func(ctx context.Context, _ statecharts.Value, _ statecharts.InvokeIO) (statecharts.Value, error) {
-							mu.Lock()
-							starts++
-							mu.Unlock()
-							startedOnce.Do(func() { close(started) })
-							<-ctx.Done()
-							return statecharts.NullValue(), nil
-						}, statecharts.WithInvokeID("work")),
+						statecharts.Invoke("durability-test", "initial-work", statecharts.WithInvokeID("work")),
 						statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("recovered")),
 					),
 					statecharts.Atomic("recovered"),
 				),
 			),
-			statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+			statecharts.NewGoModel(func() *struct{} { return &struct{}{} }), statecharts.WithRevisionSalt("test-v1"))
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
 		return chart
 	}
+	invokeHandler := func() statecharts.InvokeHandler {
+		return statecharts.InvokeHandlerFunc(func(ctx context.Context, _ statecharts.InvokeRequest, _ statecharts.InvokeIO) (statecharts.Value, error) {
+			mu.Lock()
+			starts++
+			mu.Unlock()
+			startedOnce.Do(func() { close(started) })
+			<-ctx.Done()
+			return statecharts.NullValue(), nil
+		})
+	}
 
-	sys1 := NewSystem(WithStorage(log), WithIdleTimeout(0))
+	sys1 := NewSystem(WithStorage(log), WithIdleTimeout(0), WithInvokeHandler("durability-test", invokeHandler))
 	chart1 := buildChart()
 	if err := sys1.Register(chart1); err != nil {
 		t.Fatalf("Register sys1: %v", err)
@@ -1636,7 +1666,7 @@ func TestDurableActorDoesNotRestartInitialInvokeAfterCrashBeforeFirstMessage(t *
 		t.Fatalf("stop crashed instance: %v", err)
 	}
 
-	sys2 := NewSystem(WithStorage(log), WithIdleTimeout(0))
+	sys2 := NewSystem(WithStorage(log), WithIdleTimeout(0), WithInvokeHandler("durability-test", invokeHandler))
 	chart2 := buildChart()
 	if err := sys2.Register(chart2); err != nil {
 		t.Fatalf("Register sys2: %v", err)

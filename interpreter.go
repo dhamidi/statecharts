@@ -20,7 +20,6 @@ import (
 // concern, not a core-interpreter one.
 type interpretation struct {
 	chart             *Chart
-	datamodel         any
 	session           DatamodelSession
 	sessionID         SessionID // SCXML 5.10's _sessionid, bound for this session's lifetime
 	name              string    // SCXML 5.10's _name
@@ -92,10 +91,9 @@ type pendingSendRecord struct {
 	stop   func() bool
 }
 
-func newInterpretation(chart *Chart, datamodel any) *interpretation {
+func newInterpretation(chart *Chart) *interpretation {
 	return &interpretation{
 		chart:              chart,
-		datamodel:          datamodel,
 		configuration:      map[*compiledState]bool{},
 		historyValue:       map[*compiledState][]*compiledState{},
 		pending:            map[*pendingSendRecord]bool{},
@@ -461,7 +459,6 @@ func (ip *interpretation) execContext() ExecContext {
 	return ExecContext{
 		event:             ip.lastEvent,
 		hasEvent:          ip.hasLastEvent,
-		datamodel:         ip.datamodel,
 		sessionID:         string(ip.sessionID),
 		name:              ip.name,
 		platformVariables: ip.platformVariables,
@@ -506,12 +503,6 @@ func (ip *interpretation) runActionsWithContext(actions actionBlock, ec ExecCont
 func (ip *interpretation) executeAction(ec ExecContext, action compiledAction) error {
 	if action.op != nil {
 		return ip.executeOperation(ec, action.op)
-	}
-	if action.useModel {
-		return ip.executeModel(ec, action.model)
-	}
-	if action.callback != nil {
-		return callAction(action.callback, ec)
 	}
 	return nil
 }
@@ -682,11 +673,10 @@ func (ip *interpretation) runActionBlocks(blocks []actionBlock) {
 	}
 }
 
-// finalizeExecContext preserves the Go datamodel access available to
-// finalize content while rejecting the executable effects SCXML 6.5 bans.
-// Direct external I/O performed by arbitrary Go callbacks cannot be
-// intercepted; avoiding it in finalize callbacks is a responsibility of
-// the Go datamodel profile.
+// finalizeExecContext preserves the model execution environment while
+// rejecting the executable effects SCXML 6.5 bans. Direct external I/O
+// performed inside a registered model function cannot be intercepted;
+// avoiding it in finalize functions is an application responsibility.
 func (ip *interpretation) finalizeExecContext() ExecContext {
 	ec := ip.execContext()
 	forbidden := func(operation string) {
@@ -705,25 +695,6 @@ func (ip *interpretation) runFinalizeBlocks(blocks []actionBlock) {
 	}
 }
 
-func callAction(action ActionFunc, ec ExecContext) (err error) {
-	defer func() {
-		if value := recover(); value != nil {
-			err = fmt.Errorf("statecharts: action panicked: %v", value)
-		}
-	}()
-	return action(ec)
-}
-
-func (ip *interpretation) evaluateDone(done DoneDataFunc) (data Value) {
-	defer func() {
-		if value := recover(); value != nil {
-			ip.reportError(fmt.Errorf("statecharts: done data panicked: %v", value))
-			data = Value{}
-		}
-	}()
-	return done(ip.execContext())
-}
-
 func (ip *interpretation) evaluateStateDone(state *compiledState) Value {
 	if state.modelPayload != nil {
 		v, err := ip.evaluatePayload(ip.execContext(), state.modelPayload)
@@ -733,15 +704,7 @@ func (ip *interpretation) evaluateStateDone(state *compiledState) Value {
 		}
 		return v
 	}
-	if !state.hasModelDone {
-		return ip.evaluateDone(state.done)
-	}
-	value, err := ip.evaluateModelValue(ip.execContext(), state.modelDone)
-	if err != nil {
-		ip.reportError(err)
-		return Value{}
-	}
-	return value
+	return NullValue()
 }
 
 func (ip *interpretation) evaluateModelBoolean(ec ExecContext, expression CompiledExpression) (result bool, err error) {
@@ -1059,7 +1022,7 @@ func (ip *interpretation) enterState(s *compiledState, defaults []actionBlock) {
 	if s.parent == nil || s.parent == ip.chart.root {
 		// a top-level final state (root itself is Final, or its direct
 		// parent is the chart root) ends the machine.
-		if s.done != nil || s.hasModelDone {
+		if s.modelPayload != nil {
 			ip.result = ip.evaluateStateDone(s)
 		}
 		ip.completed = true
@@ -1069,7 +1032,7 @@ func (ip *interpretation) enterState(s *compiledState, defaults []actionBlock) {
 	parent := s.parent
 
 	var data Value
-	if s.done != nil || s.hasModelDone {
+	if s.modelPayload != nil {
 		data = ip.evaluateStateDone(s)
 	}
 	ip.enqueueInternal(Event{
@@ -1174,22 +1137,6 @@ func (ip *interpretation) beginInvoke(s *compiledState, spec *compiledInvoke) {
 
 func (ip *interpretation) evaluateInvokeRequest(spec *compiledInvoke, id Identifier, ec ExecContext, assignID bool) (InvokeRequest, bool) {
 	request := InvokeRequest{DefinitionID: spec.definitionID, ID: id, Type: spec.staticType, Source: spec.staticSource}
-	if !spec.declarative {
-		if assignID && spec.idLocation != nil {
-			if err := ip.assignIDLocation(spec.idLocation, id, "invoke"); err != nil {
-				ip.reportError(err)
-				return InvokeRequest{}, false
-			}
-		}
-		if spec.params != nil {
-			params, ok := ip.evaluateInvokeParams(spec.params, ec)
-			if !ok {
-				return InvokeRequest{}, false
-			}
-			request.Data = params.Clone()
-		}
-		return request, true
-	}
 	if assignID && spec.hasModelIDLocation {
 		if err := ip.assignModel(ec, spec.modelIDLocation, stringValue(string(id))); err != nil {
 			ip.reportError(fmt.Errorf("statecharts: invoke idlocation: %w", err))
@@ -1223,9 +1170,6 @@ func (ip *interpretation) evaluateInvokeRequest(spec *compiledInvoke, id Identif
 }
 
 func (ip *interpretation) evaluateInvokeResumeRequest(ri *runningInvoke, ec ExecContext) (InvokeRequest, bool) {
-	if !ri.spec.declarative {
-		return ip.evaluateInvokeRequest(ri.spec, ri.id, ec, false)
-	}
 	data, err := ip.evaluatePayload(ec, ri.spec.payload)
 	if err != nil {
 		ip.reportError(err)
@@ -1249,17 +1193,6 @@ func (ip *interpretation) invokeIDReserved(id Identifier) bool {
 		}
 	}
 	return false
-}
-
-func (ip *interpretation) evaluateInvokeParams(fn func(ExecContext) Value, ec ExecContext) (params Value, ok bool) {
-	ok = true
-	defer func() {
-		if value := recover(); value != nil {
-			ip.reportError(fmt.Errorf("statecharts: invoke params panicked: %v", value))
-			params, ok = Value{}, false
-		}
-	}()
-	return fn(ec), true
 }
 
 // applyInvokeSideEffects runs whichever of two per-invocation side effects
@@ -1410,19 +1343,7 @@ func (ip *interpretation) condMatches(t *compiledTransition) bool {
 		}
 		return matched
 	}
-	if t.cond == nil {
-		return true
-	}
-	matched := false
-	func() {
-		defer func() {
-			if value := recover(); value != nil {
-				ip.reportError(fmt.Errorf("statecharts: condition panicked: %v", value))
-			}
-		}()
-		matched = t.cond(ip.execContext())
-	}()
-	return matched
+	return true
 }
 
 func (ip *interpretation) selectTransitions(ev Event) []*compiledTransition {

@@ -1,551 +1,348 @@
 package statecharts
 
 import (
-	"context"
+	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
-
-func testStringValue(s string) Value {
-	v, err := StringValue(s)
-	if err != nil {
-		panic(err)
-	}
-	return v
-}
 
 type Door struct {
 	OpenCount int
 	Locked    bool
 }
 
-func TestBuildSimpleChart(t *testing.T) {
-	notLocked := Cond(func(d *Door, ec ExecContext) bool {
-		return !d.Locked
+func testStringValue(s string) Value {
+	value, err := StringValue(s)
+	if err != nil {
+		panic(err)
+	}
+	return value
+}
+
+func TestBuildGoChartDefinitionIsolationAndRoundTrip(t *testing.T) {
+	model := NewGoModel(func() *Door { return &Door{} })
+	notLocked, err := model.Condition("door-not-locked", "v1", func(d *Door, _ ExecContext, _ []Value) (bool, error) {
+		return !d.Locked, nil
 	})
-	recordOpen := Action(func(d *Door, ec ExecContext) error {
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordOpen, err := model.Action("record-door-open", "v1", func(d *Door, _ ExecContext, _ []Value) error {
 		d.OpenCount++
 		return nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	chart, err := Build(
-		Compound("door", "closed",
-			Children(
-				Atomic("closed",
-					On("open.request",
-						Target("open"),
-						If(notLocked),
-						Then(recordOpen),
-					),
-				),
-				Atomic("open",
-					On("close.request", Target("closed")),
-				),
-			),
-		),
-	)
+	root := Compound("door", "closed", Children(
+		Atomic("closed", On("open.request", Target("open"), If(notLocked.If()), Then(recordOpen.Do()))),
+		Atomic("open", On("close.request", Target("closed"))),
+	))
+	chart, err := Build(root, model, WithName("Door workflow"), WithRevisionSalt("door-v1"))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-
-	got := chart.States()
-	want := []Identifier{"door", "closed", "open"}
-	if len(got) != len(want) {
-		t.Fatalf("States() = %v, want %v", got, want)
+	if got, want := chart.States(), []Identifier{"door", "closed", "open"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("States = %v, want %v", got, want)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("States()[%d] = %q, want %q", i, got[i], want[i])
+	definition := chart.Definition()
+	definition.Root.Children[0].ID.Value = "mutated"
+	if got := chart.Definition().Root.Children[0].ID.Value; got != "closed" {
+		t.Fatalf("Definition was not deep copied: %q", got)
+	}
+	wire, err := json.Marshal(chart.Definition())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Definition
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	recompiled, err := Compile(decoded, model)
+	if err != nil {
+		t.Fatalf("Compile round trip: %v", err)
+	}
+	if !reflect.DeepEqual(recompiled.Definition(), chart.Definition()) {
+		t.Fatal("definition changed across JSON round trip")
+	}
+}
+
+func TestBuildStateKindsAndDefaultInitials(t *testing.T) {
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	chart, err := Build(Parallel("machine", Children(
+		Compound("motor", "", Children(Atomic("off"), Atomic("on"))),
+		Compound("light", "dark", Children(Atomic("dark"), Atomic("lit"), History("light.history", Shallow, "dark"))),
+	)), model)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if chart.root.kind != KindParallel || chart.byID["light.history"].historyKind != Shallow {
+		t.Fatalf("compiled kinds were not preserved")
+	}
+	instance, err := chart.NewInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	configuration := instance.Configuration()
+	if !containsID(configuration, "off") || !containsID(configuration, "dark") {
+		t.Fatalf("default configuration = %v", configuration)
+	}
+	if err := instance.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsID(ids []Identifier, wanted Identifier) bool {
+	for _, id := range ids {
+		if id == wanted {
+			return true
 		}
 	}
-
-	// document order must reflect declaration order, not lexical order.
-	if chart.byID["closed"].docOrder >= chart.byID["open"].docOrder {
-		t.Fatalf("expected 'closed' to precede 'open' in document order")
-	}
+	return false
 }
 
-func TestBuildParallelChart(t *testing.T) {
-	chart, err := Build(
-		Parallel("machine",
-			Children(
-				Compound("motor", "off",
-					Children(
-						Atomic("off", On("motor.start", Target("on"))),
-						Atomic("on", On("motor.stop", Target("off"))),
-					),
-				),
-				Compound("light", "dark",
-					Children(
-						Atomic("dark", On("light.on", Target("lit"))),
-						Atomic("lit", On("light.off", Target("dark"))),
-					),
-				),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	if chart.root.kind != KindParallel {
-		t.Fatalf("root kind = %v, want KindParallel", chart.root.kind)
-	}
-	if len(chart.root.children) != 2 {
-		t.Fatalf("root has %d children, want 2", len(chart.root.children))
-	}
-}
-
-func TestBuildHistoryChart(t *testing.T) {
-	chart, err := Build(
-		Compound("app", "running",
-			Children(
-				Compound("running", "step1",
-					Children(
-						Atomic("step1", On("next", Target("step2"))),
-						Atomic("step2", On("next", Target("step3"))),
-						Atomic("step3"),
-						History("running.hist", Shallow, "step1"),
-					),
-				),
-				Atomic("paused",
-					On("resume", Target("running.hist")),
-				),
-			),
-			On("pause", Target("paused")),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	hist, ok := chart.byID["running.hist"]
-	if !ok {
-		t.Fatalf("history state not found")
-	}
-	if hist.kind != KindHistory || hist.historyKind != Shallow {
-		t.Fatalf("history state kind/historyKind mismatch: %v/%v", hist.kind, hist.historyKind)
-	}
-	if len(hist.initial.target) != 1 || hist.initial.target[0] != "step1" {
-		t.Fatalf("history default target = %v, want [step1]", hist.initial.target)
-	}
-}
-
-func TestBuildDefaultTransitionsValidateMultiTargets(t *testing.T) {
-	valid := Compound("root", "left.a", WithInitial(Target("right.a")), Children(
-		Parallel("p", Children(
-			Compound("left", "left.a", Children(Atomic("left.a"))),
-			Compound("right", "right.a", Children(Atomic("right.a"))),
-		)),
-	))
-	chart, err := Build(valid)
-	if err != nil {
-		t.Fatalf("valid multi-target initial: %v", err)
-	}
-	ip := newInterpretation(chart, &struct{}{})
-	ip.start()
-	if !hasState(ip.activeStates(), "left.a") || !hasState(ip.activeStates(), "right.a") {
-		t.Fatalf("root initial state specification did not enter both targets: states=%v", ip.activeStates())
-	}
-
-	invalid := Compound("root", "a", WithInitial(Target("a")), Children(Atomic("a")))
-	if _, err := Build(invalid); err == nil {
-		t.Fatal("duplicate initial targets accepted")
-	}
-}
-
-func TestBuildDefaultsMissingInitialToFirstChild(t *testing.T) {
-	chart, err := Build(Compound("root", "", Children(
-		Compound("first", "", Children(Atomic("first.child"), Atomic("ignored"))),
-		Atomic("second"),
-	)))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	ip := newInterpretation(chart, nil)
-	ip.start()
-	if got := ip.activeStates(); !hasState(got, "first") || !hasState(got, "first.child") || hasState(got, "second") || hasState(got, "ignored") {
-		t.Fatalf("initial configuration = %v, want first and first.child only", got)
-	}
-}
-
-func TestBuildRejectsExecutableContentOnDocumentInitial(t *testing.T) {
-	chart := Compound("root", "a", WithInitial(Then(func(ExecContext) error { return nil })), Children(Atomic("a")))
-	if _, err := Build(chart); err == nil {
-		t.Fatal("document root accepted executable initial-transition content")
-	}
-}
-
-// SCXML 3.11 requires only that a state's 'initial' target be a descendant
-// of that state, not a direct child -- entry fills in every intervening
-// ancestor. A grandchild target (or deeper) must Build successfully and
-// enter correctly.
-func TestBuildCompoundInitialCanTargetDeepDescendant(t *testing.T) {
-	chart, err := Build(
-		Compound("root", "grandchild",
-			Children(
-				Compound("child", "grandchild",
-					Children(
-						Atomic("grandchild"),
-						Atomic("sibling"),
-					),
-				),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-
-	ip := newInterpretation(chart, nil)
-	ip.start()
-	got := ip.activeStates()
-	if !hasState(got, "child") || !hasState(got, "grandchild") {
-		t.Fatalf("initial configuration = %v, want to contain 'child' and 'grandchild'", got)
-	}
-	if hasState(got, "sibling") {
-		t.Fatalf("initial configuration = %v, must not contain 'sibling'", got)
-	}
-}
-
-func TestBuildValidationErrors(t *testing.T) {
-	invoke := Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil })
-	cases := []struct {
-		name string
-		spec StateSpec
-	}{
-		{
-			name: "duplicate ids",
-			spec: Compound("root", "a", Children(
-				Atomic("a"),
-				Atomic("a"),
-			)),
-		},
-		{
-			name: "compound with no children",
-			spec: Compound("root", "a"),
-		},
-		{
-			name: "unresolved initial",
-			spec: Compound("root", "missing", Children(Atomic("a"))),
-		},
-		{
-			name: "unresolved transition target",
-			spec: Compound("root", "a", Children(
-				Atomic("a", On("go", Target("nowhere"))),
-			)),
-		},
-		{
-			name: "initial targets a state outside its own subtree",
-			spec: Compound("root", "a", Children(
-				Compound("a", "b.child", Children(Atomic("a.child"))),
-				Compound("b", "b.child", Children(Atomic("b.child"))),
-			)),
-		},
-		{
-			name: "atomic with children (impossible via constructor, but final with children is)",
-			spec: StateSpec{
-				ID:   "root",
-				Kind: KindFinal,
-				Children: []StateSpec{
-					Atomic("a"),
-				},
-			},
-		},
-		{
-			name: "history with unresolved default target",
-			spec: Compound("root", "a", Children(
-				Atomic("a"),
-				History("h", Shallow, "missing"),
-			)),
-		},
-		{
-			name: "transition targets siblings in one compound state",
-			spec: Compound("root", "a", Children(
-				Atomic("a", On("go", Target("a", "b"))),
-				Atomic("b"),
-			)),
-		},
-		{
-			name: "transition targets an ancestor and its descendant",
-			spec: Compound("root", "parent", Children(
-				Compound("parent", "child", Children(
-					Atomic("child", On("go", Target("parent", "child"))),
-				)),
-			)),
-		},
-		{
-			name: "shallow history default is not an immediate child",
-			spec: Compound("root", "parent", Children(
-				Compound("parent", "nested", Children(
-					Compound("nested", "leaf", Children(Atomic("leaf"))),
-					History("history", Shallow, "leaf"),
-				)),
-			)),
-		},
-		{
-			name: "history default is outside parent subtree",
-			spec: Compound("root", "parent", Children(
-				Compound("parent", "inside", Children(
-					Atomic("inside"),
-					History("history", Deep, "outside"),
-				)),
-				Atomic("outside"),
-			)),
-		},
-		{
-			name: "history default cycle",
-			spec: Compound("root", "active", Children(
-				Atomic("active"),
-				History("h1", Shallow, "h2"),
-				History("h2", Shallow, "h1"),
-			)),
-		},
-		{
-			name: "compound has only history pseudo-state children",
-			spec: Compound("root", "history", Children(
-				History("history", Shallow, "history"),
-			)),
-		},
-		{
-			name: "parallel has final child",
-			spec: Compound("root", "parallel", Children(
-				Parallel("parallel", Children(Final("done"))),
-			)),
-		},
-		{
-			name: "final has transition",
-			spec: Compound("root", "done", Children(
-				Final("done", On("again", Target("other"))),
-				Atomic("other"),
-			)),
-		},
-		{
-			name: "final has invoke",
-			spec: Compound("root", "done", Children(
-				Final("done", invoke),
-			)),
-		},
-		{
-			name: "done data is attached to non-final state",
-			spec: Atomic("root", WithDone(func(ExecContext) Value { return testStringValue("unused") })),
-		},
-		{
-			name: "transition has no event condition or target",
-			spec: Atomic("root", Eventless()),
-		},
-		{
-			name: "invalid state identifier",
-			spec: Atomic("bad id"),
-		},
-		{
-			name: "invalid event descriptor",
-			spec: Atomic("root", On("bad..event", Target("root"))),
-		},
-		{
-			name: "invalid state kind",
-			spec: StateSpec{ID: "root", Kind: StateKind(99)},
-		},
-		{
-			name: "invalid history kind",
-			spec: Compound("root", "active", Children(
-				Atomic("active"),
-				History("history", HistoryKind(99), "active"),
-			)),
-		},
-		{
-			name: "duplicate explicit invoke ids",
-			spec: Compound("root", "parallel", Children(
-				Parallel("parallel", Children(
-					Atomic("a", Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }, WithInvokeID("service"))),
-					Atomic("b", Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }, WithInvokeID("service"))),
-				)),
-			)),
-		},
-		{
-			name: "compound document root has onentry that would be ignored",
-			spec: Compound("root", "active", OnEntry(func(ExecContext) error { return nil }), Children(Atomic("active"))),
-		},
-		{
-			name: "compound document root has onexit that would be ignored",
-			spec: Compound("root", "active", OnExit(func(ExecContext) error { return nil }), Children(Atomic("active"))),
-		},
-		{
-			name: "compound document root has invoke that would be ignored",
-			spec: Compound("root", "active", invoke, Children(Atomic("active"))),
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if _, err := Build(c.spec); err == nil {
-				t.Fatalf("Build(%s): expected error, got nil", c.name)
+func TestBuildRejectsInvalidDefinitions(t *testing.T) {
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	for name, root := range map[string]StateDefinition{
+		"duplicate IDs":  Compound("root", "a", Children(Atomic("a"), Atomic("a"))),
+		"missing target": Compound("root", "a", Children(Atomic("a", On("go", Target("missing"))))),
+		"empty compound": Compound("root", "a"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Build(root, model); err == nil {
+				t.Fatal("Build succeeded")
 			}
 		})
 	}
 }
 
-func TestBuildAcceptsLegalTargetsInSeparateParallelRegions(t *testing.T) {
-	_, err := Build(
-		Compound("root", "parallel",
-			Children(
-				Parallel("parallel",
-					Children(
-						Compound("left", "left.a", Children(
-							Atomic("left.a", On("go", Target("left.b", "right.b"))),
-							Atomic("left.b"),
-						)),
-						Compound("right", "right.a", Children(
-							Atomic("right.a"),
-							Atomic("right.b"),
-						)),
-					),
-				),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
+func TestBuildRejectsNilDatamodel(t *testing.T) {
+	if _, err := Build(Atomic("root"), nil); err == nil || !strings.Contains(err.Error(), "nil datamodel") {
+		t.Fatalf("Build nil datamodel error = %v", err)
 	}
 }
 
-func TestBuildPreservesDirectActionsAddedAfterBuilderOptions(t *testing.T) {
-	noop := func(ExecContext) error { return nil }
-	spec := Atomic("root",
-		OnEntry(noop),
-		On("go", Then(noop)),
-		Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }, WithFinalize(noop)),
+// This is deliberately a single, dense authoring example: besides making the
+// expected document order obvious, it catches builder options which silently
+// fail to survive normalization.
+func TestBuildCanonicalBuilderSurface(t *testing.T) {
+	model := NewGoModel(func() *Door { return &Door{} })
+	guard, err := model.Condition("unlocked", "v1", func(d *Door, _ ExecContext, _ []Value) (bool, error) { return !d.Locked, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := model.Action("count", "v2", func(d *Door, _ ExecContext, _ []Value) error { d.OpenCount++; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, two := GoLiteral(Int64Value(1)), GoLiteral(Int64Value(2))
+	location := GoData("seed")
+	param := ParamDefinition{Name: "p", Expr: &one}
+	data := []DataDefinition{{ID: "seed", Expr: &two}}
+	root := Compound("root", "", WithInitial(Target("work")),
+		Children(
+			Atomic("work",
+				OnEntry(Raise("entered", one), LogValue("entry", two)), OnExit(CancelSend("timer")),
+				On("go next", Target("regions"), If(guard.If()), Then(action.Do()), AsInternal()),
+				Eventless(Target("done"), If(guard.If())),
+				Invoke("worker", "static", WithInvokeDefinitionID("job-def"), WithInvokeID("job"), WithInvokeParams(param), WithFinalize(action.Do()), WithAutoForward()),
+				Invoke("", "", WithInvokeDefinitionID("dynamic-def"), WithInvokeIDLocation(location), WithInvokeTypeExpression(one), WithInvokeSourceExpression(two), WithInvokeContent(two)),
+				OnEntry(Send("tick", SendTarget("#_internal"), SendType("scxml"), SendID("timer"), SendDelay(25*time.Millisecond), SendParams(param)),
+					Send("payload", SendIDLocation(location), SendContent(one)))),
+			Parallel("regions", Children(
+				Compound("left", "idle", Children(Atomic("idle"), Final("left-done", WithDone(one)))),
+				Compound("right", "", WithInitial(Target("ready"), Then(action.Do())), Children(Atomic("ready"), History("remember", Deep, "ready"))),
+			)),
+			Final("done", WithDoneParams(param)),
+		),
 	)
-	spec.OnEntry = append(spec.OnEntry, noop)
-	spec.Transitions[0].Actions = append(spec.Transitions[0].Actions, noop)
-	spec.Invokes[0].Finalize = append(spec.Invokes[0].Finalize, noop)
-
-	chart, err := Build(spec)
+	chart, err := Build(root, model, WithName("Builder chart"), WithRevisionSalt("rev-7"), WithDataBinding(DataBindingLate), WithData(data...))
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	countActions := func(blocks []actionBlock) int {
-		count := 0
-		for _, block := range blocks {
-			count += len(block)
+	d := chart.Definition()
+	if got, want := []any{d.ID, d.Name, d.Datamodel, d.RevisionSalt, d.DataBinding}, []any{Identifier("root"), "Builder chart", Identifier("go"), "rev-7", DataBindingLate}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("header = %#v, want %#v", got, want)
+	}
+	if got, want := chart.States(), []Identifier{"root", "work", "regions", "left", "idle", "left-done", "right", "ready", "remember", "done"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("state order = %v, want %v", got, want)
+	}
+	if d.Root.Kind != KindCompound || !reflect.DeepEqual(d.Root.Initial.Targets, []Identifier{"work"}) || d.Root.Initial.Type != TransitionExternal || len(d.Root.Initial.Actions) != 0 {
+		t.Fatalf("root initial = %#v", d.Root.Initial)
+	}
+	work := d.Root.Children[0]
+	if work.Kind != KindAtomic || len(work.Transitions) != 2 || !reflect.DeepEqual(work.Transitions[0].Events, []Identifier{"go", "next"}) || work.Transitions[0].Type != TransitionInternal || work.Transitions[0].Condition == nil || len(work.Transitions[0].Actions) != 1 {
+		t.Fatalf("work transitions = %#v", work.Transitions)
+	}
+	if len(work.Invokes) != 2 || work.Invokes[0].DefinitionID != "job-def" || work.Invokes[0].ID != "job" || len(work.Invokes[0].Params) != 1 || !work.Invokes[0].AutoForward || len(work.Invokes[0].Finalize) != 1 || work.Invokes[1].IDLocation == nil || work.Invokes[1].TypeExpr == nil || work.Invokes[1].SrcExpr == nil || work.Invokes[1].Content == nil {
+		t.Fatalf("invokes = %#v", work.Invokes)
+	}
+	if len(work.OnEntry) != 2 || len(work.OnEntry[0]) != 2 || work.OnEntry[0][0].Kind != ExecutableRaise || work.OnEntry[0][1].Kind != ExecutableLog || work.OnEntry[1][0].Kind != ExecutableSend || work.OnEntry[1][1].Send.IDLocation == nil || len(work.OnExit) != 1 || work.OnExit[0][0].Kind != ExecutableCancel {
+		t.Fatalf("work executable blocks = %#v / %#v", work.OnEntry, work.OnExit)
+	}
+	send := work.OnEntry[1][0].Send
+	if send.Target != "#_internal" || send.Type != "scxml" || send.ID != "timer" || send.Delay != "25ms" || len(send.Params) != 1 {
+		t.Fatalf("send = %#v", send)
+	}
+	regions := d.Root.Children[1]
+	if regions.Kind != KindParallel || regions.Children[0].Initial.Targets[0] != "idle" || regions.Children[1].Initial.Targets[0] != "ready" || len(regions.Children[1].Initial.Actions) != 1 || regions.Children[1].Children[1].History != Deep || regions.Children[1].Children[1].Initial.Targets[0] != "ready" {
+		t.Fatalf("normalized regions = %#v", regions)
+	}
+	if d.Root.Children[2].DoneData == nil || len(d.Root.Children[2].DoneData.Params) != 1 || regions.Children[0].Children[1].DoneData.Content == nil || len(d.Data) != 1 {
+		t.Fatal("done-data or document data missing")
+	}
+}
+
+func TestBuildOwnsInputsAndDefinitionsDeeply(t *testing.T) {
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	nested := ListValue([]Value{Int64Value(1)})
+	expr := GoLiteral(nested)
+	targets := []Identifier{"done"}
+	params := []ParamDefinition{{Name: "result", Expr: &expr}}
+	root := Compound("root", "start", Children(Atomic("start", On("go", Target(targets...), Then(Raise("raised", expr)))), Final("done", WithDoneParams(params...))))
+	chart, err := Build(root, model, WithData(DataDefinition{ID: "input", Expr: &expr}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := chart.Definition()
+	targets[0] = "start"
+	params[0].Name = "changed"
+	expr.Data = Int64Value(99)
+	root.Children[0].Transitions[0].Targets[0] = "start"
+	if got := chart.Definition(); !reflect.DeepEqual(got, want) {
+		t.Fatal("caller mutation changed chart definition")
+	}
+	returned := chart.Definition()
+	returned.Root.Children[0].Transitions[0].Targets[0] = "start"
+	returned.Root.Children[0].Transitions[0].Actions[0][0].Raise.Data.Data = Int64Value(88)
+	returned.Root.Children[1].DoneData.Params[0].Expr.Data = Int64Value(77)
+	returned.Data[0].Expr.Data = Int64Value(66)
+	if got := chart.Definition(); !reflect.DeepEqual(got, want) {
+		t.Fatal("nested mutation of Definition changed chart")
+	}
+}
+
+func TestBuildGeneratesStableUniqueInvokeDefinitionIDs(t *testing.T) {
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	chart, err := Build(Atomic("root",
+		Invoke("worker", "first"),
+		Invoke("worker", "second"),
+	), model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := chart.Definition()
+	invokes := definition.Root.Invokes
+	if len(invokes) != 2 || invokes[0].DefinitionID == "" || invokes[1].DefinitionID == "" || invokes[0].DefinitionID == invokes[1].DefinitionID {
+		t.Fatalf("generated invoke definition IDs = %#v", invokes)
+	}
+	definition.Root.Invokes[1].DefinitionID = invokes[0].DefinitionID
+	var definitionErr *DefinitionError
+	if err := definition.Validate(); !errors.As(err, &definitionErr) || !strings.Contains(definitionErr.Path, "definitionId") {
+		t.Fatalf("duplicate invoke definition ID error = %T %v", err, err)
+	}
+}
+
+func TestBuildJSONCompileRuntimeParity(t *testing.T) {
+	type flow struct{ Trace []string }
+	model := NewGoModel(func() *flow { return &flow{} })
+	guard, _ := model.Condition("yes", "v1", func(*flow, ExecContext, []Value) (bool, error) { return true, nil })
+	mark, _ := model.Action("mark", "v1", func(d *flow, _ ExecContext, _ []Value) error { d.Trace = append(d.Trace, "mark"); return nil })
+	root := Compound("flow", "waiting", Children(Atomic("waiting", On("go", Target("done"), If(guard.If()), Then(mark.Do()))), Final("done", WithDone(GoLiteral(Int64Value(42))))))
+	built, err := Build(root, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, _ := json.Marshal(built.Definition())
+	var decoded Definition
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := Compile(decoded, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(built.Definition(), compiled.Definition()) {
+		t.Fatal("canonical definitions differ")
+	}
+	type outcome struct {
+		configuration []Identifier
+		trace         []string
+		result        Value
+	}
+	var outcomes []outcome
+	for _, chart := range []*Chart{built, compiled} {
+		in, err := chart.NewInstance()
+		if err != nil {
+			t.Fatal(err)
 		}
-		return count
+		if err := in.Start(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := in.Send(t.Context(), Event{Name: "go"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := in.Wait(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		trace := in.session.(*goSession[flow]).data.Trace
+		if !reflect.DeepEqual(trace, []string{"mark"}) {
+			t.Fatalf("trace = %v", trace)
+		}
+		result, err := in.Result()
+		if err != nil || !result.Equal(Int64Value(42)) {
+			t.Fatalf("result = %#v, %v", result, err)
+		}
+		outcomes = append(outcomes, outcome{in.Configuration(), append([]string(nil), trace...), result})
 	}
-	if got := countActions(chart.root.onEntry); got != 2 {
-		t.Fatalf("compiled onentry action count = %d, want 2", got)
-	}
-	if got := countActions(chart.root.transitions[0].actions); got != 2 {
-		t.Fatalf("compiled transition action count = %d, want 2", got)
-	}
-	if got := countActions(chart.root.invokes[0].finalize); got != 2 {
-		t.Fatalf("compiled finalize action count = %d, want 2", got)
-	}
-}
-
-func TestChartIDReturnsRootStateID(t *testing.T) {
-	chart, err := Build(
-		Compound("door", "closed",
-			Children(
-				Atomic("closed", On("open.request", Target("open"))),
-				Atomic("open"),
-			),
-		),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	if chart.ID() != "door" {
-		t.Fatalf("ID() = %q, want %q", chart.ID(), "door")
+	if !reflect.DeepEqual(outcomes[0], outcomes[1]) {
+		t.Fatalf("runtime outcomes differ: %#v", outcomes)
 	}
 }
 
-func TestChartNewDatamodelRoundTrips(t *testing.T) {
-	chart, err := Build(
-		Atomic("solo"),
-		WithNewDatamodel(func() any { return &Door{OpenCount: 42} }),
-	)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
+func TestBuildRejectsStructuralEdgeCases(t *testing.T) {
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	badID := Atomic("bad id")
+	badEvent := Atomic("a", On("bad event!", Target("a")))
+	badKind := Atomic("a")
+	badKind.Kind = StateKind(99)
+	badHistory := History("h", HistoryKind(99), "a")
+	cases := map[string]StateDefinition{
+		"initial outside subtree": Compound("r", "outside", Children(Compound("box", "outside", Children(Atomic("in"))), Atomic("outside"))),
+		"atomic children":         Atomic("r", Children(Atomic("a"))), "final children": Final("r", Children(Atomic("a"))),
+		"unresolved history default":  Compound("r", "a", Children(Atomic("a"), History("h", Shallow, "missing"))),
+		"cyclic history default":      Compound("r", "a", Children(Atomic("a"), History("h1", Deep, "h2"), History("h2", Deep, "h1"))),
+		"shallow non-child":           Compound("r", "box", Children(Compound("box", "leaf", Children(Atomic("leaf"))), History("h", Shallow, "leaf"))),
+		"history outside parent":      Compound("r", "box", Children(Compound("box", "leaf", Children(Atomic("leaf"), History("h", Deep, "outside"))), Atomic("outside"))),
+		"sibling multi-target":        Compound("r", "a", Children(Atomic("a", On("go", Target("a", "b"))), Atomic("b"))),
+		"ancestor descendant targets": Compound("r", "box", Children(Compound("box", "leaf", Children(Atomic("leaf", On("go", Target("box", "leaf"))))))),
+		"parallel final child":        Parallel("r", Children(Final("done"))),
+		"final transition":            Final("r", On("go", Target("r"))), "final invoke": Final("r", Invoke("x", "y")),
+		"empty eventless": Compound("r", "a", Children(Atomic("a", Eventless()))),
+		"invalid state":   badID, "invalid event": Compound("r", "a", Children(badEvent)), "invalid kind": badKind,
+		"invalid history kind": Compound("r", "a", Children(Atomic("a"), badHistory)),
+		"root onexit":          Compound("r", "a", OnExit(Raise("x")), Children(Atomic("a"))), "root invoke": Compound("r", "a", Invoke("x", "y"), Children(Atomic("a"))),
+		"root initial executable": Compound("r", "a", WithInitial(Then(Raise("x"))), Children(Atomic("a"))),
+		"invoke id and location":  Compound("r", "a", Children(Atomic("a", Invoke("x", "y", WithInvokeID("i"), WithInvokeIDLocation(GoLiteral(Int64Value(1))))))),
+		"duplicate targets":       Compound("r", "a", Children(Atomic("a", On("go", Target("a", "a"))))),
 	}
-
-	v, ok := chart.NewDatamodel()
-	if !ok {
-		t.Fatalf("NewDatamodel() ok = false, want true")
-	}
-	d, ok := v.(*Door)
-	if !ok {
-		t.Fatalf("NewDatamodel() = %T, want *Door", v)
-	}
-	if d.OpenCount != 42 {
-		t.Fatalf("NewDatamodel().OpenCount = %d, want 42", d.OpenCount)
-	}
-
-	// Each call produces a fresh value, not a shared one.
-	v2, _ := chart.NewDatamodel()
-	d2 := v2.(*Door)
-	d2.OpenCount = 99
-	if d.OpenCount != 42 {
-		t.Fatalf("NewDatamodel() values are not independent: mutating one changed the other")
-	}
-}
-
-func TestChartWithoutNewDatamodelReportsNotOK(t *testing.T) {
-	chart, err := Build(Atomic("solo"))
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	if _, ok := chart.NewDatamodel(); ok {
-		t.Fatalf("NewDatamodel() ok = true, want false (no WithNewDatamodel given)")
-	}
-}
-
-func TestBuildAssignsDeterministicCollisionFreeStateIDs(t *testing.T) {
-	spec := Compound("", "", Children(Atomic("state.1"), Atomic(""), Final("")))
-	a, err := Build(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := Build(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []Identifier{"state.2", "state.1", "state.3", "state.4"}
-	if !reflect.DeepEqual(a.States(), want) {
-		t.Fatalf("States = %v, want %v", a.States(), want)
-	}
-	if !reflect.DeepEqual(a.States(), b.States()) {
-		t.Fatalf("rebuild IDs differ: %v / %v", a.States(), b.States())
-	}
-	if a.ID() == "" {
-		t.Fatal("Chart.ID is empty")
-	}
-	if spec.ID != "" || spec.Children[1].ID != "" || spec.Children[2].ID != "" {
-		t.Fatalf("Build mutated its input StateSpec: root=%q children=%q/%q", spec.ID, spec.Children[1].ID, spec.Children[2].ID)
-	}
-}
-
-func TestChartNameIsIndependentOfRootID(t *testing.T) {
-	c, err := Build(Atomic("root"), WithName("document"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.ID() != "root" || c.Name() != "document" {
-		t.Fatalf("ID/Name = %q/%q", c.ID(), c.Name())
-	}
-	unnamed, err := Build(Atomic("root"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if unnamed.Name() != "" {
-		t.Fatalf("default Name = %q", unnamed.Name())
-	}
-}
-
-func TestBuildRejectsInvokeIDWithIDLocation(t *testing.T) {
-	service := func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }
-	_, err := Build(Atomic("root", Invoke(service,
-		WithInvokeID("service"),
-		WithInvokeIDLocation(func(ExecContext, Identifier) error { return nil }),
-	)))
-	if err == nil {
-		t.Fatal("Build accepted invoke id together with idlocation")
+	for name, root := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Build(root, model)
+			if err == nil {
+				t.Fatal("Build succeeded")
+			}
+			var de *DefinitionError
+			if !errors.As(err, &de) {
+				t.Fatalf("Build error = %T %v, want *DefinitionError", err, err)
+			}
+		})
 	}
 }

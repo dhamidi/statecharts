@@ -31,7 +31,7 @@ func Compile(definition Definition, model Datamodel) (*Chart, error) {
 	}
 	c := &Chart{
 		byID: map[Identifier]*compiledState{}, name: d.Name, program: program,
-		definition: &d, data: globalData, dataBinding: d.DataBinding,
+		version: d.RevisionSalt, definition: d, data: globalData, dataBinding: d.DataBinding,
 		invokesByDefinitionID: map[Identifier]*compiledInvoke{},
 	}
 	order := 0
@@ -40,9 +40,6 @@ func Compile(definition Definition, model Datamodel) (*Chart, error) {
 		return nil, err
 	}
 	c.root = root
-	if err := c.validateReferences(); err != nil {
-		return nil, err
-	}
 	return c, nil
 }
 
@@ -65,7 +62,6 @@ func compileDefinitionState(c *Chart, s *StateDefinition, parent *compiledState,
 		if cs.modelPayload, err = compilePayload(s.DoneData.Params, s.DoneData.Content, p, path+".doneData"); err != nil {
 			return nil, err
 		}
-		cs.hasModelDone = true
 	}
 	if s.Initial != nil {
 		cs.initial, err = compileDefinitionTransition(s.Initial, cs, p, path+".initial")
@@ -106,7 +102,6 @@ func compileDefinitionInvoke(invoke *InvokeDefinition, owner *compiledState, p D
 		staticType:   canonicalInvokeType(Identifier(invoke.Type)),
 		staticSource: invoke.Src,
 		autoForward:  invoke.AutoForward,
-		declarative:  true,
 	}
 	var err error
 	if invoke.IDLocation != nil {
