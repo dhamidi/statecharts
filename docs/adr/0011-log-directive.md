@@ -48,18 +48,17 @@ dispatch, and stdout is not an external session.
 
 ## Decision
 
-**`ExecContext` gains a fourth primitive, `Log(label string, data any)`,
+**`ExecContext` gains a fourth primitive, `Log(label string, data Value)`,
 matching the existing three primitives' shape exactly.** A `log func(label
-string, data any)` closure field is added to `ExecContext` alongside
+string, data Value)` closure field is added to `ExecContext` alongside
 `raise`, `send`, and `cancel`; `Log` calls it if non-nil and is a silent
 no-op otherwise, the same posture `Raise`, `Send`, and `Cancel` already
 have for a bare `ExecContext{}` with no owning `interpretation`. The
-signature takes a label plus an arbitrary `data any`, mirroring `<log>`'s
-own label-plus-expr shape rather than collapsing both into one pre-formatted
-string: `Event.Data` is already `any` throughout this codebase precisely so
-callers hand over a structured Go value and let whatever's on the other end
-of the seam decide how to render it, and a `Logger` is exactly such a
-seam. Collapsing to a single `string` parameter would force every call site
+signature takes a label plus canonical `Value`, mirroring `<log>`'s own
+label-plus-expr shape rather than collapsing both into one pre-formatted
+string. `Event.Data` and logger data share that syntax-neutral representation,
+so callers hand over structured data and let whatever is on the other end of
+the seam decide how to render it. Collapsing to a single `string` parameter would force every call site
 to run its own `fmt.Sprintf` before handing the result off, which is the
 formatting decision a `Logger` implementation exists to make instead. `Log`
 is wired up at the same `execContext()` construction site as the other
@@ -70,7 +69,7 @@ three (interpreter.go), from a new `ip.doLog` method on `*interpretation`.
 
 ```go
 type Logger interface {
-	Log(label string, data any)
+	Log(label string, data Value)
 }
 ```
 
@@ -93,11 +92,11 @@ wraps an `io.Writer` and formats each call as a single line:
 type WriterLogger struct{ w io.Writer }
 
 func NewWriterLogger(w io.Writer) *WriterLogger
-func (l *WriterLogger) Log(label string, data any)
+func (l *WriterLogger) Log(label string, data Value)
 ```
 
 `greet`'s `fmt.Println("alice received", ev.Name, "from", ev.Origin)`
-becomes `ec.Log("received", ev)` inside the action, plus one
+becomes `ec.Log("received", ev.Data)` inside the action, plus one
 `statecharts.WithLogger(statecharts.NewWriterLogger(os.Stdout))` at the call
 site that builds the `Instance` — printing moves from being baked into the
 chart's own logic to being a property of how that particular `Instance` was

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1114,6 +1115,7 @@ func (p *registeredIOProcessor) IOProcessors() []statecharts.IOProcessorInfo {
 
 func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T) {
 	ctx := context.Background()
+	hello := mustStringValue(t, "hello")
 	var localDeliveries int
 	receiver, err := statecharts.Build(
 		statecharts.Atomic("typed-receiver", statecharts.On("frame", statecharts.Then(
@@ -1128,7 +1130,7 @@ func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T
 	}
 	sender, err := statecharts.Build(
 		statecharts.Atomic("typed-sender", statecharts.On("go", statecharts.Then(
-			statecharts.SendEvent("frame", statecharts.SendOptions{Target: "output", Type: "browser", Data: "hello"}),
+			statecharts.SendEvent("frame", statecharts.SendOptions{Target: "output", Type: "browser", Data: hello}),
 		))),
 		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
@@ -1156,7 +1158,7 @@ func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T
 	if len(processor.requests) != 1 {
 		t.Fatalf("registered IOProcessor received %d requests, want 1", len(processor.requests))
 	}
-	if got := processor.requests[0]; got.Type != "browser" || got.Target != "output" || got.Event != "frame" || got.Data != "hello" {
+	if got := processor.requests[0]; got.Type != "browser" || got.Target != "output" || got.Event != "frame" || !got.Data.Equal(hello) {
 		t.Fatalf("registered IOProcessor request = %#v, want browser frame to output", got)
 	}
 	if localDeliveries != 0 {
@@ -1168,15 +1170,18 @@ func TestFallbackRoutesRegisteredIOProcessorTypeInsteadOfLocalActor(t *testing.T
 }
 
 func TestActorDeliveryIsolatesMutablePayloadAndUsesSCXMLOriginType(t *testing.T) {
-	type payload struct{ Values map[string]int }
 	ctx := context.Background()
-	original := &payload{Values: map[string]int{"count": 1}}
+	original := map[string]statecharts.Value{"count": statecharts.Int64Value(1)}
+	payload := mustMapValue(t, original)
 	received := make(chan statecharts.Event, 1)
 	receiver, err := statecharts.Build(
 		statecharts.Atomic("payload-receiver", statecharts.On("payload", statecharts.Then(func(ec statecharts.ExecContext) error {
 			ev, _ := ec.Event()
-			got := ev.Data.(*payload)
-			got.Values["count"] = 9
+			got, ok := ev.Data.AsMap()
+			if !ok {
+				return fmt.Errorf("payload data is not a map: %#v", ev.Data)
+			}
+			got["count"] = statecharts.Int64Value(9)
 			received <- ev
 			return nil
 		}))),
@@ -1185,7 +1190,7 @@ func TestActorDeliveryIsolatesMutablePayloadAndUsesSCXMLOriginType(t *testing.T)
 		t.Fatalf("Build receiver: %v", err)
 	}
 	sender, err := statecharts.Build(
-		statecharts.Atomic("payload-sender", statecharts.OnEntry(statecharts.SendEvent("payload", statecharts.SendOptions{Target: "receiver", Data: original}))),
+		statecharts.Atomic("payload-sender", statecharts.OnEntry(statecharts.SendEvent("payload", statecharts.SendOptions{Target: "receiver", Data: payload}))),
 		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
 	if err != nil {
 		t.Fatalf("Build sender: %v", err)
@@ -1211,7 +1216,7 @@ func TestActorDeliveryIsolatesMutablePayloadAndUsesSCXMLOriginType(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for actor payload")
 	}
-	if original.Values["count"] != 1 {
+	if !original["count"].Equal(statecharts.Int64Value(1)) {
 		t.Fatalf("sender payload was mutated through receiver: %#v", original)
 	}
 	if err := sys.Stop(ctx); err != nil {
@@ -1389,7 +1394,15 @@ func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
 	var receiverModels []*orderModel
 	record := statecharts.Action(func(d *orderModel, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		n, _ := ev.Data.(int)
+		nText, ok := ev.Data.AsNumber()
+		if !ok {
+			return fmt.Errorf("item data is not a number: %#v", ev.Data)
+		}
+		number, err := strconv.ParseFloat(nText, 64)
+		if err != nil {
+			return fmt.Errorf("parse item data %q: %w", nText, err)
+		}
+		n := int(number)
 		d.mu.Lock()
 		d.order = append(d.order, n)
 		d.mu.Unlock()
@@ -1407,7 +1420,7 @@ func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
 	}
 	send := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
 		for i := 0; i < messages; i++ {
-			ec.Send("item", statecharts.SendOptions{Target: "receiver", Data: i})
+			ec.Send("item", statecharts.SendOptions{Target: "receiver", Data: statecharts.Int64Value(int64(i))})
 		}
 		return nil
 	})

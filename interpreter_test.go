@@ -567,10 +567,10 @@ func TestInterpreterActionErrorBecomesExecutionErrorEvent(t *testing.T) {
 	boom := errors.New("boom")
 	failing := Action(func(d *Door, ec ExecContext) error { return boom })
 
-	var gotErr error
+	var gotErr string
 	recordErr := Action(func(d *Door, ec ExecContext) error {
 		ev, _ := ec.Event()
-		gotErr, _ = ev.Data.(error)
+		_, gotErr, _ = PlatformErrorDetails(ev.Data)
 		return nil
 	})
 
@@ -596,7 +596,7 @@ func TestInterpreterActionErrorBecomesExecutionErrorEvent(t *testing.T) {
 	if got := ip.activeStates(); !hasState(got, "b") {
 		t.Fatalf("configuration = %v, want to contain 'b' after error.execution transition", got)
 	}
-	if gotErr != boom {
+	if gotErr != boom.Error() {
 		t.Fatalf("error.execution Data = %v, want %v", gotErr, boom)
 	}
 }
@@ -779,7 +779,7 @@ func TestInterpreterDoneDataPanicBecomesExecutionError(t *testing.T) {
 			Children(
 				Compound("parent", "working", Children(
 					Atomic("working", On("finish", Target("done"))),
-					Final("done", WithDone(func(ExecContext) any { panic("boom") })),
+					Final("done", WithDone(func(ExecContext) Value { panic("boom") })),
 				)),
 				Atomic("recovered"),
 			),

@@ -39,7 +39,7 @@ type InvokeIO struct {
 // invoking chart's external queue, mirroring SCXML 6.4.3; a non-nil error
 // instead reports error.communication on the internal queue. Neither event
 // is generated if ctx was already cancelled by the time InvokeFunc returns.
-type InvokeFunc func(ctx context.Context, params any, io InvokeIO) (data any, err error)
+type InvokeFunc func(ctx context.Context, params Value, io InvokeIO) (data Value, err error)
 
 // InvokeResumeFunc reattaches to a possibly-still-running invocation after
 // Rehydrate, instead of starting a fresh one via Start. id is the
@@ -62,14 +62,14 @@ type InvokeFunc func(ctx context.Context, params any, io InvokeIO) (data any, er
 // immediately (the work finished while nothing was watching it), and
 // blocking on ctx or io.Incoming continues the invocation exactly as if it
 // had never stopped.
-type InvokeResumeFunc func(ctx context.Context, id Identifier, params any, io InvokeIO) (data any, err error)
+type InvokeResumeFunc func(ctx context.Context, id Identifier, params Value, io InvokeIO) (data Value, err error)
 
 // InvokeSpec is the uncompiled description of one <invoke> attached to a
 // state, built via Invoke and InvokeOptions.
 type InvokeSpec struct {
 	ID             Identifier // empty = auto-generated ("<stateid>.invoke<n>") at invoke time
 	Start          InvokeFunc
-	Params         func(ExecContext) any // evaluated once, synchronously, when the invocation starts; nil => nil params
+	Params         func(ExecContext) Value // evaluated once, synchronously, when the invocation starts; nil => null params
 	Finalize       []ActionFunc
 	AutoForward    bool
 	Resume         InvokeResumeFunc
@@ -98,7 +98,7 @@ func WithInvokeIDLocation(fn IDLocationFunc) InvokeOption {
 // WithInvokeParams sets the callback that computes the data passed to
 // Start (SCXML's <param>/namelist equivalent), evaluated synchronously
 // against the state being entered, before Start's goroutine is spawned.
-func WithInvokeParams(fn func(ExecContext) any) InvokeOption {
+func WithInvokeParams(fn func(ExecContext) Value) InvokeOption {
 	return func(s *InvokeSpec) { s.Params = fn }
 }
 
@@ -153,7 +153,7 @@ func Invoke(fn InvokeFunc, opts ...InvokeOption) StateOption {
 type compiledInvoke struct {
 	id          Identifier
 	start       InvokeFunc
-	params      func(ExecContext) any
+	params      func(ExecContext) Value
 	finalize    []actionBlock
 	autoForward bool
 	resume      InvokeResumeFunc
@@ -185,9 +185,9 @@ type runningInvoke struct {
 // concerns, not core-interpreter ones -- the same seam actorClock already
 // uses for <send delay="...">. The default, used by a bare interpretation
 // with no owning Instance (e.g. under test), starts nothing.
-type invokeRunnerFunc func(id Identifier, spec *compiledInvoke, params any) (cancel func(), incoming chan<- Event)
+type invokeRunnerFunc func(id Identifier, spec *compiledInvoke, params Value) (cancel func(), incoming chan<- Event)
 
-func noopInvokeRunner(Identifier, *compiledInvoke, any) (func(), chan<- Event) {
+func noopInvokeRunner(Identifier, *compiledInvoke, Value) (func(), chan<- Event) {
 	return func() {}, nil
 }
 
@@ -281,8 +281,8 @@ func (p *parentIOProcessor) IOProcessors() []IOProcessorInfo {
 // own top-level final state is this invocation's own natural completion,
 // generating done.invoke.<id> on the parent exactly as for any other
 // InvokeFunc.
-func InvokeChart(chart *Chart, newDatamodel func(params any) any, baseIO IOProcessor) InvokeFunc {
-	return func(ctx context.Context, params any, io InvokeIO) (any, error) {
+func InvokeChart(chart *Chart, newDatamodel func(params Value) any, baseIO IOProcessor) InvokeFunc {
+	return func(ctx context.Context, params Value, io InvokeIO) (Value, error) {
 		datamodel := newDatamodel(params)
 		child := New(chart, datamodel, WithIOProcessor(SCXMLEventProcessor, &parentIOProcessor{deliver: io.Deliver, next: baseIO}))
 
@@ -294,7 +294,7 @@ func InvokeChart(chart *Chart, newDatamodel func(params any) any, baseIO IOProce
 		defer child.Stop(context.Background())
 
 		if err := child.Start(ctx); err != nil {
-			return nil, err
+			return Value{}, err
 		}
 
 		go func() {
@@ -314,7 +314,7 @@ func InvokeChart(chart *Chart, newDatamodel func(params any) any, baseIO IOProce
 		}()
 
 		if err := child.Wait(ctx); err != nil {
-			return nil, err
+			return Value{}, err
 		}
 		return child.Result()
 	}

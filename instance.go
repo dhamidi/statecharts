@@ -317,7 +317,7 @@ const invokeIncomingBuffer = 16
 // (SCXML 6.4.2); a goroutine that observes ctx already done by the time it
 // returns generates neither done.invoke nor error.communication, per SCXML
 // 6.4.3.
-func (in *Instance) startInvoke(id Identifier, spec *compiledInvoke, params any) (cancel func(), incoming chan<- Event) {
+func (in *Instance) startInvoke(id Identifier, spec *compiledInvoke, params Value) (cancel func(), incoming chan<- Event) {
 	// Rehydrate flips suppressInvoke for its whole bootstrap-plus-replay
 	// pass: entering an invoking state is deterministic replay of history
 	// (see enterState/processInvokes), so it must still happen -- and
@@ -330,7 +330,7 @@ func (in *Instance) startInvoke(id Identifier, spec *compiledInvoke, params any)
 	if in.suppressInvoke.Load() {
 		return func() {}, nil
 	}
-	return in.runInvokeGoroutine(id, func(ctx context.Context, io InvokeIO) (any, error) {
+	return in.runInvokeGoroutine(id, func(ctx context.Context, io InvokeIO) (Value, error) {
 		return spec.start(ctx, params, io)
 	})
 }
@@ -343,8 +343,8 @@ func (in *Instance) startInvoke(id Identifier, spec *compiledInvoke, params any)
 // never checks suppressInvoke: by the time Rehydrate calls this, replay has
 // already caught up and suppressInvoke is already false, so this call is
 // always the real thing.
-func (in *Instance) resumeInvoke(id Identifier, spec *compiledInvoke, params any) (cancel func(), incoming chan<- Event) {
-	return in.runInvokeGoroutine(id, func(ctx context.Context, io InvokeIO) (any, error) {
+func (in *Instance) resumeInvoke(id Identifier, spec *compiledInvoke, params Value) (cancel func(), incoming chan<- Event) {
+	return in.runInvokeGoroutine(id, func(ctx context.Context, io InvokeIO) (Value, error) {
 		return spec.resume(ctx, id, params, io)
 	})
 }
@@ -379,12 +379,12 @@ func (in *Instance) resumeInvokesAfterReplay() {
 				Name:     ErrEventCommunication,
 				Type:     EventPlatform,
 				InvokeID: id,
-				Data:     fmt.Errorf("statecharts: Rehydrate: invoke %q was active before restart; its continuation cannot be guaranteed", id),
+				Data:     PlatformErrorValue(ErrEventCommunication, fmt.Errorf("statecharts: Rehydrate: invoke %q was active before restart; its continuation cannot be guaranteed", id)),
 			})
 			in.ip.runToStable()
 			continue
 		}
-		var params any
+		var params Value
 		if spec.params != nil {
 			// _event is unbound here (SCXML 5.10.1), not whatever event
 			// ip.lastEvent happens to hold: that field reflects the tail of
@@ -422,7 +422,7 @@ func (in *Instance) resumeInvokesAfterReplay() {
 // cancelled by the returned cancel func, which interpretation.cancelInvokes
 // calls as part of exiting the invoking state (SCXML 6.4.2); run observing
 // ctx already done by the time it returns generates neither event.
-func (in *Instance) runInvokeGoroutine(id Identifier, run func(context.Context, InvokeIO) (any, error)) (cancel func(), incoming chan<- Event) {
+func (in *Instance) runInvokeGoroutine(id Identifier, run func(context.Context, InvokeIO) (Value, error)) (cancel func(), incoming chan<- Event) {
 	ctx, cancelFn := context.WithCancel(context.Background())
 	inbound := make(chan Event, invokeIncomingBuffer)
 	io := InvokeIO{
@@ -430,12 +430,7 @@ func (in *Instance) runInvokeGoroutine(id Identifier, run func(context.Context, 
 			if ctx.Err() != nil {
 				return
 			}
-			data, err := clonePayload(ev.Data)
-			if err != nil {
-				ev = Event{Name: ErrEventExecution, Type: EventPlatform, Data: err}
-			} else {
-				ev.Data = data
-			}
+			ev = cloneEvent(ev)
 			ev.InvokeID = id
 			ev.Type = EventExternal
 			_ = in.Deliver(ctx, ev)
@@ -448,7 +443,7 @@ func (in *Instance) runInvokeGoroutine(id Identifier, run func(context.Context, 
 			if r := recover(); r != nil && ctx.Err() == nil {
 				_ = in.Deliver(context.Background(), Event{
 					Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id,
-					Data: fmt.Errorf("statecharts: invoke %q panicked: %v", id, r),
+					Data: PlatformErrorValue(ErrEventCommunication, fmt.Errorf("statecharts: invoke %q panicked: %v", id, r)),
 				})
 			}
 		}()
@@ -459,16 +454,11 @@ func (in *Instance) runInvokeGoroutine(id Identifier, run func(context.Context, 
 		}
 		if err != nil {
 			_ = in.Deliver(context.Background(), Event{
-				Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id, Data: err,
+				Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id, Data: PlatformErrorValue(ErrEventCommunication, err),
 			})
 			return
 		}
-		data, cloneErr := clonePayload(data)
-		if cloneErr != nil {
-			_ = in.Deliver(context.Background(), Event{Name: ErrEventExecution, Type: EventPlatform, InvokeID: id, Data: cloneErr})
-			return
-		}
-		_ = in.Deliver(context.Background(), Event{Name: Identifier("done.invoke." + string(id)), Type: EventExternal, InvokeID: id, Data: data})
+		_ = in.Deliver(context.Background(), Event{Name: Identifier("done.invoke." + string(id)), Type: EventExternal, InvokeID: id, Data: data.Clone()})
 	}()
 
 	return cancelFn, inbound
@@ -729,7 +719,7 @@ func (in *Instance) Send(ctx context.Context, ev Event) error {
 }
 
 func (in *Instance) send(ctx context.Context, ev Event) error {
-	req := actorRequest{kind: reqSend, event: ev, reply: make(chan error, 1)}
+	req := actorRequest{kind: reqSend, event: cloneEvent(ev), reply: make(chan error, 1)}
 	if err := in.submit(ctx, req); err != nil {
 		return err
 	}
@@ -810,18 +800,18 @@ func (in *Instance) Wait(ctx context.Context) error {
 // Result returns the data produced by the top-level final state. It is
 // available after the Instance has completed naturally; a stopped or still
 // running Instance has no final result.
-func (in *Instance) Result() (any, error) {
+func (in *Instance) Result() (Value, error) {
 	select {
 	case <-in.doneCh:
 		if err := in.Err(); err != nil {
-			return nil, err
+			return Value{}, err
 		}
 		if !in.ip.completed {
-			return nil, fmt.Errorf("statecharts: instance stopped without reaching a top-level final state")
+			return Value{}, fmt.Errorf("statecharts: instance stopped without reaching a top-level final state")
 		}
-		return in.ip.result, nil
+		return in.ip.result.Clone(), nil
 	default:
-		return nil, fmt.Errorf("statecharts: instance is still running")
+		return Value{}, fmt.Errorf("statecharts: instance is still running")
 	}
 }
 

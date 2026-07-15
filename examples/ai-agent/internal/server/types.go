@@ -1,33 +1,124 @@
-// Package server implements the workspace server: the durable
-// ConversationActor and UserActor, the non-durable FanoutActor,
-// ToolRegistryActor, DirectoryActor, ConnectionActor and per-turn
-// llmrequest actors, LLMDispatchProcessor, and the HTTP/SSE handlers that
-// tie them together.
+// Package server implements the workspace server actors and HTTP handlers.
 package server
 
 import (
-	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/dhamidi/statecharts"
-
+	"github.com/dhamidi/statecharts/examples/ai-agent/internal/llm"
 	"github.com/dhamidi/statecharts/examples/ai-agent/internal/protocol"
 )
 
-// Every Event.Data that crosses a durable boundary must be registered: both
-// inbound events logged by a durable target and outbound intents emitted by
-// a durable sender. The latter remains true when the recipient itself is an
-// ephemeral actor, because the sender's outbox must be able to retry the
-// original typed request after a crash.
+const (
+	tagUserMessage          = "aiagent.user_message"
+	tagToolResult           = "aiagent.tool_result"
+	tagLLMReply             = "aiagent.llm_reply"
+	tagRegisterConversation = "aiagent.register_conversation"
+	tagConversationState    = "aiagent.conversation_state"
+	tagCatchupRequest       = "aiagent.catchup_request"
+	tagDirectorySync        = "aiagent.directory_sync"
+	tagDispatch             = "aiagent.dispatch"
+	tagToolOffer            = "aiagent.tool_offer"
+	tagCatchupMessage       = "aiagent.catchup_message"
+	tagFanoutBroadcast      = "aiagent.fanout_broadcast"
+	tagFanoutSubscribe      = "aiagent.fanout_subscribe"
+	tagToolClaim            = "aiagent.tool_claim"
+	tagToolCall             = "aiagent.tool_call"
+	tagConnectionStart      = "aiagent.connection_start"
+	tagProviderChunk        = "aiagent.provider_chunk"
+	tagDirectoryRequest     = "aiagent.directory_request"
+)
 
-// UserMessageData is "user_message"'s payload -> conversation.
-type UserMessageData struct {
-	Text string
+func sv(s string) statecharts.Value {
+	v, e := statecharts.StringValue(s)
+	if e != nil {
+		panic(e)
+	}
+	return v
+}
+func mv(m map[string]statecharts.Value) statecharts.Value {
+	v, e := statecharts.MapValue(m)
+	if e != nil {
+		panic(e)
+	}
+	return v
+}
+func tagged(tag string, v statecharts.Value) statecharts.Value {
+	x, e := statecharts.TaggedValue(tag, v)
+	if e != nil {
+		panic(e)
+	}
+	return x
+}
+func fields(v statecharts.Value, tag string) (map[string]statecharts.Value, bool) {
+	t, p, ok := v.AsTagged()
+	if !ok || t != tag {
+		return nil, false
+	}
+	m, ok := p.AsMap()
+	return m, ok
+}
+func str(m map[string]statecharts.Value, k string) (string, bool) {
+	v, ok := m[k]
+	if !ok {
+		return "", false
+	}
+	return v.AsString()
+}
+func integer(m map[string]statecharts.Value, k string) (int, bool) {
+	v, ok := m[k]
+	if !ok {
+		return 0, false
+	}
+	n, ok := v.AsInt64()
+	if !ok {
+		return 0, false
+	}
+	x := int(n)
+	return x, int64(x) == n
+}
+func boolean(m map[string]statecharts.Value, k string) (bool, bool) {
+	v, ok := m[k]
+	if !ok {
+		return false, false
+	}
+	return v.AsBool()
+}
+func stringsValue[T ~string](xs []T) statecharts.Value {
+	vs := make([]statecharts.Value, len(xs))
+	for i, x := range xs {
+		vs[i] = sv(string(x))
+	}
+	return statecharts.ListValue(vs)
+}
+func decodeStrings[T ~string](v statecharts.Value) ([]T, bool) {
+	vs, ok := v.AsList()
+	if !ok {
+		return nil, false
+	}
+	out := make([]T, len(vs))
+	for i, x := range vs {
+		s, ok := x.AsString()
+		if !ok {
+			return nil, false
+		}
+		out[i] = T(s)
+	}
+	return out, true
 }
 
-type userMessagePayload = statecharts.JSONData[UserMessageData]
+type UserMessageData struct{ Text string }
 
-// ToolResultData is "tool_result"'s payload -> conversation.
+func encodeUserMessage(x UserMessageData) statecharts.Value {
+	return tagged(tagUserMessage, mv(map[string]statecharts.Value{"text": sv(x.Text)}))
+}
+func decodeUserMessage(v statecharts.Value) (UserMessageData, bool) {
+	m, ok := fields(v, tagUserMessage)
+	x, o := str(m, "text")
+	return UserMessageData{x}, ok && o
+}
+
 type ToolResultData struct {
 	CallID   protocol.CallID
 	Output   string
@@ -35,10 +126,18 @@ type ToolResultData struct {
 	Error    string
 }
 
-type toolResultPayload = statecharts.JSONData[ToolResultData]
+func encodeToolResult(x ToolResultData) statecharts.Value {
+	return tagged(tagToolResult, mv(map[string]statecharts.Value{"call_id": sv(string(x.CallID)), "output": sv(x.Output), "exit_code": statecharts.Int64Value(int64(x.ExitCode)), "error": sv(x.Error)}))
+}
+func decodeToolResult(v statecharts.Value) (ToolResultData, bool) {
+	m, ok := fields(v, tagToolResult)
+	a, aok := str(m, "call_id")
+	o, ook := str(m, "output")
+	e, eok := integer(m, "exit_code")
+	er, erok := str(m, "error")
+	return ToolResultData{protocol.CallID(a), o, e, er}, ok && aok && ook && eok && erok
+}
 
-// LLMReplyData is "llm_reply"'s payload -> conversation, covering both
-// shapes a turn can resolve to: plain text, or a decided tool call.
 type LLMReplyData struct {
 	IsToolCall bool
 	Text       string
@@ -46,132 +145,341 @@ type LLMReplyData struct {
 	ToolArgs   protocol.ToolArgs
 }
 
-type llmReplyPayload = statecharts.JSONData[LLMReplyData]
+func encodeLLMReply(x LLMReplyData) statecharts.Value {
+	j, e := statecharts.ValueFromJSON(map[string]any(x.ToolArgs))
+	if e != nil {
+		j = mv(nil)
+	}
+	return tagged(tagLLMReply, mv(map[string]statecharts.Value{"is_tool_call": statecharts.BoolValue(x.IsToolCall), "text": sv(x.Text), "tool_name": sv(string(x.ToolName)), "tool_args": j}))
+}
+func decodeLLMReply(v statecharts.Value) (LLMReplyData, bool) {
+	m, ok := fields(v, tagLLMReply)
+	b, bok := boolean(m, "is_tool_call")
+	t, tok := str(m, "text")
+	n, nok := str(m, "tool_name")
+	j, jok := m["tool_args"]
+	raw, err := j.JSONValue()
+	args, cast := raw.(map[string]any)
+	return LLMReplyData{b, t, protocol.ToolName(n), protocol.NewToolArgs(args)}, ok && bok && tok && nok && jok && err == nil && cast
+}
 
-// RegisterConversationData is "register"'s payload -> user.
 type RegisterConversationData struct {
 	ID    protocol.ConversationID
 	Title string
 }
 
-type registerConversationPayload = statecharts.JSONData[RegisterConversationData]
+func encodeRegister(x RegisterConversationData) statecharts.Value {
+	return tagged(tagRegisterConversation, mv(map[string]statecharts.Value{"id": sv(string(x.ID)), "title": sv(x.Title)}))
+}
+func decodeRegister(v statecharts.Value) (RegisterConversationData, bool) {
+	m, ok := fields(v, tagRegisterConversation)
+	id, a := str(m, "id")
+	t, b := str(m, "title")
+	return RegisterConversationData{protocol.ConversationID(id), t}, ok && a && b
+}
 
-// ConversationStateData is "state_changed"'s payload -> user.
 type ConversationStateData struct {
 	ID    protocol.ConversationID
 	State protocol.ConversationState
 }
 
-type conversationStatePayload = statecharts.JSONData[ConversationStateData]
+func encodeConversationState(x ConversationStateData) statecharts.Value {
+	return tagged(tagConversationState, mv(map[string]statecharts.Value{"id": sv(string(x.ID)), "state": sv(string(x.State))}))
+}
+func decodeConversationState(v statecharts.Value) (ConversationStateData, bool) {
+	m, ok := fields(v, tagConversationState)
+	id, a := str(m, "id")
+	s, b := str(m, "state")
+	return ConversationStateData{protocol.ConversationID(id), protocol.ConversationState(s)}, ok && a && b
+}
 
-// CatchupRequestData is "catchup"'s payload -> conversation: a connection
-// asking to be sent every transcript entry it doesn't already have, by
-// ordinary actor Send -- never by reading the conversation's Log directly.
-// ConversationActor answers from its own already-rehydrated History, the
-// same in-memory state it would use to serve a live turn.
 type CatchupRequestData struct {
 	Connection protocol.ConnectionID
-	FromSeq    int // 0 = from the beginning
+	FromSeq    int
 }
 
-type catchupRequestPayload = statecharts.JSONData[CatchupRequestData]
-
-type directorySyncPayload = statecharts.JSONData[protocol.ConversationSummary]
-
-func marshalActorData(typeName string, value any) (string, []byte, error) {
-	payload, err := json.Marshal(value)
-	return typeName, payload, err
+func encodeCatchupRequest(x CatchupRequestData) statecharts.Value {
+	return tagged(tagCatchupRequest, mv(map[string]statecharts.Value{"connection": sv(string(x.Connection)), "from_seq": statecharts.Int64Value(int64(x.FromSeq))}))
 }
-
-func (p *dispatchPayload) MarshalData() (string, []byte, error) {
-	return marshalActorData("aiagent.dispatch", p)
+func decodeCatchupRequest(v statecharts.Value) (CatchupRequestData, bool) {
+	m, ok := fields(v, tagCatchupRequest)
+	c, a := str(m, "connection")
+	n, b := integer(m, "from_seq")
+	return CatchupRequestData{protocol.ConnectionID(c), n}, ok && a && b
 }
-
-func (p *dispatchPayload) UnmarshalData(payload []byte) error { return json.Unmarshal(payload, p) }
-
-func (p *toolOffer) MarshalData() (string, []byte, error) {
-	return marshalActorData("aiagent.tool_offer", p)
+func encodeSummary(x protocol.ConversationSummary) statecharts.Value {
+	return tagged(tagDirectorySync, mv(map[string]statecharts.Value{"id": sv(string(x.ID)), "title": sv(x.Title), "state": sv(string(x.State))}))
 }
-
-func (p *toolOffer) UnmarshalData(payload []byte) error { return json.Unmarshal(payload, p) }
-
-func (p *catchupMessage) MarshalData() (string, []byte, error) {
-	return marshalActorData("aiagent.catchup_message", p)
+func decodeSummary(v statecharts.Value) (protocol.ConversationSummary, bool) {
+	m, ok := fields(v, tagDirectorySync)
+	id, a := str(m, "id")
+	t, b := str(m, "title")
+	s, c := str(m, "state")
+	return protocol.ConversationSummary{ID: protocol.ConversationID(id), Title: t, State: protocol.ConversationState(s)}, ok && a && b && c
 }
-
-func (p *catchupMessage) UnmarshalData(payload []byte) error { return json.Unmarshal(payload, p) }
-
-type fanoutBroadcastWire struct {
-	ConversationID protocol.ConversationID
-	Kind           string
-	Seq            int
-	Frame          json.RawMessage
+func encodeMessage(x llm.Message) statecharts.Value {
+	return mv(map[string]statecharts.Value{"role": sv(string(x.Role)), "text": sv(x.Text)})
 }
-
-func (p *fanoutBroadcast) MarshalData() (string, []byte, error) {
-	frame, err := json.Marshal(p.Frame)
-	if err != nil {
-		return "", nil, err
+func decodeMessage(v statecharts.Value) (llm.Message, bool) {
+	m, ok := v.AsMap()
+	r, a := str(m, "role")
+	t, b := str(m, "text")
+	return llm.Message{Role: llm.Role(r), Text: t}, ok && a && b
+}
+func encodeDispatch(x dispatchPayload) statecharts.Value {
+	hs := make([]statecharts.Value, len(x.Request.History))
+	for i := range x.Request.History {
+		hs[i] = encodeMessage(x.Request.History[i])
 	}
-	return marshalActorData("aiagent.fanout_broadcast", fanoutBroadcastWire{
-		ConversationID: p.ConversationID,
-		Kind:           p.Kind,
-		Seq:            p.Seq,
-		Frame:          frame,
-	})
-}
-
-func (p *fanoutBroadcast) UnmarshalData(payload []byte) error {
-	var wire fanoutBroadcastWire
-	if err := json.Unmarshal(payload, &wire); err != nil {
-		return err
+	ts := make([]statecharts.Value, len(x.Request.Tools))
+	for i, t := range x.Request.Tools {
+		ts[i] = mv(map[string]statecharts.Value{"name": sv(string(t.Name)), "description": sv(t.Description)})
 	}
-	p.ConversationID, p.Kind, p.Seq = wire.ConversationID, wire.Kind, wire.Seq
-	switch wire.Kind {
-	case "message":
-		var frame protocol.MessageFrame
-		if err := json.Unmarshal(wire.Frame, &frame); err != nil {
-			return err
+	return tagged(tagDispatch, mv(map[string]statecharts.Value{"conversation_id": sv(string(x.ConversationID)), "history": statecharts.ListValue(hs), "tools": statecharts.ListValue(ts)}))
+}
+func decodeDispatch(v statecharts.Value) (dispatchPayload, bool) {
+	m, ok := fields(v, tagDispatch)
+	id, a := str(m, "conversation_id")
+	hv, b := m["history"].AsList()
+	tv, c := m["tools"].AsList()
+	x := dispatchPayload{ConversationID: protocol.ConversationID(id)}
+	for _, v := range hv {
+		q, o := decodeMessage(v)
+		if !o {
+			return x, false
 		}
-		p.Frame = frame
-	case "delta":
-		var frame deltaFrame
-		if err := json.Unmarshal(wire.Frame, &frame); err != nil {
-			return err
-		}
-		p.Frame = frame
-	default:
-		return fmt.Errorf("unknown fanout frame kind %q", wire.Kind)
+		x.Request.History = append(x.Request.History, q)
 	}
-	return nil
+	for _, v := range tv {
+		z, o := v.AsMap()
+		n, nok := str(z, "name")
+		d, dok := str(z, "description")
+		if !o || !nok || !dok {
+			return x, false
+		}
+		x.Request.Tools = append(x.Request.Tools, llm.ToolDef{Name: n, Description: d})
+	}
+	return x, ok && a && b && c
 }
 
-// registerDataTypes must run once at startup, before any durable actor can
-// receive traffic or emit an outbound intent.
-func registerDataTypes() {
-	statecharts.RegisterDataType("aiagent.user_message", func() statecharts.DataUnmarshaler {
-		return &userMessagePayload{TypeName: "aiagent.user_message"}
-	})
-	statecharts.RegisterDataType("aiagent.tool_result", func() statecharts.DataUnmarshaler {
-		return &toolResultPayload{TypeName: "aiagent.tool_result"}
-	})
-	statecharts.RegisterDataType("aiagent.llm_reply", func() statecharts.DataUnmarshaler {
-		return &llmReplyPayload{TypeName: "aiagent.llm_reply"}
-	})
-	statecharts.RegisterDataType("aiagent.register_conversation", func() statecharts.DataUnmarshaler {
-		return &registerConversationPayload{TypeName: "aiagent.register_conversation"}
-	})
-	statecharts.RegisterDataType("aiagent.conversation_state", func() statecharts.DataUnmarshaler {
-		return &conversationStatePayload{TypeName: "aiagent.conversation_state"}
-	})
-	statecharts.RegisterDataType("aiagent.catchup_request", func() statecharts.DataUnmarshaler {
-		return &catchupRequestPayload{TypeName: "aiagent.catchup_request"}
-	})
-	statecharts.RegisterDataType("aiagent.directory_sync", func() statecharts.DataUnmarshaler {
-		return &directorySyncPayload{TypeName: "aiagent.directory_sync"}
-	})
-	statecharts.RegisterDataType("aiagent.dispatch", func() statecharts.DataUnmarshaler { return &dispatchPayload{} })
-	statecharts.RegisterDataType("aiagent.tool_offer", func() statecharts.DataUnmarshaler { return &toolOffer{} })
-	statecharts.RegisterDataType("aiagent.catchup_message", func() statecharts.DataUnmarshaler { return &catchupMessage{} })
-	statecharts.RegisterDataType("aiagent.fanout_broadcast", func() statecharts.DataUnmarshaler { return &fanoutBroadcast{} })
+func encodeFanoutSubscribe(x fanoutSubscribe) statecharts.Value {
+	return tagged(tagFanoutSubscribe, mv(map[string]statecharts.Value{"conversation_id": sv(string(x.ConversationID)), "connection": sv(string(x.Connection))}))
+}
+func decodeFanoutSubscribe(v statecharts.Value) (fanoutSubscribe, bool) {
+	m, ok := fields(v, tagFanoutSubscribe)
+	a, x := str(m, "conversation_id")
+	b, y := str(m, "connection")
+	return fanoutSubscribe{protocol.ConversationID(a), protocol.ConnectionID(b)}, ok && x && y
+}
+func encodeToolClaim(x toolClaim) statecharts.Value {
+	return tagged(tagToolClaim, mv(map[string]statecharts.Value{"tool": sv(string(x.Tool)), "owner": sv(string(x.Owner))}))
+}
+func decodeToolClaim(v statecharts.Value) (toolClaim, bool) {
+	m, ok := fields(v, tagToolClaim)
+	a, x := str(m, "tool")
+	b, y := str(m, "owner")
+	return toolClaim{protocol.ToolName(a), protocol.ConnectionID(b)}, ok && x && y
+}
+func encodeConnectionStart(x connectionStart) statecharts.Value {
+	return tagged(tagConnectionStart, mv(map[string]statecharts.Value{"conversation_id": sv(string(x.ConversationID)), "tools": stringsValue(x.Tools), "from_seq": statecharts.Int64Value(int64(x.FromSeq)), "request_id": sv(x.RequestID)}))
+}
+func decodeConnectionStart(v statecharts.Value) (connectionStart, bool) {
+	m, ok := fields(v, tagConnectionStart)
+	a, x := str(m, "conversation_id")
+	ts, y := decodeStrings[protocol.ToolName](m["tools"])
+	n, z := integer(m, "from_seq")
+	id, q := str(m, "request_id")
+	return connectionStart{ConversationID: protocol.ConversationID(a), Tools: ts, FromSeq: n, RequestID: id}, ok && x && y && z && q
+}
+func encodeDirectoryRequest(id string) statecharts.Value {
+	return tagged(tagDirectoryRequest, mv(map[string]statecharts.Value{"request_id": sv(id)}))
+}
+func decodeDirectoryRequest(v statecharts.Value) (string, bool) {
+	m, ok := fields(v, tagDirectoryRequest)
+	id, x := str(m, "request_id")
+	return id, ok && x
+}
+func encodeMessageFrame(x protocol.MessageFrame) statecharts.Value {
+	return mv(map[string]statecharts.Value{"role": sv(string(x.Role)), "text": sv(x.Text)})
+}
+func decodeMessageFrame(v statecharts.Value) (protocol.MessageFrame, bool) {
+	m, ok := v.AsMap()
+	r, a := str(m, "role")
+	t, b := str(m, "text")
+	return protocol.MessageFrame{Role: protocol.Role(r), Text: t}, ok && a && b
+}
+func encodeCatchupMessage(x catchupMessage) statecharts.Value {
+	return tagged(tagCatchupMessage, mv(map[string]statecharts.Value{"seq": statecharts.Int64Value(int64(x.Seq)), "frame": encodeMessageFrame(x.Frame)}))
+}
+func decodeCatchupMessage(v statecharts.Value) (catchupMessage, bool) {
+	m, ok := fields(v, tagCatchupMessage)
+	n, a := integer(m, "seq")
+	f, b := decodeMessageFrame(m["frame"])
+	return catchupMessage{n, f}, ok && a && b
+}
+func encodeFanoutBroadcast(x fanoutBroadcast) statecharts.Value {
+	m := map[string]statecharts.Value{"conversation_id": sv(string(x.ConversationID)), "kind": sv(x.Kind), "seq": statecharts.Int64Value(int64(x.Seq))}
+	if x.Kind == "message" {
+		m["frame"] = encodeMessageFrame(x.Message)
+	} else {
+		m["frame"] = mv(map[string]statecharts.Value{"kind": sv(x.Delta.Kind), "text": sv(x.Delta.Text)})
+	}
+	return tagged(tagFanoutBroadcast, mv(m))
+}
+func decodeFanoutBroadcast(v statecharts.Value) (fanoutBroadcast, bool) {
+	m, ok := fields(v, tagFanoutBroadcast)
+	id, a := str(m, "conversation_id")
+	k, b := str(m, "kind")
+	n, c := integer(m, "seq")
+	x := fanoutBroadcast{ConversationID: protocol.ConversationID(id), Kind: k, Seq: n}
+	if k == "message" {
+		f, q := decodeMessageFrame(m["frame"])
+		x.Message = f
+		return x, ok && a && b && c && q
+	}
+	z, q := m["frame"].AsMap()
+	dk, r := str(z, "kind")
+	dt, s := str(z, "text")
+	x.Delta = deltaFrame{dk, dt}
+	return x, ok && a && b && c && q && r && s
+}
+func encodeToolCall(x toolCallDelivery) statecharts.Value {
+	j, e := statecharts.ValueFromJSON(map[string]any(x.Args))
+	if e != nil {
+		j = mv(nil)
+	}
+	return tagged(tagToolCall, mv(map[string]statecharts.Value{"conversation_id": sv(string(x.ConversationID)), "call_id": sv(string(x.CallID)), "name": sv(string(x.Name)), "args": j}))
+}
+func decodeToolCall(v statecharts.Value) (toolCallDelivery, bool) {
+	m, ok := fields(v, tagToolCall)
+	a, x := str(m, "conversation_id")
+	b, y := str(m, "call_id")
+	n, z := str(m, "name")
+	raw, e := m["args"].JSONValue()
+	args, q := raw.(map[string]any)
+	return toolCallDelivery{protocol.ConversationID(a), protocol.CallID(b), protocol.ToolName(n), protocol.NewToolArgs(args)}, ok && x && y && z && e == nil && q
+}
+
+func encodeToolOffer(x toolOffer) statecharts.Value {
+	j, _ := statecharts.ValueFromJSON(map[string]any(x.Args))
+	return tagged(tagToolOffer, mv(map[string]statecharts.Value{"conversation_id": sv(string(x.ConversationID)), "tool": sv(string(x.Tool)), "call_id": sv(string(x.CallID)), "args": j}))
+}
+func decodeToolOffer(v statecharts.Value) (toolOffer, bool) {
+	m, ok := fields(v, tagToolOffer)
+	a, x := str(m, "conversation_id")
+	b, y := str(m, "tool")
+	c, z := str(m, "call_id")
+	raw, e := m["args"].JSONValue()
+	args, q := raw.(map[string]any)
+	return toolOffer{protocol.ConversationID(a), protocol.ToolName(b), protocol.CallID(c), protocol.NewToolArgs(args)}, ok && x && y && z && e == nil && q
+}
+func encodeProviderChunk(x llm.Chunk) statecharts.Value {
+	j, _ := statecharts.ValueFromJSON(x.ToolCall.Args)
+	return tagged(tagProviderChunk, mv(map[string]statecharts.Value{"kind": sv(x.Kind), "text": sv(x.TextDelta), "tool_id": sv(x.ToolCall.ID), "tool_name": sv(x.ToolCall.Name), "tool_args": j}))
+}
+func decodeProviderChunk(v statecharts.Value) (llm.Chunk, bool) {
+	m, ok := fields(v, tagProviderChunk)
+	k, a := str(m, "kind")
+	t, b := str(m, "text")
+	id, c := str(m, "tool_id")
+	n, d := str(m, "tool_name")
+	raw, e := m["tool_args"].JSONValue()
+	args, q := raw.(map[string]any)
+	return llm.Chunk{Kind: k, TextDelta: t, ToolCall: llm.ToolCall{ID: id, Name: n, Args: args}}, ok && a && b && c && d && e == nil && q
+}
+
+type RequestRegistry struct {
+	mu          sync.Mutex
+	next        uint64
+	lists       map[string]chan<- []protocol.ConversationSummary
+	watches     map[string]chan<- chan protocol.ConversationSummary
+	unwatches   map[string]chan protocol.ConversationSummary
+	connections map[string]chan<- chan sseFrame
+}
+
+func NewRequestRegistry() *RequestRegistry {
+	return &RequestRegistry{
+		lists:       map[string]chan<- []protocol.ConversationSummary{},
+		watches:     map[string]chan<- chan protocol.ConversationSummary{},
+		unwatches:   map[string]chan protocol.ConversationSummary{},
+		connections: map[string]chan<- chan sseFrame{},
+	}
+}
+
+func (r *RequestRegistry) newIDLocked() string {
+	r.next++
+	return fmt.Sprintf("req-%d", r.next)
+}
+
+func (r *RequestRegistry) putList(reply chan<- []protocol.ConversationSummary) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := r.newIDLocked()
+	r.lists[id] = reply
+	return id
+}
+
+func (r *RequestRegistry) takeList(id string) (chan<- []protocol.ConversationSummary, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.lists[id]
+	delete(r.lists, id)
+	return v, ok
+}
+
+func (r *RequestRegistry) putWatch(reply chan<- chan protocol.ConversationSummary) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := r.newIDLocked()
+	r.watches[id] = reply
+	return id
+}
+
+func (r *RequestRegistry) takeWatch(id string) (chan<- chan protocol.ConversationSummary, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.watches[id]
+	delete(r.watches, id)
+	return v, ok
+}
+
+func (r *RequestRegistry) putUnwatch(channel chan protocol.ConversationSummary) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := r.newIDLocked()
+	r.unwatches[id] = channel
+	return id
+}
+
+func (r *RequestRegistry) takeUnwatch(id string) (chan protocol.ConversationSummary, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.unwatches[id]
+	delete(r.unwatches, id)
+	return v, ok
+}
+
+func (r *RequestRegistry) putConnection(reply chan<- chan sseFrame) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := r.newIDLocked()
+	r.connections[id] = reply
+	return id
+}
+
+func (r *RequestRegistry) takeConnection(id string) (chan<- chan sseFrame, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.connections[id]
+	delete(r.connections, id)
+	return v, ok
+}
+
+func (r *RequestRegistry) remove(id string) {
+	r.mu.Lock()
+	delete(r.lists, id)
+	delete(r.watches, id)
+	delete(r.unwatches, id)
+	delete(r.connections, id)
+	r.mu.Unlock()
 }

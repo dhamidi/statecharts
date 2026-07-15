@@ -66,17 +66,44 @@ type linkParams struct {
 	LastSeq        int
 }
 
-func computeInvokeParams(ec statecharts.ExecContext) any {
+func computeInvokeParams(ec statecharts.ExecContext) statecharts.Value {
 	d, _ := ec.Datamodel().(*linkModel)
 	if d == nil {
-		return linkParams{}
+		return encodeLinkParams(linkParams{})
 	}
-	return linkParams{
+	return encodeLinkParams(linkParams{
 		ServerAddr:     d.ServerAddr,
 		ConversationID: d.ConversationID,
 		Tools:          d.Tools,
 		LastSeq:        d.LastSeq,
+	})
+}
+
+func encodeLinkParams(p linkParams) statecharts.Value {
+	tools := make([]statecharts.Value, len(p.Tools))
+	for i, t := range p.Tools {
+		tools[i] = str(t.String())
 	}
+	return taggedMap(tagLinkParams, map[string]statecharts.Value{"server_addr": str(p.ServerAddr), "conversation_id": str(p.ConversationID.String()), "tools": statecharts.ListValue(tools), "last_seq": statecharts.Int64Value(int64(p.LastSeq))})
+}
+func decodeLinkParams(v statecharts.Value) (linkParams, bool) {
+	m, ok := fields(v, tagLinkParams)
+	if !ok {
+		return linkParams{}, false
+	}
+	s, a := stringField(m, "server_addr")
+	id, b := stringField(m, "conversation_id")
+	n, c := intField(m, "last_seq")
+	xs, d := m["tools"].AsList()
+	tools := make([]protocol.ToolName, len(xs))
+	for i, x := range xs {
+		z, good := x.AsString()
+		if !good {
+			return linkParams{}, false
+		}
+		tools[i] = protocol.ToolName(z)
+	}
+	return linkParams{ServerAddr: s, ConversationID: protocol.ConversationID(id), Tools: tools, LastSeq: n}, a && b && c && d
 }
 
 // dialSSE is LinkActor's Invoke: it opens (or resumes, via Last-Event-ID)
@@ -87,15 +114,15 @@ func computeInvokeParams(ec statecharts.ExecContext) any {
 // becomes error.communication (SCXML 6.4.3) unless ctx was already done,
 // in which case the interpreter core suppresses it -- see invoke.go -- so
 // this never special-cases a clean cancellation itself.
-func dialSSE(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
-	p, _ := params.(linkParams)
+func dialSSE(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
+	p, _ := decodeLinkParams(params)
 	if p.ConversationID == "" {
-		return nil, fmt.Errorf("client: dialSSE: no conversation selected")
+		return statecharts.NullValue(), fmt.Errorf("client: dialSSE: no conversation selected")
 	}
 
 	u, err := url.Parse(p.ServerAddr)
 	if err != nil {
-		return nil, err
+		return statecharts.NullValue(), err
 	}
 	u = u.JoinPath("conversations", p.ConversationID.String(), "events")
 	if len(p.Tools) > 0 {
@@ -110,7 +137,7 @@ func dialSSE(ctx context.Context, params any, io statecharts.InvokeIO) (any, err
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
+		return statecharts.NullValue(), err
 	}
 	if p.LastSeq > 0 {
 		req.Header.Set("Last-Event-ID", strconv.Itoa(p.LastSeq))
@@ -118,11 +145,11 @@ func dialSSE(ctx context.Context, params any, io statecharts.InvokeIO) (any, err
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return statecharts.NullValue(), err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("client: dial %s: unexpected status %s", u, resp.Status)
+		return statecharts.NullValue(), fmt.Errorf("client: dial %s: unexpected status %s", u, resp.Status)
 	}
 	io.Deliver(statecharts.Event{Name: "connected"})
 
@@ -133,7 +160,7 @@ func dialSSE(ctx context.Context, params any, io statecharts.InvokeIO) (any, err
 		if event == "" && data == "" {
 			return
 		}
-		io.Deliver(statecharts.Event{Name: "server_frame", Data: parseServerFrame(event, id, data)})
+		io.Deliver(statecharts.Event{Name: "server_frame", Data: serverFrameValue(parseServerFrame(event, id, data))})
 		id, event, data = "", "", ""
 	}
 	for scanner.Scan() {
@@ -150,9 +177,9 @@ func dialSSE(ctx context.Context, params any, io statecharts.InvokeIO) (any, err
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return statecharts.NullValue(), err
 	}
-	return nil, fmt.Errorf("client: server closed the event stream")
+	return statecharts.NullValue(), fmt.Errorf("client: server closed the event stream")
 }
 
 func parseServerFrame(event, id, data string) serverFrame {
@@ -176,12 +203,12 @@ func parseServerFrame(event, id, data string) serverFrame {
 
 var resetBackoff = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
 	d.BackoffAttempt = 0
-	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: "connected"})
+	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: str("connected")})
 	return nil
 })
 
 var reportReconnecting = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
-	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: "reconnecting"})
+	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: str("reconnecting")})
 	return nil
 })
 
@@ -190,7 +217,7 @@ var reportReconnecting = statecharts.Action(func(d *linkModel, ec statecharts.Ex
 // selected yet rather than sitting on whatever it guessed at startup (see
 // ui.go's newUIModel).
 var reportIdle = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
-	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: "idle"})
+	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: str("idle")})
 	return nil
 })
 
@@ -199,13 +226,13 @@ var reportIdle = statecharts.Action(func(d *linkModel, ec statecharts.ExecContex
 // can tell "nothing is happening yet" apart from "actively trying and not
 // there yet".
 var reportConnecting = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
-	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: "connecting"})
+	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: str("connecting")})
 	return nil
 })
 
 var dispatchFrame = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	f, ok := statecharts.Payload[serverFrame](ev)
+	f, ok := decodeServerFrame(ev.Data)
 	if !ok {
 		return nil
 	}
@@ -240,11 +267,11 @@ var dispatchFrame = statecharts.Action(func(d *linkModel, ec statecharts.ExecCon
 	switch f.EventName {
 	case "message":
 		if f.Message != nil {
-			ec.Send("append_message", statecharts.SendOptions{Target: "ui", Data: messageWithSeq{Seq: seq, Frame: *f.Message}})
+			ec.Send("append_message", statecharts.SendOptions{Target: "ui", Data: messageSeqValue(messageWithSeq{Seq: seq, Frame: *f.Message})})
 		}
 	case "delta":
 		if f.Delta != nil {
-			ec.Send("append_delta", statecharts.SendOptions{Target: "ui", Data: *f.Delta})
+			ec.Send("append_delta", statecharts.SendOptions{Target: "ui", Data: deltaValue(*f.Delta)})
 		}
 	case "tool_call":
 		if f.ToolCall != nil {
@@ -257,11 +284,11 @@ var dispatchFrame = statecharts.Action(func(d *linkModel, ec statecharts.ExecCon
 			// frame's own ConversationID -- never d.ConversationID -- to
 			// post the result back to the right place.
 			if f.ToolCall.ConversationID == d.ConversationID {
-				ec.Send("append_tool_call", statecharts.SendOptions{Target: "ui", Data: *f.ToolCall})
+				ec.Send("append_tool_call", statecharts.SendOptions{Target: "ui", Data: toolCallValue(*f.ToolCall)})
 			}
 			ec.Send("execute", statecharts.SendOptions{
 				Target: "tool",
-				Data:   executeRequest{ConversationID: f.ToolCall.ConversationID, Call: *f.ToolCall},
+				Data:   executeValue(executeRequest{ConversationID: f.ToolCall.ConversationID, Call: *f.ToolCall}),
 			})
 		}
 	}
@@ -288,14 +315,14 @@ var scheduleReconnect = statecharts.Action(func(d *linkModel, ec statecharts.Exe
 
 var handleSwitch = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	sw, ok := statecharts.Payload[switchRequest](ev)
+	sw, ok := decodeSwitch(ev.Data)
 	if !ok {
 		return nil
 	}
 	d.ConversationID = sw.ConversationID
 	d.LastSeq = 0
 	d.BackoffAttempt = 0
-	ec.Send("conversation_switched", statecharts.SendOptions{Target: "ui", Data: sw.ConversationID})
+	ec.Send("conversation_switched", statecharts.SendOptions{Target: "ui", Data: str(sw.ConversationID.String())})
 	return nil
 })
 

@@ -3,6 +3,7 @@ package statecharts
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -17,16 +18,16 @@ type recordingLogger struct {
 
 type recordedLogCall struct {
 	label string
-	data  any
+	data  Value
 }
 
-func (l *recordingLogger) Log(label string, data any) {
+func (l *recordingLogger) Log(label string, data Value) {
 	l.calls = append(l.calls, recordedLogCall{label: label, data: data})
 }
 
 type panicLogger struct{}
 
-func (panicLogger) Log(string, any) { panic("logger failed") }
+func (panicLogger) Log(string, Value) { panic("logger failed") }
 
 func TestLoggerPanicDoesNotAffectInterpretation(t *testing.T) {
 	var actions []string
@@ -36,7 +37,7 @@ func TestLoggerPanicDoesNotAffectInterpretation(t *testing.T) {
 				Atomic("active",
 					On("go", Target("target"), Then(
 						func(ec ExecContext) error {
-							ec.Log("diagnostic", 42)
+							ec.Log("diagnostic", Int64Value(42))
 							actions = append(actions, "after-log")
 							return nil
 						},
@@ -71,7 +72,7 @@ func TestLoggerPanicDoesNotAffectInterpretation(t *testing.T) {
 
 func TestExecContextLogCallsConfiguredLogger(t *testing.T) {
 	logOnEntry := Action(func(d *Door, ec ExecContext) error {
-		ec.Log("entered", "open")
+		ec.Log("entered", testStringValue("open"))
 		return nil
 	})
 
@@ -104,8 +105,34 @@ func TestExecContextLogCallsConfiguredLogger(t *testing.T) {
 	if len(rec.calls) != 1 {
 		t.Fatalf("logger recorded %d calls, want 1: %v", len(rec.calls), rec.calls)
 	}
-	if rec.calls[0].label != "entered" || rec.calls[0].data != "open" {
+	if rec.calls[0].label != "entered" || !rec.calls[0].data.Equal(testStringValue("open")) {
 		t.Fatalf("logger recorded %+v, want {entered open}", rec.calls[0])
+	}
+}
+
+func TestExecContextLogClonesValueAtEvaluation(t *testing.T) {
+	source := map[string]Value{"count": Int64Value(1)}
+	payload := Value{kind: ValueKindMap, object: source}
+	rec := &recordingLogger{}
+	chart, err := Build(Atomic("ready", OnEntry(func(ec ExecContext) error {
+		ec.Log("payload", payload)
+		source["count"] = Int64Value(9)
+		return nil
+	})))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	in := New(chart, nil, WithLogger(rec))
+	if err := in.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(context.Background())
+	if len(rec.calls) != 1 {
+		t.Fatalf("logger recorded %d calls, want 1", len(rec.calls))
+	}
+	fields, ok := rec.calls[0].data.AsMap()
+	if !ok || !fields["count"].Equal(Int64Value(1)) {
+		t.Fatalf("logged payload = %#v, want isolated count=1", rec.calls[0].data)
 	}
 }
 
@@ -115,10 +142,10 @@ func TestExecContextLogCallsConfiguredLogger(t *testing.T) {
 // default Instance.
 func TestExecContextLogIsNoopWithoutLogger(t *testing.T) {
 	var bare ExecContext
-	bare.Log("label", "data") // must not panic
+	bare.Log("label", testStringValue("data")) // must not panic
 
 	logOnEntry := Action(func(d *Door, ec ExecContext) error {
-		ec.Log("entered", "open")
+		ec.Log("entered", testStringValue("open"))
 		return nil
 	})
 	chart, err := Build(
@@ -153,9 +180,9 @@ func TestExecContextLogIsNoopWithoutLogger(t *testing.T) {
 func TestWriterLoggerWritesLine(t *testing.T) {
 	var buf bytes.Buffer
 	l := NewWriterLogger(&buf)
-	l.Log("received", 42)
+	l.Log("received", Int64Value(42))
 
-	want := "received: 42\n"
+	want := fmt.Sprintf("received: %v\n", Int64Value(42))
 	if got := buf.String(); got != want {
 		t.Fatalf("WriterLogger wrote %q, want %q", got, want)
 	}
@@ -179,7 +206,7 @@ func TestWriterLoggerConcurrentLogIsRaceFree(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			for i := 0; i < callsEach; i++ {
-				l.Log("concurrent", g*callsEach+i)
+				l.Log("concurrent", Int64Value(int64(g*callsEach+i)))
 			}
 		}(g)
 	}
@@ -195,7 +222,7 @@ type spyLogger struct {
 	logCount int
 }
 
-func (s *spyLogger) Log(string, any) { s.logCount++ }
+func (s *spyLogger) Log(string, Value) { s.logCount++ }
 
 func TestRehydrateSuppressesLoggerDuringReplayThenGoesLive(t *testing.T) {
 	ctx := context.Background()
@@ -204,7 +231,7 @@ func TestRehydrateSuppressesLoggerDuringReplayThenGoesLive(t *testing.T) {
 	sessionID := SessionID("sess-logger")
 
 	logAction := func(ec ExecContext) error {
-		ec.Log("transition", nil)
+		ec.Log("transition", Value{})
 		return nil
 	}
 

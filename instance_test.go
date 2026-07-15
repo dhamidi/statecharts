@@ -831,15 +831,18 @@ func TestInstanceSCXMLAliasUsesMandatoryProcessorAndCanonicalRequestType(t *test
 }
 
 func TestDelayedSCXMLSelfSendSnapshotsPayloadWhenEvaluated(t *testing.T) {
-	type payload struct{ Values map[string]int }
-	original := &payload{Values: map[string]int{"count": 1}}
-	var received *payload
+	originalValues := map[string]Value{"count": Int64Value(1)}
+	original, err := MapValue(originalValues)
+	if err != nil {
+		t.Fatalf("MapValue: %v", err)
+	}
+	var received Value
 	clock := NewManualClock(time.Unix(0, 0))
 	chart, err := Build(Atomic("root",
 		OnEntry(SendEvent("later", SendOptions{Data: original, Delay: time.Second})),
 		On("later", Then(func(ec ExecContext) error {
 			ev, _ := ec.Event()
-			received = ev.Data.(*payload)
+			received = ev.Data
 			return nil
 		})),
 	))
@@ -852,7 +855,7 @@ func TestDelayedSCXMLSelfSendSnapshotsPayloadWhenEvaluated(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer in.Stop(ctx)
-	original.Values["count"] = 2
+	originalValues["count"] = Int64Value(2)
 	clock.Advance(time.Second)
 	// ManualClock fires the actor timer synchronously, but actorClock queues
 	// its callback on the instance. A synchronous Send is a deterministic
@@ -860,7 +863,8 @@ func TestDelayedSCXMLSelfSendSnapshotsPayloadWhenEvaluated(t *testing.T) {
 	if err := in.Send(ctx, Event{Name: "barrier", Type: EventExternal}); err != nil {
 		t.Fatalf("barrier Send: %v", err)
 	}
-	if received == nil || received == original || received.Values["count"] != 1 {
+	receivedMap, ok := received.AsMap()
+	if !ok || !receivedMap["count"].Equal(Int64Value(1)) {
 		t.Fatalf("received payload = %#v, want isolated evaluation-time snapshot with count 1", received)
 	}
 }
@@ -1123,7 +1127,7 @@ func TestInstanceRestorePreservesEqualDeadlineSendOrder(t *testing.T) {
 func TestInstanceResultUsesTopLevelFinalDoneData(t *testing.T) {
 	chart, err := Build(
 		Compound("root", "done", Children(
-			Final("done", WithDone(func(ExecContext) any { return "root result" })),
+			Final("done", WithDone(func(ExecContext) Value { return testStringValue("root result") })),
 		)),
 	)
 	if err != nil {
@@ -1138,7 +1142,7 @@ func TestInstanceResultUsesTopLevelFinalDoneData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Result: %v", err)
 	}
-	if got != "root result" {
+	if !got.Equal(testStringValue("root result")) {
 		t.Fatalf("Result = %#v, want root result", got)
 	}
 }

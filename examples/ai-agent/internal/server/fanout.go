@@ -17,7 +17,8 @@ type fanoutBroadcast struct {
 	ConversationID protocol.ConversationID
 	Kind           string // "message" | "delta"
 	Seq            int    // Kind == "message" only
-	Frame          any    // protocol.MessageFrame (message) or deltaFrame (delta)
+	Message        protocol.MessageFrame
+	Delta          deltaFrame
 }
 
 // fanoutSubscribe is "subscribe"/"unsubscribe"'s payload -> fanout.
@@ -34,7 +35,7 @@ type fanoutModel struct {
 
 var subscribeConnection = statecharts.Action(func(d *fanoutModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	sub, ok := statecharts.Payload[fanoutSubscribe](ev)
+	sub, ok := decodeFanoutSubscribe(ev.Data)
 	if !ok {
 		return nil
 	}
@@ -49,7 +50,7 @@ var subscribeConnection = statecharts.Action(func(d *fanoutModel, ec statecharts
 
 var unsubscribeConnection = statecharts.Action(func(d *fanoutModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	sub, ok := statecharts.Payload[fanoutSubscribe](ev)
+	sub, ok := decodeFanoutSubscribe(ev.Data)
 	if !ok {
 		return nil
 	}
@@ -65,14 +66,14 @@ var unsubscribeConnection = statecharts.Action(func(d *fanoutModel, ec statechar
 
 var forwardBroadcast = statecharts.Action(func(d *fanoutModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	bc, ok := statecharts.Payload[*fanoutBroadcast](ev)
+	bc, ok := decodeFanoutBroadcast(ev.Data)
 	if !ok {
 		return nil
 	}
 	subs := append([]protocol.ConnectionID(nil), d.Subscribers[bc.ConversationID]...)
 	sort.Slice(subs, func(i, j int) bool { return subs[i] < subs[j] }) // deterministic order, not that it matters for a fanout
 	for _, conn := range subs {
-		ec.Send("fanout_frame", statecharts.SendOptions{Target: statecharts.Identifier(conn), Data: bc})
+		ec.Send("fanout_frame", statecharts.SendOptions{Target: statecharts.Identifier(conn), Data: encodeFanoutBroadcast(bc)})
 	}
 	return nil
 })

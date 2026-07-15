@@ -21,53 +21,50 @@ type userModel struct {
 
 func notAlreadyKnown(d *userModel, ec statecharts.ExecContext) bool {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*registerConversationPayload](ev)
+	payload, ok := decodeRegister(ev.Data)
 	if !ok {
 		return false
 	}
-	_, known := d.Conversations[payload.Value.ID]
+	_, known := d.Conversations[payload.ID]
 	return !known
 }
 
 var addConversation = statecharts.Action(func(d *userModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*registerConversationPayload](ev)
+	payload, ok := decodeRegister(ev.Data)
 	if !ok {
 		return nil
 	}
-	d.Conversations[payload.Value.ID] = conversationSummary{Title: payload.Value.Title, State: protocol.ConversationIdle}
+	d.Conversations[payload.ID] = conversationSummary{Title: payload.Title, State: protocol.ConversationIdle}
 	return nil
 })
 
 func isKnownConversation(d *userModel, ec statecharts.ExecContext) bool {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*conversationStatePayload](ev)
+	payload, ok := decodeConversationState(ev.Data)
 	if !ok {
 		return false
 	}
-	_, known := d.Conversations[payload.Value.ID]
+	_, known := d.Conversations[payload.ID]
 	return known
 }
 
 var updateConversationState = statecharts.Action(func(d *userModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*conversationStatePayload](ev)
+	payload, ok := decodeConversationState(ev.Data)
 	if !ok {
 		return nil
 	}
-	summary := d.Conversations[payload.Value.ID]
-	summary.State = payload.Value.State
-	d.Conversations[payload.Value.ID] = summary
+	summary := d.Conversations[payload.ID]
+	summary.State = payload.State
+	d.Conversations[payload.ID] = summary
 	return nil
 })
 
 func syncOne(ec statecharts.ExecContext, id protocol.ConversationID, summary conversationSummary) {
 	ec.Send("sync", statecharts.SendOptions{
 		Target: "directory",
-		Data: &directorySyncPayload{
-			TypeName: "aiagent.directory_sync",
-			Value:    protocol.ConversationSummary{ID: id, Title: summary.Title, State: summary.State},
-		},
+		Data:   encodeSummary(protocol.ConversationSummary{ID: id, Title: summary.Title, State: summary.State}),
 	})
 }
 
@@ -79,12 +76,11 @@ func syncOne(ec statecharts.ExecContext, id protocol.ConversationID, summary con
 var forwardSync = statecharts.Action(func(d *userModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
 	var id protocol.ConversationID
-	switch payload := ev.Data.(type) {
-	case *registerConversationPayload:
-		id = payload.Value.ID
-	case *conversationStatePayload:
-		id = payload.Value.ID
-	default:
+	if payload, ok := decodeRegister(ev.Data); ok {
+		id = payload.ID
+	} else if payload, ok := decodeConversationState(ev.Data); ok {
+		id = payload.ID
+	} else {
 		return nil
 	}
 	summary, ok := d.Conversations[id]

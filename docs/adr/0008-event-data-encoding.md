@@ -1,54 +1,43 @@
-# 8. Event.Data persisted via explicit marshaler interfaces, not gob
+# 8. Event.Data persisted as one canonical Value
 
 Date: 2026-07-13
 
 ## Status
 
-Accepted
+Accepted (revised by the pre-v1 payload cutover in issue #9)
 
 ## Context
 
-`Event.Data` is an arbitrary Go value (there is no expression language or
-generic datamodel to introspect, per ADR 0004), so persisting an `Event` —
-in a `Snapshot`'s queues/pending-sends, or in a `Log` entry — needs a way to
-encode and later reconstruct whatever concrete type a caller put in `Data`.
+Events cross datamodel, session, actor, process, snapshot, log, and durable
+outbox boundaries. Allowing each concrete Go type to choose its own encoding
+made those boundaries depend on process-global registration and prevented
+other datamodel runtimes from interpreting the same payload.
 
-Two approaches were considered:
-
-1. `encoding/gob` with `gob.Register`, relying on the application
-   registering every concrete `Data` type once at startup.
-2. An explicit `DataMarshaler`/`DataUnmarshaler` interface pair
-   (event_codec.go) plus an explicit `RegisterDataType(typeName, factory)`
-   registry, with the wire format itself left up to each `Data` type's own
-   implementation (a `JSONData[T]` convenience wrapper is provided via
-   `encoding/json` for callers who don't want to hand-write one).
+The canonical `Value` introduced for the serializable-definition architecture
+is a closed, syntax-neutral data union: null, boolean, UTF-8 string, exact
+decimal number, list, string-keyed map, and an application-tagged value. Its
+versioned marshal representation is deterministic and does not require a Go
+concrete type to decode.
 
 ## Decision
 
-Option 2. A `Log` is meant to be a long-lived, debuggable, replay-safe
-durability mechanism (ADR 0006) — `gob.Register`'s global mutable
-registration state (init-order fragility, awkward when tests run multiple
-type universes) and gob's opaque binary wire format (unreadable without
-decoding, which hurts the "debug a stuck replay in production" story this
-layer exists for) are the wrong trade for that. The explicit interface pair
-makes the registry's failure mode a clear, actionable error ("no registered
-data type %q") rather than a silent gob decode mismatch, and lets a caller
-choose any wire format for their own payload (JSON, protobuf, a hand-rolled
-format with an embedded schema version) without the persistence layer
-needing to know which.
+`Event.Data` and every other cross-runtime payload field use `Value` directly.
+Durable stores persist only `Value.MarshalBinary` bytes and reconstruct them
+with `Value.UnmarshalBinary`. Application payload identities use stable tags
+whose payloads are themselves canonical values.
 
-A `nil` or non-`DataMarshaler` `Data` value is an error when encoding
-(`EncodeEvent`, event_codec.go) — there is no reflection-based fallback,
-since silently dropping payload data would break replay fidelity.
+There is one durable codec. There is no process-global concrete-type registry,
+reflection fallback, or caller-selected alternate payload encoding. Platform
+errors that cross a session or durability boundary are explicit tagged values
+with stable classification and message fields rather than raw Go errors.
 
 ## Consequences
 
-- Every concrete `Data` type that will ever be persisted must implement
-  `DataMarshaler`/`DataUnmarshaler` (or be wrapped in `JSONData[T]`) and be
-  registered once via `RegisterDataType` at program startup.
-- `Snapshot`'s JSON envelope (`MarshalJSON`/`UnmarshalJSON` in snapshot.go)
-  and the `sqllog` subpackage's `data_type`/`data_payload` columns both
-  reuse `EncodeEvent`/`DecodeEvent`, so there is exactly one encoding path
-  to keep correct and to extend if a new wire format is ever needed.
-- Events with `Data == nil` (the common case for pure signal events) encode
-  and decode with zero registry involvement.
+- Event, send, invoke, log, snapshot, actor bridge, and durable outbox payloads
+  share one representation and clone at their semantic boundaries.
+- Snapshot event queues and SQL log/outbox rows reuse the same event codec.
+- A zero `Value` is canonical null, so signal-only events require no special
+  case or registration.
+- This was a direct pre-v1 replacement. Persisted payloads and SQL schemas from
+  the earlier concrete-type encoding are rejected rather than migrated or read
+  through a compatibility path.

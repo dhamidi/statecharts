@@ -63,7 +63,7 @@ type Checkpoint struct {
 	Seq      uint64
 }
 
-const snapshotVersion = 3
+const snapshotVersion = 4
 
 // Snapshot captures this Instance's current state (safely, by running on
 // the interpreter's own goroutine), suitable for persisting and later
@@ -101,8 +101,8 @@ func (in *Instance) buildSnapshot() (Snapshot, error) {
 		ID:                ip.sessionID,
 		Configuration:     ip.activeStates(),
 		HistoryValue:      map[Identifier][]Identifier{},
-		InternalQueue:     append([]Event(nil), ip.internalQueue...),
-		ExternalQueue:     append([]Event(nil), ip.externalQueue...),
+		InternalQueue:     cloneEvents(ip.internalQueue),
+		ExternalQueue:     cloneEvents(ip.externalQueue),
 		Running:           ip.running,
 		SendSeq:           ip.sendSeq,
 		InvokeSeq:         ip.invokeSeq,
@@ -134,7 +134,7 @@ func (in *Instance) buildSnapshot() (Snapshot, error) {
 			SendID: rec.sendID,
 			Target: rec.target,
 			Type:   rec.typ,
-			Event:  rec.event,
+			Event:  cloneEvent(rec.event),
 			FireAt: rec.fireAt,
 		})
 	}
@@ -292,8 +292,8 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 
 	ip.configuration = configuration
 	ip.historyValue = historyValue
-	ip.internalQueue = append([]Event(nil), snap.InternalQueue...)
-	ip.externalQueue = append([]Event(nil), snap.ExternalQueue...)
+	ip.internalQueue = cloneEvents(snap.InternalQueue)
+	ip.externalQueue = cloneEvents(snap.ExternalQueue)
 	ip.running = snap.Running
 	ip.sendSeq = snap.SendSeq
 	ip.invokeSeq = snap.InvokeSeq
@@ -309,7 +309,7 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 			sendID: sendID,
 			target: ps.Target,
 			typ:    ps.Type,
-			event:  ps.Event,
+			event:  cloneEvent(ps.Event),
 			fireAt: ps.FireAt,
 			order:  i + 1,
 		}
@@ -357,8 +357,8 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 
 // --- JSON envelope -------------------------------------------------------
 //
-// Snapshot's own fields are otherwise JSON-friendly; only Event.Data (an
-// arbitrary Go value) needs help, via EncodeEvent/DecodeEvent (event_codec.go).
+// Snapshot's event payloads use EncodeEvent/DecodeEvent so the only durable
+// representation of Data is canonical Value marshal bytes.
 
 type snapshotWire struct {
 	Version           int                         `json:"version"`

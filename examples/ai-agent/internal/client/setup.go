@@ -62,7 +62,7 @@ func Setup(ctx context.Context, sys *actors.System, serverAddr string, tools []p
 	if initialConversation != "" {
 		if err := sys.Tell(ctx, "link", statecharts.Event{
 			Name: "switch", Type: statecharts.EventExternal,
-			Data: switchRequest{ConversationID: initialConversation},
+			Data: switchValue(initialConversation),
 		}); err != nil {
 			return fmt.Errorf("examples/ai-agent: initial switch: %w", err)
 		}

@@ -154,6 +154,36 @@ func TestValueNumbersAreExactAndRejectUnsupportedForms(t *testing.T) {
 	}
 }
 
+func TestValueAsInt64AcceptsCanonicalExponentIntegers(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int64
+		ok    bool
+	}{
+		{"0", 0, true},
+		{"10", 10, true},
+		{"-1000", -1000, true},
+		{"9223372036854775807", math.MaxInt64, true},
+		{"-9223372036854775808", math.MinInt64, true},
+		{"1.5", 0, false},
+		{"9223372036854775808", 0, false},
+		{"1e99999999999999999999", 0, false},
+	}
+	for _, test := range tests {
+		value, err := NumberValue(test.input)
+		if err != nil {
+			t.Fatalf("NumberValue(%q): %v", test.input, err)
+		}
+		got, ok := value.AsInt64()
+		if got != test.want || ok != test.ok {
+			t.Errorf("NumberValue(%q).AsInt64() = (%d, %t), want (%d, %t); canonical number is %q", test.input, got, ok, test.want, test.ok, value.text)
+		}
+	}
+	if _, ok := BoolValue(true).AsInt64(); ok {
+		t.Fatal("BoolValue(true).AsInt64() succeeded")
+	}
+}
+
 func TestValueMapEncodingIsDeterministic(t *testing.T) {
 	left := mustMapValue(t, map[string]Value{
 		"z": Int64Value(1),

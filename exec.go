@@ -18,7 +18,7 @@ type ExecContext struct {
 	raise             func(Event)
 	send              func(name Identifier, opts SendOptions)
 	cancel            func(sendID Identifier)
-	log               func(label string, data any)
+	log               func(label string, data Value)
 	reportError       func(error)
 	ioProcessors      func() []IOProcessorInfo
 }
@@ -133,13 +133,13 @@ func (ec ExecContext) Cancel(sendID Identifier) {
 }
 
 // Log records one diagnostic entry, mirroring <log>: label names it, data
-// carries whatever value the call site wants recorded. It is routed to
+// carries canonical data. It is routed to
 // whichever Logger the owning Instance was configured with (see
 // WithLogger), and is a silent no-op if none was. Unlike Send, Log never
 // produces an event another transition can match against, and unlike
 // Raise, it never touches either event queue -- it exists purely for a
 // human or a log aggregator to read.
-func (ec ExecContext) Log(label string, data any) {
+func (ec ExecContext) Log(label string, data Value) {
 	if ec.log != nil {
 		ec.log(label, data)
 	}
@@ -156,8 +156,8 @@ type ActionFunc func(ExecContext) error
 // express it as state plus a preceding action instead.
 type CondFunc func(ExecContext) bool
 
-// DoneDataFunc produces the payload for a final state's done event.
-type DoneDataFunc func(ExecContext) any
+// DoneDataFunc produces the canonical payload for a final state's done event.
+type DoneDataFunc func(ExecContext) Value
 
 // actionBlock is one SCXML block of executable content. An error skips the
 // rest of this block without affecting later blocks (for example, a second

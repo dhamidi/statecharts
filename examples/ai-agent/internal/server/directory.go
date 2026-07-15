@@ -49,66 +49,66 @@ func broadcastUpsert(d *directoryModel, cs protocol.ConversationSummary) {
 
 var applySync = statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*directorySyncPayload](ev)
+	payload, ok := decodeSummary(ev.Data)
 	if !ok {
 		return nil
 	}
-	cs := payload.Value
+	cs := payload
 	d.Items[cs.ID] = cs
 	broadcastUpsert(d, cs)
 	return nil
 })
 
-var replyWithList = statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
-	ev, _ := ec.Event()
-	reply, ok := statecharts.Payload[chan<- []protocol.ConversationSummary](ev)
-	if !ok {
-		return nil
-	}
-	reply <- snapshotList(d)
-	return nil
-})
-
-// directoryWatchRequest is "watch"'s payload -> directory, from a freshly
-// opened GET /directory/events request. Reply carries back the channel that
-// request's own goroutine reads one upserted protocol.ConversationSummary
-// from at a time, for as long as the request lasts, until "unwatch".
-type directoryWatchRequest struct {
-	Reply chan<- chan protocol.ConversationSummary
-}
-
-var watchDirectory = statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
-	ev, _ := ec.Event()
-	req, ok := statecharts.Payload[directoryWatchRequest](ev)
-	if !ok {
-		return nil
-	}
-	ch := make(chan protocol.ConversationSummary, 8)
-	d.Watchers = append(d.Watchers, ch)
-	req.Reply <- ch
-	return nil
-})
-
-// directoryUnwatchRequest is "unwatch"'s payload -> directory, sent when a
-// GET /directory/events request ends.
-type directoryUnwatchRequest struct {
-	Channel chan protocol.ConversationSummary
-}
-
-var unwatchDirectory = statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
-	ev, _ := ec.Event()
-	req, ok := statecharts.Payload[directoryUnwatchRequest](ev)
-	if !ok {
-		return nil
-	}
-	for i, ch := range d.Watchers {
-		if ch == req.Channel {
-			d.Watchers = append(d.Watchers[:i], d.Watchers[i+1:]...)
-			break
+func replyWithList(requests *RequestRegistry) statecharts.ActionFunc {
+	return statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		id, ok := decodeDirectoryRequest(ev.Data)
+		if !ok {
+			return nil
 		}
-	}
-	return nil
-})
+		if reply, ok := requests.takeList(id); ok {
+			reply <- snapshotList(d)
+		}
+		return nil
+	})
+}
+func watchDirectory(requests *RequestRegistry) statecharts.ActionFunc {
+	return statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		id, ok := decodeDirectoryRequest(ev.Data)
+		if !ok {
+			return nil
+		}
+		reply, ok := requests.takeWatch(id)
+		if !ok {
+			return nil
+		}
+		ch := make(chan protocol.ConversationSummary, 8)
+		d.Watchers = append(d.Watchers, ch)
+		reply <- ch
+		return nil
+	})
+}
+func unwatchDirectory(requests *RequestRegistry) statecharts.ActionFunc {
+	return statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		id, ok := decodeDirectoryRequest(ev.Data)
+		if !ok {
+			return nil
+		}
+		target, ok := requests.takeUnwatch(id)
+		if !ok {
+			return nil
+		}
+		for i, ch := range d.Watchers {
+			if ch == target {
+				d.Watchers = append(d.Watchers[:i], d.Watchers[i+1:]...)
+				break
+			}
+		}
+		return nil
+	})
+}
 
 // DirectoryKind is the chart kind name the non-durable, singleton
 // "directory" actor is Registered and Spawned under.
@@ -123,13 +123,13 @@ const DirectoryKind statecharts.Identifier = "directory"
 // fresh full list to every GET /directory/events watcher, so a client's own
 // sidebar is push-driven, not polled (see http.go's handleDirectoryEvents
 // and internal/client's directorylink).
-func BuildDirectoryChart() (*statecharts.Chart, error) {
+func BuildDirectoryChart(requests *RequestRegistry) (*statecharts.Chart, error) {
 	return statecharts.Build(
 		statecharts.Atomic("directory",
 			statecharts.On("sync", statecharts.Then(applySync)),
-			statecharts.On("list", statecharts.Then(replyWithList)),
-			statecharts.On("watch", statecharts.Then(watchDirectory)),
-			statecharts.On("unwatch", statecharts.Then(unwatchDirectory)),
+			statecharts.On("list", statecharts.Then(replyWithList(requests))),
+			statecharts.On("watch", statecharts.Then(watchDirectory(requests))),
+			statecharts.On("unwatch", statecharts.Then(unwatchDirectory(requests))),
 		),
 		statecharts.WithNewDatamodel(func() any {
 			return &directoryModel{Items: map[protocol.ConversationID]protocol.ConversationSummary{}}

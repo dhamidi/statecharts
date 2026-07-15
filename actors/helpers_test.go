@@ -20,6 +20,24 @@ func hasStateID(ids []statecharts.Identifier, want statecharts.Identifier) bool 
 	return false
 }
 
+func mustStringValue(t *testing.T, value string) statecharts.Value {
+	t.Helper()
+	got, err := statecharts.StringValue(value)
+	if err != nil {
+		t.Fatalf("StringValue(%q): %v", value, err)
+	}
+	return got
+}
+
+func mustMapValue(t *testing.T, values map[string]statecharts.Value) statecharts.Value {
+	t.Helper()
+	got, err := statecharts.MapValue(values)
+	if err != nil {
+		t.Fatalf("MapValue: %v", err)
+	}
+	return got
+}
+
 // waitFor polls cond until it returns true or timeout elapses, failing t
 // otherwise. Cross-actor delivery hops through a goroutine (see router.go),
 // so tests that observe its effect need to wait for it rather than assert
@@ -197,9 +215,9 @@ func buildCallerChart(sink *[]*callerModel, target statecharts.Identifier) *stat
 func buildInvokingChart() *statecharts.Chart {
 	chart, err := statecharts.Build(
 		statecharts.Atomic("invoking",
-			statecharts.Invoke(func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
+			statecharts.Invoke(func(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
 				<-ctx.Done()
-				return nil, nil
+				return statecharts.NullValue(), nil
 			}),
 		),
 		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))

@@ -52,15 +52,11 @@ func (t *streamTransport) Send(ctx context.Context, req statecharts.SendRequest)
 	if ch == nil {
 		return fmt.Errorf("closed UI transport target %q", req.Target)
 	}
-	var frame []byte
-	switch v := req.Data.(type) {
-	case string:
-		frame = []byte(v)
-	case []byte:
-		frame = append([]byte(nil), v...)
-	default:
-		return fmt.Errorf("invalid stream frame %T", req.Data)
+	text, ok := req.Data.AsString()
+	if !ok {
+		return fmt.Errorf("invalid stream frame Value kind %q", req.Data.Kind())
 	}
+	frame := []byte(text)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -75,11 +71,42 @@ type counterRuntime struct {
 	counters, ui *actors.System
 	streams      *streamTransport
 	storage      *sqlite3.Storage
+	requests     *hubRequestRegistry
 }
 
+type hubRequest struct {
+	colors []string
+	reply  chan []projection
+}
+type hubRequestRegistry struct {
+	mu      sync.Mutex
+	next    uint64
+	pending map[string]hubRequest
+}
+
+func newHubRequestRegistry() *hubRequestRegistry {
+	return &hubRequestRegistry{pending: map[string]hubRequest{}}
+}
+func (r *hubRequestRegistry) add(q hubRequest) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.next++
+	id := strconv.FormatUint(r.next, 10)
+	r.pending[id] = q
+	return id
+}
+func (r *hubRequestRegistry) take(id string) (hubRequest, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	q, ok := r.pending[id]
+	delete(r.pending, id)
+	return q, ok
+}
+func (r *hubRequestRegistry) remove(id string) { r.mu.Lock(); delete(r.pending, id); r.mu.Unlock() }
+
 func setupCounters(ctx context.Context, store *sqlite3.Storage) (*counterRuntime, error) {
-	registerCounterDataTypes()
-	hubChart, err := buildHubChart()
+	requests := newHubRequestRegistry()
+	hubChart, err := buildHubChart(requests)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +136,7 @@ func setupCounters(ctx context.Context, store *sqlite3.Storage) (*counterRuntime
 		return nil, err
 	}
 	counters := actors.NewSystem(actors.WithNodeName("counters"), actors.WithStorage(store), actors.WithMaxResident(3), actors.WithIdleTimeout(time.Minute), actors.WithSCXMLPeer(bridge), actors.WithResidencyObserver(func(change actors.ResidencyChange) {
-		_ = ui.Tell(context.Background(), "hub", statecharts.Event{Name: "residency", Type: statecharts.EventExternal, Data: change})
+		_ = ui.Tell(context.Background(), "hub", statecharts.Event{Name: "residency", Type: statecharts.EventExternal, Data: taggedMap(residencyValueTag, map[string]statecharts.Value{"actor_id": stringValue(string(change.ActorID)), "state": stringValue(string(change.State))})})
 	}))
 	fail := func(e error) (*counterRuntime, error) {
 		_ = counters.Stop(context.Background())
@@ -130,7 +157,7 @@ func setupCounters(ctx context.Context, store *sqlite3.Storage) (*counterRuntime
 			return fail(err)
 		}
 	}
-	rt := &counterRuntime{counters: counters, ui: ui, streams: transport, storage: store}
+	rt := &counterRuntime{counters: counters, ui: ui, streams: transport, storage: store, requests: requests}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		ps, e := rt.query(ctx, colors)
@@ -147,13 +174,16 @@ func setupCounters(ctx context.Context, store *sqlite3.Storage) (*counterRuntime
 
 func (rt *counterRuntime) query(ctx context.Context, selected []string) ([]projection, error) {
 	reply := make(chan []projection, 1)
-	if err := rt.ui.Tell(ctx, "hub", statecharts.Event{Name: "query", Type: statecharts.EventExternal, Data: hubQuery{Colors: append([]string(nil), selected...), Reply: reply}}); err != nil {
+	id := rt.requests.add(hubRequest{colors: append([]string(nil), selected...), reply: reply})
+	if err := rt.ui.Tell(ctx, "hub", statecharts.Event{Name: "query", Type: statecharts.EventExternal, Data: taggedMap(hubQueryValueTag, map[string]statecharts.Value{"request_id": stringValue(id)})}); err != nil {
+		rt.requests.remove(id)
 		return nil, err
 	}
 	select {
 	case p := <-reply:
 		return p, nil
 	case <-ctx.Done():
+		rt.requests.remove(id)
 		return nil, ctx.Err()
 	}
 }
@@ -259,7 +289,7 @@ func (rt *counterRuntime) streamHandler(mode string, choose func(*http.Request) 
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		if err = rt.ui.Tell(r.Context(), actorID, statecharts.Event{Name: "start", Type: statecharts.EventExternal, Data: streamStart{Mode: mode, Colors: selected, Output: output}}); err != nil {
+		if err = rt.ui.Tell(r.Context(), actorID, statecharts.Event{Name: "start", Type: statecharts.EventExternal, Data: taggedMap(streamStartValueTag, map[string]statecharts.Value{"mode": stringValue(mode), "colors": encodeStrings(selected), "output": stringValue(string(output))})}); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}

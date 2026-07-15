@@ -6,6 +6,14 @@ import (
 	"testing"
 )
 
+func testStringValue(s string) Value {
+	v, err := StringValue(s)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 type Door struct {
 	OpenCount int
 	Locked    bool
@@ -199,7 +207,7 @@ func TestBuildCompoundInitialCanTargetDeepDescendant(t *testing.T) {
 }
 
 func TestBuildValidationErrors(t *testing.T) {
-	invoke := Invoke(func(context.Context, any, InvokeIO) (any, error) { return nil, nil })
+	invoke := Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil })
 	cases := []struct {
 		name string
 		spec StateSpec
@@ -318,7 +326,7 @@ func TestBuildValidationErrors(t *testing.T) {
 		},
 		{
 			name: "done data is attached to non-final state",
-			spec: Atomic("root", WithDone(func(ExecContext) any { return "unused" })),
+			spec: Atomic("root", WithDone(func(ExecContext) Value { return testStringValue("unused") })),
 		},
 		{
 			name: "transition has no event condition or target",
@@ -347,8 +355,8 @@ func TestBuildValidationErrors(t *testing.T) {
 			name: "duplicate explicit invoke ids",
 			spec: Compound("root", "parallel", Children(
 				Parallel("parallel", Children(
-					Atomic("a", Invoke(func(context.Context, any, InvokeIO) (any, error) { return nil, nil }, WithInvokeID("service"))),
-					Atomic("b", Invoke(func(context.Context, any, InvokeIO) (any, error) { return nil, nil }, WithInvokeID("service"))),
+					Atomic("a", Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }, WithInvokeID("service"))),
+					Atomic("b", Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }, WithInvokeID("service"))),
 				)),
 			)),
 		},
@@ -404,7 +412,7 @@ func TestBuildPreservesDirectActionsAddedAfterBuilderOptions(t *testing.T) {
 	spec := Atomic("root",
 		OnEntry(noop),
 		On("go", Then(noop)),
-		Invoke(func(context.Context, any, InvokeIO) (any, error) { return nil, nil }, WithFinalize(noop)),
+		Invoke(func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }, WithFinalize(noop)),
 	)
 	spec.OnEntry = append(spec.OnEntry, noop)
 	spec.Transitions[0].Actions = append(spec.Transitions[0].Actions, noop)
@@ -532,7 +540,7 @@ func TestChartNameIsIndependentOfRootID(t *testing.T) {
 }
 
 func TestBuildRejectsInvokeIDWithIDLocation(t *testing.T) {
-	service := func(context.Context, any, InvokeIO) (any, error) { return nil, nil }
+	service := func(context.Context, Value, InvokeIO) (Value, error) { return Value{}, nil }
 	_, err := Build(Atomic("root", Invoke(service,
 		WithInvokeID("service"),
 		WithInvokeIDLocation(func(ExecContext, Identifier) error { return nil }),

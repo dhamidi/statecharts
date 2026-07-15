@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -125,20 +126,19 @@ func TestReadStreamsInOrderFromOffset(t *testing.T) {
 	}
 }
 
-type payload struct {
-	Amount int `json:"amount"`
-}
-
 func TestAppendReadRoundTripsEventDataPayload(t *testing.T) {
-	statecharts.RegisterDataType("test.payload", func() statecharts.DataUnmarshaler {
-		return &statecharts.JSONData[payload]{TypeName: "test.payload"}
-	})
-
 	log := openTestLog(t)
 	ctx := context.Background()
 
-	data := statecharts.NewJSONData("test.payload", payload{Amount: 42})
-	_, err := log.Append(ctx, statecharts.LogEntry{
+	payload, err := statecharts.MapValue(map[string]statecharts.Value{"amount": statecharts.Int64Value(42)})
+	if err != nil {
+		t.Fatalf("MapValue: %v", err)
+	}
+	data, err := statecharts.TaggedValue("test.payload/v1", payload)
+	if err != nil {
+		t.Fatalf("TaggedValue: %v", err)
+	}
+	_, err = log.Append(ctx, statecharts.LogEntry{
 		SessionID: "s1", Kind: statecharts.KindExternalEvent,
 		Timestamp: time.Now().UTC(),
 		Event:     statecharts.Event{Name: "paid", Type: statecharts.EventExternal, Data: data},
@@ -155,12 +155,94 @@ func TestAppendReadRoundTripsEventDataPayload(t *testing.T) {
 		got = entry.Event
 	}
 
-	decoded, ok := got.Data.(*statecharts.JSONData[payload])
-	if !ok {
-		t.Fatalf("decoded Data type = %T, want *JSONData[payload]", got.Data)
+	if !got.Data.Equal(data) {
+		t.Fatalf("decoded Data = %#v, want %#v", got.Data, data)
 	}
-	if decoded.Value.Amount != 42 {
-		t.Fatalf("decoded amount = %d, want 42", decoded.Value.Amount)
+}
+
+func canonicalValues(t *testing.T) []statecharts.Value {
+	t.Helper()
+	text, err := statecharts.StringValue("hello")
+	if err != nil {
+		t.Fatalf("StringValue: %v", err)
+	}
+	number, err := statecharts.NumberValue("123.4500")
+	if err != nil {
+		t.Fatalf("NumberValue: %v", err)
+	}
+	object, err := statecharts.MapValue(map[string]statecharts.Value{"key": text})
+	if err != nil {
+		t.Fatalf("MapValue: %v", err)
+	}
+	tagged, err := statecharts.TaggedValue("test.value/v1", object)
+	if err != nil {
+		t.Fatalf("TaggedValue: %v", err)
+	}
+	return []statecharts.Value{
+		statecharts.NullValue(),
+		statecharts.BoolValue(true),
+		text,
+		number,
+		statecharts.ListValue([]statecharts.Value{text, number}),
+		object,
+		tagged,
+	}
+}
+
+func TestLogAndOutboxRoundTripEveryCanonicalValueKind(t *testing.T) {
+	store := openTestLog(t)
+	ctx := context.Background()
+	values := canonicalValues(t)
+
+	for i, value := range values {
+		if _, err := store.Append(ctx, statecharts.LogEntry{
+			SessionID: "value-log", Kind: statecharts.KindExternalEvent,
+			Timestamp: time.Unix(int64(i+1), 0).UTC(),
+			Event:     statecharts.Event{Name: statecharts.Identifier(fmt.Sprintf("kind-%d", i)), Data: value},
+		}); err != nil {
+			t.Fatalf("Append value %d (%s): %v", i, value.Kind(), err)
+		}
+
+		deliveryID := statecharts.DeliveryID(fmt.Sprintf("value-outbox:%d", i))
+		if err := store.StoreOutbound(ctx, statecharts.OutboundMessage{
+			SessionID: "value-outbox", DeliveryID: deliveryID,
+			Request: statecharts.SendRequest{
+				DeliveryID: deliveryID, SendID: statecharts.Identifier(fmt.Sprintf("send-%d", i)),
+				Target: "worker", Type: statecharts.SCXMLEventProcessor,
+				Event: statecharts.Identifier(fmt.Sprintf("kind-%d", i)), Data: value,
+			},
+		}); err != nil {
+			t.Fatalf("StoreOutbound value %d (%s): %v", i, value.Kind(), err)
+		}
+	}
+
+	var logValues []statecharts.Value
+	for entry, err := range store.Read(ctx, "value-log", 1) {
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		logValues = append(logValues, entry.Event.Data)
+	}
+	if len(logValues) != len(values) {
+		t.Fatalf("log values = %d, want %d", len(logValues), len(values))
+	}
+	for i := range values {
+		if !logValues[i].Equal(values[i]) {
+			t.Fatalf("log value %d = %#v, want %#v", i, logValues[i], values[i])
+		}
+	}
+
+	outbounds, err := store.Outbounds(ctx, "value-outbox")
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(outbounds) != len(values) {
+		t.Fatalf("outbox values = %d, want %d", len(outbounds), len(values))
+	}
+	for i := range values {
+		if !outbounds[i].Request.Data.Equal(values[i]) {
+			t.Fatalf("outbox value %d = %#v, want %#v", i, outbounds[i].Request.Data, values[i])
+		}
 	}
 }
 
@@ -189,7 +271,7 @@ func TestAppendReadRoundTripsTimerDispatchMetadata(t *testing.T) {
 	}
 }
 
-func TestNewMigratesLegacyLogForTimerType(t *testing.T) {
+func TestNewRejectsNonCurrentSchemaBeforeMutation(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
@@ -203,26 +285,62 @@ func TestNewMigratesLegacyLogForTimerType(t *testing.T) {
 		event_origin TEXT NOT NULL DEFAULT '', event_origin_type TEXT NOT NULL DEFAULT '',
 		event_invoke_id TEXT NOT NULL DEFAULT '', data_type TEXT NOT NULL DEFAULT '', data_payload BLOB,
 		PRIMARY KEY (session_id, seq)
-	)`)
+	); PRAGMA user_version=5`)
 	if err != nil {
 		t.Fatalf("create legacy schema: %v", err)
 	}
-	log, err := sqllog.New(db, sqllog.SQLite)
+	if _, err := sqllog.New(db, sqllog.SQLite); err == nil {
+		t.Fatal("New accepted a legacy schema")
+	}
+	rows, err := db.Query(`SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'statechart_%' ORDER BY name`)
 	if err != nil {
-		t.Fatalf("New with legacy schema: %v", err)
+		t.Fatalf("inspect rejected schema: %v", err)
 	}
-	if _, err := log.Append(context.Background(), statecharts.LogEntry{
-		SessionID: "legacy", Kind: statecharts.KindTimerFired, Timestamp: time.Unix(1, 0),
-		Type: "custom-io", Event: statecharts.Event{Name: "work"},
-	}); err != nil {
-		t.Fatalf("Append after migration: %v", err)
-	}
-	for entry, err := range log.Read(context.Background(), "legacy", 1) {
-		if err != nil {
-			t.Fatalf("Read after migration: %v", err)
+	defer rows.Close()
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			t.Fatalf("scan rejected schema: %v", err)
 		}
-		if entry.Type != "custom-io" {
-			t.Fatalf("Type after migration = %q, want custom-io", entry.Type)
+		tables = append(tables, table)
+	}
+	if len(tables) != 1 || tables[0] != "statechart_log" {
+		t.Fatalf("New mutated rejected schema tables: %v", tables)
+	}
+	var hasValueData int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('statechart_log') WHERE name='value_data'`).Scan(&hasValueData); err != nil {
+		t.Fatalf("inspect rejected columns: %v", err)
+	}
+	if hasValueData != 0 {
+		t.Fatal("New mutated the rejected legacy table")
+	}
+}
+
+func TestFreshSchemaUsesOnlyCanonicalPayloadColumns(t *testing.T) {
+	store := openTestLog(t)
+	for _, table := range []string{"statechart_log", "statechart_outbound"} {
+		rows, err := store.DB().Query(fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", table))
+		if err != nil {
+			t.Fatalf("inspect %s: %v", table, err)
+		}
+		columns := map[string]bool{}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				t.Fatalf("scan %s: %v", table, err)
+			}
+			columns[name] = true
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close %s columns: %v", table, err)
+		}
+		if !columns["value_data"] {
+			t.Fatalf("%s has no canonical value_data column: %v", table, columns)
+		}
+		if columns["data_type"] || columns["data_payload"] {
+			t.Fatalf("%s retains legacy payload columns: %v", table, columns)
 		}
 	}
 }
@@ -261,45 +379,6 @@ func TestStoreOutboundRejectsDeliveryIDCollision(t *testing.T) {
 	}
 	if len(messages) != 1 || messages[0].Request.Target != "worker-a" {
 		t.Fatalf("stored outbounds = %#v, want only original worker-a request", messages)
-	}
-}
-
-func TestNewMigratesVersionThreeOutboxResults(t *testing.T) {
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() { _ = db.Close() })
-	if _, err := db.Exec(`CREATE TABLE statechart_outbound (
-		session_id TEXT NOT NULL, delivery_id TEXT NOT NULL, send_id TEXT NOT NULL,
-		event_send_id TEXT NOT NULL, target TEXT NOT NULL, processor_type TEXT NOT NULL,
-		event_name TEXT NOT NULL, data_type TEXT NOT NULL DEFAULT '', data_payload BLOB,
-		status TEXT NOT NULL, PRIMARY KEY(session_id, delivery_id)
-	); PRAGMA user_version=3`); err != nil {
-		t.Fatalf("create version 3 schema: %v", err)
-	}
-	store, err := sqllog.New(db, sqllog.SQLite)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	message := statecharts.OutboundMessage{
-		SessionID: "sender", DeliveryID: "delivery-1", Status: statecharts.OutboundPending,
-		Request: statecharts.SendRequest{DeliveryID: "delivery-1", SendID: "send.1", Target: "worker", Type: statecharts.SCXMLEventProcessor, Event: "work"},
-	}
-	if err := store.StoreOutbound(context.Background(), message); err != nil {
-		t.Fatalf("StoreOutbound after migration: %v", err)
-	}
-	result := statecharts.OutboundResult{Error: "rejected", Execution: true, Synchronous: true}
-	if err := store.ResolveOutbound(context.Background(), message.SessionID, message.DeliveryID, result); err != nil {
-		t.Fatalf("ResolveOutbound after migration: %v", err)
-	}
-	messages, err := store.Outbounds(context.Background(), message.SessionID)
-	if err != nil {
-		t.Fatalf("Outbounds after migration: %v", err)
-	}
-	if len(messages) != 1 || messages[0].Result != result {
-		t.Fatalf("outbound result = %#v, want %#v", messages, result)
 	}
 }
 

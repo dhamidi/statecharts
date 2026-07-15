@@ -1386,9 +1386,9 @@ func TestDurableInvokeCompletionIsWriteAheadLogged(t *testing.T) {
 		statecharts.Compound("durable-invoke", "working",
 			statecharts.Children(
 				statecharts.Atomic("working",
-					statecharts.Invoke(func(context.Context, any, statecharts.InvokeIO) (any, error) {
+					statecharts.Invoke(func(context.Context, statecharts.Value, statecharts.InvokeIO) (statecharts.Value, error) {
 						<-complete
-						return nil, nil
+						return statecharts.NullValue(), nil
 					}, statecharts.WithInvokeID("job")),
 					statecharts.On("done.invoke.job", statecharts.Target("completed")),
 				),
@@ -1531,13 +1531,13 @@ func TestDurableActorDoesNotRestartInitialInvokeAfterCrashBeforeFirstMessage(t *
 			statecharts.Compound("initial-invoke", "invoking",
 				statecharts.Children(
 					statecharts.Atomic("invoking",
-						statecharts.Invoke(func(ctx context.Context, _ any, _ statecharts.InvokeIO) (any, error) {
+						statecharts.Invoke(func(ctx context.Context, _ statecharts.Value, _ statecharts.InvokeIO) (statecharts.Value, error) {
 							mu.Lock()
 							starts++
 							mu.Unlock()
 							startedOnce.Do(func() { close(started) })
 							<-ctx.Done()
-							return nil, nil
+							return statecharts.NullValue(), nil
 						}, statecharts.WithInvokeID("work")),
 						statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("recovered")),
 					),

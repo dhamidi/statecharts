@@ -58,7 +58,7 @@ type toolRegistryModel struct {
 func claimLease(clock statecharts.Clock) statecharts.ActionFunc {
 	return statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		c, ok := statecharts.Payload[toolClaim](ev)
+		c, ok := decodeToolClaim(ev.Data)
 		if !ok {
 			return nil
 		}
@@ -78,7 +78,7 @@ func claimLease(clock statecharts.Clock) statecharts.ActionFunc {
 
 var releaseLease = statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	c, ok := statecharts.Payload[toolClaim](ev)
+	c, ok := decodeToolClaim(ev.Data)
 	if !ok {
 		return nil
 	}
@@ -104,7 +104,7 @@ var releaseLease = statecharts.Action(func(d *toolRegistryModel, ec statecharts.
 func offerToRegistry(clock statecharts.Clock) statecharts.ActionFunc {
 	return statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		offer, ok := statecharts.Payload[*toolOffer](ev)
+		offer, ok := decodeToolOffer(ev.Data)
 		if !ok {
 			return nil
 		}
@@ -119,9 +119,9 @@ func offerToRegistry(clock statecharts.Clock) statecharts.ActionFunc {
 		d.Leases[offer.Tool] = lease
 		ec.Send("tool_call", statecharts.SendOptions{
 			Target: statecharts.Identifier(lease.Owner),
-			Data: toolCallDelivery{
+			Data: encodeToolCall(toolCallDelivery{
 				ConversationID: offer.ConversationID, CallID: offer.CallID, Name: offer.Tool, Args: offer.Args,
-			},
+			}),
 		})
 		return nil
 	})

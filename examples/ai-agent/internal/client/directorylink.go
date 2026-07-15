@@ -34,26 +34,28 @@ type directoryLinkModel struct {
 // connections to the workspace server, sidestepping the browser's own
 // six-connections-per-origin limit on the *other* side of this client
 // entirely, since it isn't the browser holding this connection at all.
-func dialDirectoryEvents(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
-	p, _ := params.(directoryLinkModel)
+func dialDirectoryEvents(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
+	m, _ := fields(params, tagDirectoryParams)
+	addr, _ := stringField(m, "server_addr")
+	p := directoryLinkModel{ServerAddr: addr}
 
 	u, err := url.Parse(p.ServerAddr)
 	if err != nil {
-		return nil, err
+		return statecharts.NullValue(), err
 	}
 	u = u.JoinPath("directory", "events")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
+		return statecharts.NullValue(), err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return statecharts.NullValue(), err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("client: dial %s: unexpected status %s", u, resp.Status)
+		return statecharts.NullValue(), fmt.Errorf("client: dial %s: unexpected status %s", u, resp.Status)
 	}
 	io.Deliver(statecharts.Event{Name: "connected"})
 
@@ -68,12 +70,12 @@ func dialDirectoryEvents(ctx context.Context, params any, io statecharts.InvokeI
 		case "list":
 			var items []protocol.ConversationSummary
 			if err := json.Unmarshal([]byte(data), &items); err == nil {
-				io.Deliver(statecharts.Event{Name: "directory_frame", Data: items})
+				io.Deliver(statecharts.Event{Name: "directory_frame", Data: summariesValue(items)})
 			}
 		case "conversation":
 			var cs protocol.ConversationSummary
 			if err := json.Unmarshal([]byte(data), &cs); err == nil {
-				io.Deliver(statecharts.Event{Name: "directory_upsert", Data: cs})
+				io.Deliver(statecharts.Event{Name: "directory_upsert", Data: summaryValue(cs)})
 			}
 		}
 		event, data = "", ""
@@ -90,36 +92,36 @@ func dialDirectoryEvents(ctx context.Context, params any, io statecharts.InvokeI
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return statecharts.NullValue(), err
 	}
-	return nil, fmt.Errorf("client: server closed the directory event stream")
+	return statecharts.NullValue(), fmt.Errorf("client: server closed the directory event stream")
 }
 
-func computeDirectoryInvokeParams(ec statecharts.ExecContext) any {
+func computeDirectoryInvokeParams(ec statecharts.ExecContext) statecharts.Value {
 	d, _ := ec.Datamodel().(*directoryLinkModel)
 	if d == nil {
-		return directoryLinkModel{}
+		return taggedMap(tagDirectoryParams, map[string]statecharts.Value{"server_addr": str("")})
 	}
-	return *d
+	return taggedMap(tagDirectoryParams, map[string]statecharts.Value{"server_addr": str(d.ServerAddr)})
 }
 
 var forwardDirectorySnapshot = statecharts.Action(func(d *directoryLinkModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	items, ok := statecharts.Payload[[]protocol.ConversationSummary](ev)
+	items, ok := decodeSummaries(ev.Data)
 	if !ok {
 		return nil
 	}
-	ec.Send("directory_snapshot", statecharts.SendOptions{Target: "ui", Data: items})
+	ec.Send("directory_snapshot", statecharts.SendOptions{Target: "ui", Data: summariesValue(items)})
 	return nil
 })
 
 var forwardDirectoryUpsert = statecharts.Action(func(d *directoryLinkModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	cs, ok := statecharts.Payload[protocol.ConversationSummary](ev)
+	cs, ok := decodeSummary(ev.Data)
 	if !ok {
 		return nil
 	}
-	ec.Send("directory_upsert", statecharts.SendOptions{Target: "ui", Data: cs})
+	ec.Send("directory_upsert", statecharts.SendOptions{Target: "ui", Data: summaryValue(cs)})
 	return nil
 })
 

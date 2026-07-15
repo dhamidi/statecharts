@@ -120,7 +120,7 @@ func (b *Bridge) send(ctx context.Context, req statecharts.SendRequest, complete
 	ev := statecharts.Event{
 		Name:       req.Event,
 		Type:       statecharts.EventExternal,
-		Data:       req.Data,
+		Data:       req.Data.Clone(),
 		SendID:     req.EventSendID,
 		Origin:     origin,
 		OriginType: statecharts.SCXMLEventProcessorAlias,

@@ -37,174 +37,96 @@ func (l *Storage) DB() *sql.DB { return l.db }
 // caller is responsible for importing, opening, and configuring its driver.
 // No external migration tool is used or required.
 func New(db *sql.DB, dialect Dialect) (*Storage, error) {
-	if dialect != SQLite {
-		return nil, fmt.Errorf("sqllog: dialect %q is not supported", dialect)
-	}
-	if err := migrateSchema(db); err != nil {
+	if err := initializeSchema(db, dialect); err != nil {
 		return nil, err
 	}
 	return &Storage{db: db, dialect: dialect}, nil
 }
 
-func migrateSchema(db *sql.DB) (err error) {
-	ctx := context.Background()
-	conn, err := db.Conn(ctx)
+const schemaVersion = 1
+
+func initializeSchema(db *sql.DB, dialect Dialect) (err error) {
+	statements, err := ddlFor(dialect)
 	if err != nil {
-		return fmt.Errorf("sqllog: migration connection: %w", err)
+		return err
 	}
-	defer conn.Close()
-	if _, err = conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return fmt.Errorf("sqllog: begin migration: %w", err)
+	tableQuery, err := tableQueryFor(dialect)
+	if err != nil {
+		return err
 	}
-	defer func() {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqllog: begin schema transaction: %w", err)
+	}
+	defer tx.Rollback()
+	tables, err := schemaTables(ctx, tx, tableQuery)
+	if err != nil {
+		return fmt.Errorf("sqllog: inspect schema: %w", err)
+	}
+	if len(tables) > 0 {
+		if !tables["statechart_schema"] {
+			return fmt.Errorf("sqllog: non-current schema has no version marker")
+		}
+		var count, version int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(version), 0) FROM statechart_schema`).Scan(&count, &version); err != nil {
+			return fmt.Errorf("sqllog: read schema version: %w", err)
+		}
+		if count != 1 || version != schemaVersion {
+			return fmt.Errorf("sqllog: schema version %d is not current (want %d)", version, schemaVersion)
+		}
+		if err := validateSchema(ctx, tx); err != nil {
+			return fmt.Errorf("sqllog: non-current schema: %w", err)
+		}
+		return nil
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("sqllog: create schema: %w", err)
+		}
+	}
+	if err := validateSchema(ctx, tx); err != nil {
+		return fmt.Errorf("sqllog: validate fresh schema: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO statechart_schema(version) VALUES (?)`, schemaVersion); err != nil {
+		return fmt.Errorf("sqllog: record schema version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqllog: commit schema: %w", err)
+	}
+	return nil
+}
+
+func schemaTables(ctx context.Context, tx *sql.Tx, query string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tables := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		tables[name] = true
+	}
+	return tables, rows.Err()
+}
+
+func validateSchema(ctx context.Context, tx *sql.Tx) error {
+	queries := []string{
+		`SELECT session_id,seq,kind,ts,entry_send_id,entry_target,entry_type,event_name,event_type,event_send_id,event_origin,event_origin_type,event_invoke_id,delivery_id,value_data FROM statechart_log WHERE 1=0`,
+		`SELECT session_id,seq,snapshot_json FROM statechart_snapshot WHERE 1=0`,
+		`SELECT session_id,delivery_id FROM statechart_inbound WHERE 1=0`,
+		`SELECT session_id,delivery_id,seq,send_id,event_send_id,target,processor_type,event_name,value_data,status,result_error,result_execution,result_synchronous FROM statechart_outbound WHERE 1=0`,
+	}
+	for _, query := range queries {
+		rows, err := tx.QueryContext(ctx, query)
 		if err != nil {
-			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
-		}
-	}()
-	var version int
-	if err = conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		return fmt.Errorf("sqllog: read schema version: %w", err)
-	}
-	if version < 1 {
-		stmts, _ := ddlFor(SQLite)
-		for _, stmt := range stmts {
-			if _, err = conn.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("sqllog: create schema: %w", err)
-			}
-		}
-	}
-	if version < 2 {
-		rows, qerr := conn.QueryContext(ctx, `PRAGMA table_info(statechart_log)`)
-		if qerr != nil {
-			return fmt.Errorf("sqllog: inspect schema: %w", qerr)
-		}
-		has := false
-		for rows.Next() {
-			var cid int
-			var name, typ string
-			var notnull, pk int
-			var def any
-			if qerr = rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); qerr != nil {
-				rows.Close()
-				return qerr
-			}
-			has = has || name == "entry_type"
+			return err
 		}
 		rows.Close()
-		if !has {
-			if _, err = conn.ExecContext(ctx, `ALTER TABLE statechart_log ADD COLUMN entry_type TEXT NOT NULL DEFAULT ''`); err != nil {
-				return fmt.Errorf("sqllog: migrate entry_type: %w", err)
-			}
-		}
-		if _, err = conn.ExecContext(ctx, `PRAGMA user_version=2`); err != nil {
-			return fmt.Errorf("sqllog: set schema version: %w", err)
-		}
-	}
-	if version < 3 {
-		// Version 3 adds durable delivery identity, inbox dedup, and outbox.
-		var hasDelivery bool
-		rows, qerr := conn.QueryContext(ctx, `PRAGMA table_info(statechart_log)`)
-		if qerr != nil {
-			return fmt.Errorf("sqllog: inspect delivery schema: %w", qerr)
-		}
-		for rows.Next() {
-			var cid, nn, pk int
-			var name, typ string
-			var def any
-			if qerr = rows.Scan(&cid, &name, &typ, &nn, &def, &pk); qerr != nil {
-				rows.Close()
-				return qerr
-			}
-			hasDelivery = hasDelivery || name == "delivery_id"
-		}
-		rows.Close()
-		if !hasDelivery {
-			if _, err = conn.ExecContext(ctx, `ALTER TABLE statechart_log ADD COLUMN delivery_id TEXT NOT NULL DEFAULT ''`); err != nil {
-				return fmt.Errorf("sqllog: migrate delivery_id: %w", err)
-			}
-		}
-		stmts, _ := ddlFor(SQLite)
-		for _, stmt := range stmts[2:] {
-			if _, err = conn.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("sqllog: create durability schema: %w", err)
-			}
-		}
-		if _, err = conn.ExecContext(ctx, `PRAGMA user_version=3`); err != nil {
-			return fmt.Errorf("sqllog: set schema version: %w", err)
-		}
-	}
-	if version < 4 {
-		// Version 4 records processor outcomes so deterministic replay can
-		// reproduce synchronous send failures without performing I/O.
-		columns := map[string]bool{}
-		rows, qerr := conn.QueryContext(ctx, `PRAGMA table_info(statechart_outbound)`)
-		if qerr != nil {
-			return fmt.Errorf("sqllog: inspect outbound result schema: %w", qerr)
-		}
-		for rows.Next() {
-			var cid, nn, pk int
-			var name, typ string
-			var def any
-			if qerr = rows.Scan(&cid, &name, &typ, &nn, &def, &pk); qerr != nil {
-				rows.Close()
-				return qerr
-			}
-			columns[name] = true
-		}
-		rows.Close()
-		alter := []struct {
-			name string
-			sql  string
-		}{
-			{"result_error", `ALTER TABLE statechart_outbound ADD COLUMN result_error TEXT NOT NULL DEFAULT ''`},
-			{"result_execution", `ALTER TABLE statechart_outbound ADD COLUMN result_execution INTEGER NOT NULL DEFAULT 0`},
-			{"result_synchronous", `ALTER TABLE statechart_outbound ADD COLUMN result_synchronous INTEGER NOT NULL DEFAULT 0`},
-		}
-		for _, column := range alter {
-			if columns[column.name] {
-				continue
-			}
-			if _, err = conn.ExecContext(ctx, column.sql); err != nil {
-				return fmt.Errorf("sqllog: migrate %s: %w", column.name, err)
-			}
-		}
-		if _, err = conn.ExecContext(ctx, `PRAGMA user_version=4`); err != nil {
-			return fmt.Errorf("sqllog: set schema version: %w", err)
-		}
-	}
-	if version < 5 {
-		// Version 5 makes outbox recovery order explicit instead of relying
-		// on SQLite's mutable, implementation-defined rowid order.
-		var hasSeq bool
-		rows, qerr := conn.QueryContext(ctx, `PRAGMA table_info(statechart_outbound)`)
-		if qerr != nil {
-			return fmt.Errorf("sqllog: inspect outbound sequence schema: %w", qerr)
-		}
-		for rows.Next() {
-			var cid, nn, pk int
-			var name, typ string
-			var def any
-			if qerr = rows.Scan(&cid, &name, &typ, &nn, &def, &pk); qerr != nil {
-				rows.Close()
-				return qerr
-			}
-			hasSeq = hasSeq || name == "seq"
-		}
-		rows.Close()
-		if !hasSeq {
-			if _, err = conn.ExecContext(ctx, `ALTER TABLE statechart_outbound ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`); err != nil {
-				return fmt.Errorf("sqllog: migrate outbound sequence: %w", err)
-			}
-			if _, err = conn.ExecContext(ctx, `UPDATE statechart_outbound AS current SET seq = (SELECT COUNT(*) FROM statechart_outbound AS preceding WHERE preceding.session_id = current.session_id AND preceding.rowid <= current.rowid)`); err != nil {
-				return fmt.Errorf("sqllog: backfill outbound sequence: %w", err)
-			}
-		}
-		if _, err = conn.ExecContext(ctx, `PRAGMA user_version=5`); err != nil {
-			return fmt.Errorf("sqllog: set schema version: %w", err)
-		}
-	}
-	if _, err = conn.ExecContext(ctx, `COMMIT`); err != nil {
-		return fmt.Errorf("sqllog: commit migration: %w", err)
 	}
 	return nil
 }
@@ -221,7 +143,7 @@ func (l *Storage) Append(ctx context.Context, entry statecharts.LogEntry) (uint6
 		entry.SessionID, string(entry.Kind), entry.Timestamp.UTC(),
 		string(entry.SendID), string(entry.Target), string(entry.Type),
 		string(enc.Name), int(enc.Type), string(enc.SendID), string(enc.Origin), string(enc.OriginType), string(enc.InvokeID),
-		string(enc.DeliveryID), enc.DataType, enc.DataPayload, entry.SessionID,
+		string(enc.DeliveryID), enc.Data, entry.SessionID,
 	).Scan(&seq)
 	if err != nil {
 		return 0, fmt.Errorf("sqllog: insert: %w", err)
@@ -248,26 +170,25 @@ func (l *Log) Read(ctx context.Context, sessionID statecharts.SessionID, from ui
 				eventName                                                string
 				eventType                                                int
 				eventSendID, eventOrigin, eventOriginType, eventInvokeID string
-				dataType, deliveryID                                     string
-				dataPayload                                              []byte
+				deliveryID                                               string
+				valueData                                                []byte
 			)
 			if err := rows.Scan(&seq, &kind, &ts, &entrySendID, &entryTarget, &entryType,
 				&eventName, &eventType, &eventSendID, &eventOrigin, &eventOriginType, &eventInvokeID,
-				&deliveryID, &dataType, &dataPayload); err != nil {
+				&deliveryID, &valueData); err != nil {
 				yield(statecharts.LogEntry{}, fmt.Errorf("sqllog: scan: %w", err))
 				return
 			}
 
 			ev, err := statecharts.DecodeEvent(statecharts.EncodedEvent{
-				Name:        statecharts.Identifier(eventName),
-				Type:        statecharts.EventType(eventType),
-				SendID:      statecharts.Identifier(eventSendID),
-				Origin:      statecharts.Identifier(eventOrigin),
-				OriginType:  statecharts.Identifier(eventOriginType),
-				InvokeID:    statecharts.Identifier(eventInvokeID),
-				DeliveryID:  statecharts.DeliveryID(deliveryID),
-				DataType:    dataType,
-				DataPayload: dataPayload,
+				Name:       statecharts.Identifier(eventName),
+				Type:       statecharts.EventType(eventType),
+				SendID:     statecharts.Identifier(eventSendID),
+				Origin:     statecharts.Identifier(eventOrigin),
+				OriginType: statecharts.Identifier(eventOriginType),
+				InvokeID:   statecharts.Identifier(eventInvokeID),
+				DeliveryID: statecharts.DeliveryID(deliveryID),
+				Data:       valueData,
 			})
 			if err != nil {
 				yield(statecharts.LogEntry{}, fmt.Errorf("sqllog: decode event: %w", err))
@@ -318,7 +239,7 @@ func (l *Storage) AppendIngress(ctx context.Context, entry statecharts.LogEntry,
 		return 0, false, err
 	}
 	var seq uint64
-	err = tx.QueryRowContext(ctx, insertLogSQL[l.dialect], entry.SessionID, string(entry.Kind), entry.Timestamp.UTC(), string(entry.SendID), string(entry.Target), string(entry.Type), string(enc.Name), int(enc.Type), string(enc.SendID), string(enc.Origin), string(enc.OriginType), string(enc.InvokeID), string(id), enc.DataType, enc.DataPayload, entry.SessionID).Scan(&seq)
+	err = tx.QueryRowContext(ctx, insertLogSQL[l.dialect], entry.SessionID, string(entry.Kind), entry.Timestamp.UTC(), string(entry.SendID), string(entry.Target), string(entry.Type), string(enc.Name), int(enc.Type), string(enc.SendID), string(enc.Origin), string(enc.OriginType), string(enc.InvokeID), string(id), enc.Data, entry.SessionID).Scan(&seq)
 	if err != nil {
 		return 0, false, err
 	}
@@ -340,7 +261,7 @@ func (l *Storage) StoreOutbound(ctx context.Context, m statecharts.OutboundMessa
 	if status == "" {
 		status = statecharts.OutboundPending
 	}
-	result, err := l.db.ExecContext(ctx, `INSERT OR IGNORE INTO statechart_outbound(session_id,delivery_id,seq,send_id,event_send_id,target,processor_type,event_name,data_type,data_payload,status,result_error,result_execution,result_synchronous) SELECT ?,?,COALESCE(MAX(seq),0)+1,?,?,?,?,?,?,?,?,?,?,? FROM statechart_outbound WHERE session_id=?`, m.SessionID, m.DeliveryID, m.Request.SendID, m.Request.EventSendID, m.Request.Target, m.Request.Type, m.Request.Event, enc.DataType, enc.DataPayload, status, m.Result.Error, m.Result.Execution, m.Result.Synchronous, m.SessionID)
+	result, err := l.db.ExecContext(ctx, `INSERT OR IGNORE INTO statechart_outbound(session_id,delivery_id,seq,send_id,event_send_id,target,processor_type,event_name,value_data,status,result_error,result_execution,result_synchronous) SELECT ?,?,COALESCE(MAX(seq),0)+1,?,?,?,?,?,?,?,?,?,? FROM statechart_outbound WHERE session_id=?`, m.SessionID, m.DeliveryID, m.Request.SendID, m.Request.EventSendID, m.Request.Target, m.Request.Type, m.Request.Event, enc.Data, status, m.Result.Error, m.Result.Execution, m.Result.Synchronous, m.SessionID)
 	if err != nil {
 		return err
 	}
@@ -352,14 +273,14 @@ func (l *Storage) StoreOutbound(ctx context.Context, m statecharts.OutboundMessa
 		return nil
 	}
 
-	var sendID, eventSendID, target, typ, eventName, dataType string
+	var sendID, eventSendID, target, typ, eventName string
 	var payload []byte
-	err = l.db.QueryRowContext(ctx, `SELECT send_id,event_send_id,target,processor_type,event_name,data_type,data_payload FROM statechart_outbound WHERE session_id=? AND delivery_id=?`, m.SessionID, m.DeliveryID).
-		Scan(&sendID, &eventSendID, &target, &typ, &eventName, &dataType, &payload)
+	err = l.db.QueryRowContext(ctx, `SELECT send_id,event_send_id,target,processor_type,event_name,value_data FROM statechart_outbound WHERE session_id=? AND delivery_id=?`, m.SessionID, m.DeliveryID).
+		Scan(&sendID, &eventSendID, &target, &typ, &eventName, &payload)
 	if err != nil {
 		return fmt.Errorf("sqllog: inspect existing outbound: %w", err)
 	}
-	if sendID != string(m.Request.SendID) || eventSendID != string(m.Request.EventSendID) || target != string(m.Request.Target) || typ != string(m.Request.Type) || eventName != string(m.Request.Event) || dataType != enc.DataType || !bytes.Equal(payload, enc.DataPayload) {
+	if sendID != string(m.Request.SendID) || eventSendID != string(m.Request.EventSendID) || target != string(m.Request.Target) || typ != string(m.Request.Type) || eventName != string(m.Request.Event) || !bytes.Equal(payload, enc.Data) {
 		return fmt.Errorf("sqllog: session %q delivery %q identifies a different request: %w", m.SessionID, m.DeliveryID, statecharts.ErrOutboundCollision)
 	}
 	return nil
@@ -371,20 +292,20 @@ func (l *Storage) ResolveOutbound(ctx context.Context, sid statecharts.SessionID
 }
 
 func (l *Storage) Outbounds(ctx context.Context, sid statecharts.SessionID) ([]statecharts.OutboundMessage, error) {
-	rows, err := l.db.QueryContext(ctx, `SELECT delivery_id,send_id,event_send_id,target,processor_type,event_name,data_type,data_payload,status,result_error,result_execution,result_synchronous FROM statechart_outbound WHERE session_id=? ORDER BY seq`, sid)
+	rows, err := l.db.QueryContext(ctx, `SELECT delivery_id,send_id,event_send_id,target,processor_type,event_name,value_data,status,result_error,result_execution,result_synchronous FROM statechart_outbound WHERE session_id=? ORDER BY seq`, sid)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []statecharts.OutboundMessage
 	for rows.Next() {
-		var id, sendID, eventSendID, target, typ, name, dataType, status, resultErr string
+		var id, sendID, eventSendID, target, typ, name, status, resultErr string
 		var payload []byte
 		var execution, synchronous bool
-		if err := rows.Scan(&id, &sendID, &eventSendID, &target, &typ, &name, &dataType, &payload, &status, &resultErr, &execution, &synchronous); err != nil {
+		if err := rows.Scan(&id, &sendID, &eventSendID, &target, &typ, &name, &payload, &status, &resultErr, &execution, &synchronous); err != nil {
 			return nil, err
 		}
-		ev, err := statecharts.DecodeEvent(statecharts.EncodedEvent{Name: statecharts.Identifier(name), DataType: dataType, DataPayload: payload})
+		ev, err := statecharts.DecodeEvent(statecharts.EncodedEvent{Name: statecharts.Identifier(name), Data: payload})
 		if err != nil {
 			return nil, err
 		}

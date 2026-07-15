@@ -157,7 +157,7 @@ post-replay reconciliation instead of unconditionally sending
 // done.invoke.<id> immediately (the work finished while this session was
 // down), and blocking on ctx/io.Incoming continues the invocation exactly
 // as if it had never stopped.
-type InvokeResumeFunc func(ctx context.Context, id Identifier, params any, io InvokeIO) (data any, err error)
+type InvokeResumeFunc func(ctx context.Context, id Identifier, params Value, io InvokeIO) (data Value, err error)
 ```
 
 `WithInvokeResume(fn InvokeResumeFunc) InvokeOption` sets `InvokeSpec.Resume`,

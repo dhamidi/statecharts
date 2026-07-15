@@ -1,6 +1,9 @@
 package statecharts
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // DeliveryID is an opaque, stable identity for one external delivery.
 // Applications must not interpret it; durable transports use it for inbox
@@ -36,15 +39,13 @@ func (t EventType) String() string {
 }
 
 // Event is a message flowing through a chart's internal or external queue.
-// It mirrors the mandatory fields of an SCXML event (5.10.1). Data carries
-// the payload as a plain Go value -- there is no expression language, so the
-// datamodel touchpoints the spec defines (cond, assign, send params, etc.)
-// become ordinary Go closures operating on the user's own datamodel value,
-// with Data available through ExecContext during their evaluation.
+// It mirrors the mandatory fields of an SCXML event (5.10.1). Data is the
+// canonical payload representation shared by datamodel, actor, process, and
+// durability boundaries. Its zero value is canonical null.
 type Event struct {
 	Name       Identifier
 	Type       EventType
-	Data       any
+	Data       Value
 	SendID     Identifier
 	Origin     Identifier
 	OriginType Identifier
@@ -52,9 +53,55 @@ type Event struct {
 	DeliveryID DeliveryID
 }
 
-// Payload type-asserts e.Data to T, the way callers are expected to recover
-// a typed payload from a heterogeneous event queue.
-func Payload[T any](e Event) (T, bool) {
-	v, ok := e.Data.(T)
-	return v, ok
+func cloneEvent(event Event) Event {
+	event.Data = event.Data.Clone()
+	return event
+}
+
+func cloneEvents(events []Event) []Event {
+	clones := make([]Event, len(events))
+	for i := range events {
+		clones[i] = cloneEvent(events[i])
+	}
+	return clones
+}
+
+// PlatformErrorValueTag is the stable tag used for interpreter and platform
+// errors that cross event, session, actor, or durability boundaries.
+const PlatformErrorValueTag = "statecharts.error/v1"
+
+// PlatformErrorValue converts err into canonical data with a stable
+// classification and message. Invalid UTF-8 is replaced deterministically so
+// an error can never make a durable event unencodable.
+func PlatformErrorValue(classification Identifier, err error) Value {
+	message := ""
+	if err != nil {
+		message = strings.ToValidUTF8(err.Error(), "\uFFFD")
+	}
+	classificationValue, _ := StringValue(strings.ToValidUTF8(string(classification), "\uFFFD"))
+	messageValue, _ := StringValue(message)
+	payload, _ := MapValue(map[string]Value{
+		"classification": classificationValue,
+		"message":        messageValue,
+	})
+	value, _ := TaggedValue(PlatformErrorValueTag, payload)
+	return value
+}
+
+// PlatformErrorDetails extracts a canonical platform error.
+func PlatformErrorDetails(value Value) (classification Identifier, message string, ok bool) {
+	tag, payload, ok := value.AsTagged()
+	if !ok || tag != PlatformErrorValueTag {
+		return "", "", false
+	}
+	fields, ok := payload.AsMap()
+	if !ok {
+		return "", "", false
+	}
+	classificationText, classificationOK := fields["classification"].AsString()
+	message, messageOK := fields["message"].AsString()
+	if !classificationOK || !messageOK {
+		return "", "", false
+	}
+	return Identifier(classificationText), message, true
 }

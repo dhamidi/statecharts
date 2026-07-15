@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -189,6 +190,34 @@ func (v Value) AsNumber() (string, bool) {
 		return "", false
 	}
 	return v.text, true
+}
+
+// AsInt64 returns the exact signed integer represented by v. It accepts the
+// canonical exponent form used for integers with trailing zeroes (for
+// example, Int64Value(10) is stored as "1e1") and rejects fractional and
+// out-of-range numbers.
+func (v Value) AsInt64() (int64, bool) {
+	number, ok := v.AsNumber()
+	if !ok {
+		return 0, false
+	}
+	coefficientText, exponentText, hasExponent := strings.Cut(number, "e")
+	coefficient, ok := new(big.Int).SetString(coefficientText, 10)
+	if !ok {
+		return 0, false
+	}
+	if hasExponent {
+		exponent, ok := new(big.Int).SetString(exponentText, 10)
+		if !ok || exponent.Sign() < 0 || !exponent.IsInt64() || exponent.Int64() > 19 {
+			return 0, false
+		}
+		power := new(big.Int).Exp(big.NewInt(10), exponent, nil)
+		coefficient.Mul(coefficient, power)
+	}
+	if !coefficient.IsInt64() {
+		return 0, false
+	}
+	return coefficient.Int64(), true
 }
 
 // AsList returns a deep copy of the list and true when v is a list Value.

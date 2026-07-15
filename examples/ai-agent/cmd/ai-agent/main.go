@@ -98,7 +98,8 @@ func startServer(ctx context.Context, addr, dbPath, llmChoice, llmModel string) 
 	}
 	clock := statecharts.NewRealClock()
 	sys, _ := server.NewSystem(logStore, clock, statecharts.NoopLogger, provider)
-	if err := server.Setup(ctx, sys, clock); err != nil {
+	requests := server.NewRequestRegistry()
+	if err := server.Setup(ctx, sys, clock, requests); err != nil {
 		return "", nil, err
 	}
 
@@ -106,7 +107,7 @@ func startServer(ctx context.Context, addr, dbPath, llmChoice, llmModel string) 
 	if err != nil {
 		return "", nil, fmt.Errorf("listen %q: %w", addr, err)
 	}
-	httpSrv := &http.Server{Handler: server.NewServerHandler(sys)}
+	httpSrv := &http.Server{Handler: server.NewServerHandler(sys, requests)}
 	go func() {
 		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("ai-agent serve: %v", err)

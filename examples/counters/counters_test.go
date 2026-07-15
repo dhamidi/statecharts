@@ -156,8 +156,7 @@ func projectionFor(t *testing.T, ps []projection, name string) projection {
 	return projection{}
 }
 
-func TestIncrementEventCarriesIdentifierInTypedPayload(t *testing.T) {
-	registerCounterDataTypes()
+func TestIncrementEventCarriesIdentifierInCanonicalTaggedPayload(t *testing.T) {
 	ev := incrementEvent("write-42")
 	if ev.Name != "increment" {
 		t.Fatalf("event name = %q, want stable increment name", ev.Name)
@@ -170,9 +169,24 @@ func TestIncrementEventCarriesIdentifierInTypedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, ok := decoded.Data.(*incrementPayload)
-	if !ok || payload.Value.WriteID != statecharts.Identifier("write-42") {
+	fields, err := taggedFields(decoded.Data, incrementValueTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeID, ok := fields["write_id"].AsString()
+	if !ok || writeID != "write-42" {
 		t.Fatalf("decoded payload = %#v, want Identifier write-42", decoded.Data)
+	}
+}
+
+func TestProjectionDecodesCanonicalExponentInteger(t *testing.T) {
+	want := projection{Name: "red", Color: "red", Value: 10, Resident: true, ActorState: actorStateResident}
+	got, err := decodeProjection(encodeProjection(want))
+	if err != nil {
+		t.Fatalf("decodeProjection value 10: %v", err)
+	}
+	if got != want {
+		t.Fatalf("decodeProjection value 10 = %#v, want %#v", got, want)
 	}
 }
 

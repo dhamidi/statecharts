@@ -19,13 +19,14 @@ import (
 // Server holds the HTTP handlers for the workspace server. It has no state
 // of its own beyond sys: every durable fact lives in an actor.
 type Server struct {
-	sys *actors.System
+	sys      *actors.System
+	requests *RequestRegistry
 }
 
 // NewServerHandler returns an http.Handler exposing every endpoint the
 // example's README documents, backed by sys (already Setup).
-func NewServerHandler(sys *actors.System) http.Handler {
-	s := &Server{sys: sys}
+func NewServerHandler(sys *actors.System, requests *RequestRegistry) http.Handler {
+	s := &Server{sys: sys, requests: requests}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /conversations", s.handleListConversations)
 	mux.HandleFunc("GET /directory/events", s.handleDirectoryEvents)
@@ -51,10 +52,7 @@ func (s *Server) ensureConversation(ctx context.Context, idStr string) (protocol
 	}
 	if err := s.sys.Tell(ctx, "user", statecharts.Event{
 		Name: "register", Type: statecharts.EventExternal,
-		Data: &registerConversationPayload{
-			TypeName: "aiagent.register_conversation",
-			Value:    RegisterConversationData{ID: id, Title: "Untitled"},
-		},
+		Data: encodeRegister(RegisterConversationData{ID: id, Title: "Untitled"}),
 	}); err != nil {
 		return "", err
 	}
@@ -69,8 +67,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
 	reply := make(chan []protocol.ConversationSummary, 1)
+	requestID := s.requests.putList(reply)
+	defer s.requests.remove(requestID)
 	if err := s.sys.Tell(r.Context(), "directory", statecharts.Event{
-		Name: "list", Type: statecharts.EventExternal, Data: (chan<- []protocol.ConversationSummary)(reply),
+		Name: "list", Type: statecharts.EventExternal, Data: encodeDirectoryRequest(requestID),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -95,8 +95,10 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleDirectoryEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	reply := make(chan chan protocol.ConversationSummary, 1)
+	watchID := s.requests.putWatch(reply)
+	defer s.requests.remove(watchID)
 	if err := s.sys.Tell(ctx, "directory", statecharts.Event{
-		Name: "watch", Type: statecharts.EventExternal, Data: directoryWatchRequest{Reply: reply},
+		Name: "watch", Type: statecharts.EventExternal, Data: encodeDirectoryRequest(watchID),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -108,9 +110,12 @@ func (s *Server) handleDirectoryEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() {
-		_ = s.sys.Tell(context.Background(), "directory", statecharts.Event{
-			Name: "unwatch", Type: statecharts.EventExternal, Data: directoryUnwatchRequest{Channel: updates},
-		})
+		unwatchID := s.requests.putUnwatch(updates)
+		if err := s.sys.Tell(context.Background(), "directory", statecharts.Event{
+			Name: "unwatch", Type: statecharts.EventExternal, Data: encodeDirectoryRequest(unwatchID),
+		}); err != nil {
+			s.requests.remove(unwatchID)
+		}
 	}()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -120,8 +125,10 @@ func (s *Server) handleDirectoryEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 
 	listReply := make(chan []protocol.ConversationSummary, 1)
+	listID := s.requests.putList(listReply)
+	defer s.requests.remove(listID)
 	if err := s.sys.Tell(ctx, "directory", statecharts.Event{
-		Name: "list", Type: statecharts.EventExternal, Data: (chan<- []protocol.ConversationSummary)(listReply),
+		Name: "list", Type: statecharts.EventExternal, Data: encodeDirectoryRequest(listID),
 	}); err == nil {
 		select {
 		case items := <-listReply:
@@ -171,10 +178,7 @@ func (s *Server) handleCreateConversation(w http.ResponseWriter, r *http.Request
 	}
 	if err := s.sys.Tell(r.Context(), "user", statecharts.Event{
 		Name: "register", Type: statecharts.EventExternal,
-		Data: &registerConversationPayload{
-			TypeName: "aiagent.register_conversation",
-			Value:    RegisterConversationData{ID: id, Title: title},
-		},
+		Data: encodeRegister(RegisterConversationData{ID: id, Title: title}),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -195,7 +199,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.sys.Tell(r.Context(), statecharts.Identifier(id), statecharts.Event{
 		Name: "user_message", Type: statecharts.EventExternal,
-		Data: &userMessagePayload{TypeName: "aiagent.user_message", Value: UserMessageData{Text: req.Text}},
+		Data: encodeUserMessage(UserMessageData{Text: req.Text}),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -216,12 +220,7 @@ func (s *Server) handleToolResult(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.sys.Tell(r.Context(), statecharts.Identifier(id), statecharts.Event{
 		Name: "tool_result", Type: statecharts.EventExternal,
-		Data: &toolResultPayload{
-			TypeName: "aiagent.tool_result",
-			Value: ToolResultData{
-				CallID: req.CallID, Output: req.Output, ExitCode: req.ExitCode, Error: req.Error,
-			},
-		},
+		Data: encodeToolResult(ToolResultData{CallID: req.CallID, Output: req.Output, ExitCode: req.ExitCode, Error: req.Error}),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -258,9 +257,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ready := make(chan chan sseFrame, 1)
+	requestID := s.requests.putConnection(ready)
+	defer s.requests.remove(requestID)
 	if err := s.sys.Tell(r.Context(), connName, statecharts.Event{
 		Name: "start", Type: statecharts.EventExternal,
-		Data: connectionStart{ConversationID: id, Tools: tools, FromSeq: fromSeq, Ready: ready},
+		Data: encodeConnectionStart(connectionStart{ConversationID: id, Tools: tools, FromSeq: fromSeq, RequestID: requestID}),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return

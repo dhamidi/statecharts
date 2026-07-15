@@ -30,7 +30,7 @@ type toolModel struct {
 
 var recordCurrent = statecharts.Action(func(d *toolModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	req, ok := statecharts.Payload[executeRequest](ev)
+	req, ok := decodeExecute(ev.Data)
 	if !ok {
 		return nil
 	}
@@ -43,7 +43,7 @@ var recordCurrent = statecharts.Action(func(d *toolModel, ec statecharts.ExecCon
 // one finishes.
 var enqueueCall = statecharts.Action(func(d *toolModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	req, ok := statecharts.Payload[executeRequest](ev)
+	req, ok := decodeExecute(ev.Data)
 	if !ok {
 		return nil
 	}
@@ -61,16 +61,16 @@ var dequeueNext = statecharts.ActionFunc(func(ec statecharts.ExecContext) error 
 	}
 	next := d.Queued[0]
 	d.Queued = d.Queued[1:]
-	ec.Raise(statecharts.Event{Name: "execute", Data: next})
+	ec.Raise(statecharts.Event{Name: "execute", Data: executeValue(next)})
 	return nil
 })
 
-func computeExecParams(ec statecharts.ExecContext) any {
+func computeExecParams(ec statecharts.ExecContext) statecharts.Value {
 	d, _ := ec.Datamodel().(*toolModel)
 	if d == nil {
-		return executeRequest{}
+		return executeValue(executeRequest{})
 	}
-	return d.Current
+	return executeValue(d.Current)
 }
 
 // buildExecAndPost returns the InvokeFunc that runs a tool call's command
@@ -80,8 +80,8 @@ func computeExecParams(ec statecharts.ExecContext) any {
 // recovery test script's tool-executor-handoff scenarios exercise -- see
 // the example's README.
 func buildExecAndPost(serverAddr string) statecharts.InvokeFunc {
-	return func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
-		req, _ := params.(executeRequest)
+	return func(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
+		req, _ := decodeExecute(params)
 
 		command, _ := req.Call.Args["command"].(string)
 		result := protocol.ToolResultRequest{CallID: req.Call.CallID}
@@ -101,32 +101,32 @@ func buildExecAndPost(serverAddr string) statecharts.InvokeFunc {
 		}
 
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return statecharts.NullValue(), ctx.Err()
 		}
 
 		body, err := json.Marshal(result)
 		if err != nil {
-			return nil, err
+			return statecharts.NullValue(), err
 		}
 		u, err := url.Parse(serverAddr)
 		if err != nil {
-			return nil, err
+			return statecharts.NullValue(), err
 		}
 		u = u.JoinPath("conversations", req.ConversationID.String(), "tool-result")
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
 		if err != nil {
-			return nil, err
+			return statecharts.NullValue(), err
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(httpReq)
 		if err != nil {
-			return nil, err
+			return statecharts.NullValue(), err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("client: POST %s: unexpected status %s", u, resp.Status)
+			return statecharts.NullValue(), fmt.Errorf("client: POST %s: unexpected status %s", u, resp.Status)
 		}
-		return nil, nil
+		return statecharts.NullValue(), nil
 	}
 }
 

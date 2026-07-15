@@ -37,7 +37,7 @@ type llmRequestModel struct {
 
 var recordRequestStart = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*dispatchPayload](ev)
+	payload, ok := decodeDispatch(ev.Data)
 	if !ok {
 		return nil
 	}
@@ -47,7 +47,7 @@ var recordRequestStart = statecharts.Action(func(d *llmRequestModel, ec statecha
 
 var applyProviderChunk = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	c, ok := statecharts.Payload[llm.Chunk](ev)
+	c, ok := decodeProviderChunk(ev.Data)
 	if !ok {
 		return nil
 	}
@@ -69,11 +69,11 @@ var applyProviderChunk = statecharts.Action(func(d *llmRequestModel, ec statecha
 func broadcastDelta(ec statecharts.ExecContext, conversationID protocol.ConversationID, kind, text string) {
 	ec.Send("broadcast", statecharts.SendOptions{
 		Target: "fanout",
-		Data: &fanoutBroadcast{
+		Data: encodeFanoutBroadcast(fanoutBroadcast{
 			ConversationID: conversationID,
 			Kind:           "delta",
-			Frame:          deltaFrame{Kind: kind, Text: text},
-		},
+			Delta:          deltaFrame{Kind: kind, Text: text},
+		}),
 	})
 }
 
@@ -88,15 +88,12 @@ type deltaFrame struct {
 var sendFinalReply = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
 	ec.Send("llm_reply", statecharts.SendOptions{
 		Target: statecharts.Identifier(d.ConversationID),
-		Data: &llmReplyPayload{
-			TypeName: "aiagent.llm_reply",
-			Value: LLMReplyData{
-				IsToolCall: d.IsToolCall,
-				Text:       d.Text.String(),
-				ToolName:   d.ToolName,
-				ToolArgs:   d.ToolArgs,
-			},
-		},
+		Data: encodeLLMReply(LLMReplyData{
+			IsToolCall: d.IsToolCall,
+			Text:       d.Text.String(),
+			ToolName:   d.ToolName,
+			ToolArgs:   d.ToolArgs,
+		}),
 	})
 	return nil
 })
@@ -104,15 +101,12 @@ var sendFinalReply = statecharts.Action(func(d *llmRequestModel, ec statecharts.
 var sendErrorReply = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
 	msg := "unknown error"
-	if err, ok := statecharts.Payload[error](ev); ok && err != nil {
-		msg = err.Error()
+	if _, detail, ok := statecharts.PlatformErrorDetails(ev.Data); ok {
+		msg = detail
 	}
 	ec.Send("llm_reply", statecharts.SendOptions{
 		Target: statecharts.Identifier(d.ConversationID),
-		Data: &llmReplyPayload{
-			TypeName: "aiagent.llm_reply",
-			Value:    LLMReplyData{Text: fmt.Sprintf("[error: %s]", msg)},
-		},
+		Data:   encodeLLMReply(LLMReplyData{Text: fmt.Sprintf("[error: %s]", msg)}),
 	})
 	return nil
 })
@@ -183,16 +177,16 @@ func (p *LLMDispatchProcessor) Send(ctx context.Context, req statecharts.SendReq
 	if req.Type != "llm" {
 		return fmt.Errorf("examples/ai-agent: LLMDispatchProcessor: unsupported send (target %q, type %q)", req.Target, req.Type)
 	}
-	payload, ok := req.Data.(*dispatchPayload)
+	payload, ok := decodeDispatch(req.Data)
 	if !ok {
-		return fmt.Errorf("examples/ai-agent: LLMDispatchProcessor: unexpected data type %T", req.Data)
+		return fmt.Errorf("examples/ai-agent: LLMDispatchProcessor: invalid dispatch payload")
 	}
 
 	if err := p.sys.Spawn(ctx, req.Target, LLMRequestKind); err != nil {
 		return fmt.Errorf("examples/ai-agent: LLMDispatchProcessor: spawn %q: %w", req.Target, err)
 	}
 	if err := p.sys.Tell(ctx, req.Target, statecharts.Event{
-		Name: "start", Type: statecharts.EventExternal, Data: payload,
+		Name: "start", Type: statecharts.EventExternal, Data: encodeDispatch(payload),
 	}); err != nil {
 		return fmt.Errorf("examples/ai-agent: LLMDispatchProcessor: start %q: %w", req.Target, err)
 	}
@@ -203,12 +197,12 @@ func (p *LLMDispatchProcessor) Send(ctx context.Context, req statecharts.SendReq
 	go func() {
 		err := provider.Generate(context.Background(), payload.Request, func(c llm.Chunk) {
 			_ = sys.Tell(context.Background(), target, statecharts.Event{
-				Name: "provider_chunk", Type: statecharts.EventExternal, Data: c,
+				Name: "provider_chunk", Type: statecharts.EventExternal, Data: encodeProviderChunk(c),
 			})
 		})
 		if err != nil {
 			_ = sys.Tell(context.Background(), target, statecharts.Event{
-				Name: "provider_error", Type: statecharts.EventExternal, Data: err,
+				Name: "provider_error", Type: statecharts.EventExternal, Data: statecharts.PlatformErrorValue(statecharts.ErrEventExecution, err),
 			})
 			return
 		}

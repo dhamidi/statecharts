@@ -18,7 +18,7 @@ type SendRequest struct {
 	Target      Identifier
 	Type        Identifier
 	Event       Identifier
-	Data        any
+	Data        Value
 }
 
 // AcknowledgingIOProcessor reports stable asynchronous acceptance. complete

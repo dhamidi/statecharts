@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -49,22 +48,17 @@ type counterModel struct {
 }
 
 const (
-	incrementDataType  = "counters.increment.v1"
-	projectionDataType = "counters.projection.v1"
+	incrementValueTag    = "counters.increment/v1"
+	projectionValueTag   = "counters.projection/v1"
+	projectionsValueTag  = "counters.projections/v1"
+	residencyValueTag    = "counters.residency/v1"
+	subscriptionValueTag = "counters.subscription/v1"
+	streamStartValueTag  = "counters.stream-start/v1"
+	hubQueryValueTag     = "counters.hub-query/v1"
 )
 
-type incrementData struct {
-	WriteID statecharts.Identifier `json:"write_id"`
-}
-type incrementPayload = statecharts.JSONData[incrementData]
-
-func registerCounterDataTypes() {
-	statecharts.RegisterDataType(incrementDataType, func() statecharts.DataUnmarshaler { return &incrementPayload{} })
-	statecharts.RegisterDataType(projectionDataType, func() statecharts.DataUnmarshaler { return &projection{} })
-}
-
 func incrementEvent(writeID statecharts.Identifier) statecharts.Event {
-	return statecharts.Event{Name: "increment", Type: statecharts.EventExternal, Data: statecharts.NewJSONData(incrementDataType, incrementData{WriteID: writeID})}
+	return statecharts.Event{Name: "increment", Type: statecharts.EventExternal, Data: taggedMap(incrementValueTag, map[string]statecharts.Value{"write_id": stringValue(string(writeID))})}
 }
 
 type projection struct {
@@ -75,12 +69,125 @@ type projection struct {
 	ActorState string `json:"actor_state"`
 }
 
-func (p projection) MarshalData() (string, []byte, error) {
-	b, err := json.Marshal(p)
-	return projectionDataType, b, err
+func stringValue(s string) statecharts.Value {
+	v, err := statecharts.StringValue(s)
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
-
-func (p *projection) UnmarshalData(b []byte) error { return json.Unmarshal(b, p) }
+func taggedMap(tag string, fields map[string]statecharts.Value) statecharts.Value {
+	m, err := statecharts.MapValue(fields)
+	if err != nil {
+		panic(err)
+	}
+	v, err := statecharts.TaggedValue(tag, m)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+func taggedFields(v statecharts.Value, tag string) (map[string]statecharts.Value, error) {
+	got, payload, ok := v.AsTagged()
+	if !ok || got != tag {
+		return nil, fmt.Errorf("expected tagged value %q", tag)
+	}
+	fields, ok := payload.AsMap()
+	if !ok {
+		return nil, fmt.Errorf("%s payload is not a map", tag)
+	}
+	return fields, nil
+}
+func requiredString(fields map[string]statecharts.Value, name string) (string, error) {
+	s, ok := fields[name].AsString()
+	if !ok {
+		return "", fmt.Errorf("field %q is not a string", name)
+	}
+	return s, nil
+}
+func encodeProjection(p projection) statecharts.Value {
+	return taggedMap(projectionValueTag, map[string]statecharts.Value{"name": stringValue(p.Name), "color": stringValue(p.Color), "value": statecharts.Int64Value(int64(p.Value)), "resident": statecharts.BoolValue(p.Resident), "actor_state": stringValue(p.ActorState)})
+}
+func decodeProjection(v statecharts.Value) (projection, error) {
+	f, err := taggedFields(v, projectionValueTag)
+	if err != nil {
+		return projection{}, err
+	}
+	name, err := requiredString(f, "name")
+	if err != nil {
+		return projection{}, err
+	}
+	color, err := requiredString(f, "color")
+	if err != nil {
+		return projection{}, err
+	}
+	n, ok := f["value"].AsInt64()
+	if !ok {
+		return projection{}, fmt.Errorf("projection value is not an int64")
+	}
+	value := int(n)
+	if int64(value) != n {
+		return projection{}, fmt.Errorf("projection value %d does not fit int", n)
+	}
+	resident, ok := f["resident"].AsBool()
+	if !ok {
+		return projection{}, fmt.Errorf("projection resident is not a bool")
+	}
+	actorState, err := requiredString(f, "actor_state")
+	if err != nil {
+		return projection{}, err
+	}
+	return projection{Name: name, Color: color, Value: value, Resident: resident, ActorState: actorState}, nil
+}
+func encodeProjections(ps []projection) statecharts.Value {
+	values := make([]statecharts.Value, len(ps))
+	for i := range ps {
+		values[i] = encodeProjection(ps[i])
+	}
+	tagged, _ := statecharts.TaggedValue(projectionsValueTag, statecharts.ListValue(values))
+	return tagged
+}
+func decodeProjections(v statecharts.Value) ([]projection, error) {
+	tag, payload, ok := v.AsTagged()
+	if !ok || tag != projectionsValueTag {
+		return nil, fmt.Errorf("expected tagged value %q", projectionsValueTag)
+	}
+	values, ok := payload.AsList()
+	if !ok {
+		return nil, fmt.Errorf("projections payload is not a list")
+	}
+	out := make([]projection, len(values))
+	for i := range values {
+		p, err := decodeProjection(values[i])
+		if err != nil {
+			return nil, err
+		}
+		out[i] = p
+	}
+	return out, nil
+}
+func encodeStrings(values []string) statecharts.Value {
+	out := make([]statecharts.Value, len(values))
+	for i, value := range values {
+		out[i] = stringValue(value)
+	}
+	return statecharts.ListValue(out)
+}
+func decodeStrings(v statecharts.Value) ([]string, error) {
+	values, ok := v.AsList()
+	if !ok {
+		return nil, fmt.Errorf("expected string list")
+	}
+	out := make([]string, len(values))
+	for i := range values {
+		s, ok := values[i].AsString()
+		if !ok {
+			return nil, fmt.Errorf("list item %d is not a string", i)
+		}
+		out[i] = s
+	}
+	return out, nil
+}
 
 const (
 	actorStateResident  = string(actors.ResidencyResident)
@@ -90,20 +197,20 @@ const (
 
 func buildCounterChart() (*statecharts.Chart, error) {
 	publish := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
-		ec.Send("projection", statecharts.SendOptions{Target: "hub@ui", Data: &projection{Name: ec.SessionID(), Color: ec.SessionID(), Value: d.Value}})
+		ec.Send("projection", statecharts.SendOptions{Target: "hub@ui", Data: encodeProjection(projection{Name: ec.SessionID(), Color: ec.SessionID(), Value: d.Value})})
 		return nil
 	})
 	increment := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		var writeID statecharts.Identifier
-		switch payload := ev.Data.(type) {
-		case incrementPayload:
-			writeID = payload.Value.WriteID
-		case *incrementPayload:
-			writeID = payload.Value.WriteID
-		default:
-			return fmt.Errorf("counters: increment payload has type %T", ev.Data)
+		fields, err := taggedFields(ev.Data, incrementValueTag)
+		if err != nil {
+			return err
 		}
+		text, err := requiredString(fields, "write_id")
+		if err != nil {
+			return err
+		}
+		writeID := statecharts.Identifier(text)
 		if d.Processed == nil {
 			d.Processed = make(map[statecharts.Identifier]bool)
 		}
@@ -132,10 +239,6 @@ type hubSubscription struct {
 	Target statecharts.Identifier
 	Colors []string
 }
-type hubQuery struct {
-	Colors []string
-	Reply  chan []projection
-}
 
 func hubSnapshot(d *hubModel, selected []string) []projection {
 	out := make([]projection, 0, len(selected))
@@ -152,50 +255,84 @@ func hubSnapshot(d *hubModel, selected []string) []projection {
 	return out
 }
 
-func buildHubChart() (*statecharts.Chart, error) {
+func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 	notify := func(d *hubModel, ec statecharts.ExecContext) {
 		for target, selected := range d.Subscribers {
-			ec.Send("snapshot", statecharts.SendOptions{Target: target, Data: hubSnapshot(d, selected)})
+			ec.Send("snapshot", statecharts.SendOptions{Target: target, Data: encodeProjections(hubSnapshot(d, selected))})
 		}
 	}
 	return statecharts.Build(statecharts.Atomic(hubKind,
 		statecharts.On("projection", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
 			ev, _ := ec.Event()
-			payload, ok := ev.Data.(*projection)
-			if !ok {
-				return fmt.Errorf("projection payload %T", ev.Data)
+			p, err := decodeProjection(ev.Data)
+			if err != nil {
+				return err
 			}
-			p := *payload
 			d.Values[p.Name] = p
 			notify(d, ec)
 			return nil
 		}))),
 		statecharts.On("residency", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
 			ev, _ := ec.Event()
-			change, ok := ev.Data.(actors.ResidencyChange)
-			if !ok {
-				return fmt.Errorf("residency payload %T", ev.Data)
+			fields, err := taggedFields(ev.Data, residencyValueTag)
+			if err != nil {
+				return err
 			}
-			d.Residencies[string(change.ActorID)] = string(change.State)
+			actorID, err := requiredString(fields, "actor_id")
+			if err != nil {
+				return err
+			}
+			state, err := requiredString(fields, "state")
+			if err != nil {
+				return err
+			}
+			d.Residencies[actorID] = state
 			notify(d, ec)
 			return nil
 		}))),
 		statecharts.On("subscribe", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
 			ev, _ := ec.Event()
-			sub := ev.Data.(hubSubscription)
+			fields, err := taggedFields(ev.Data, subscriptionValueTag)
+			if err != nil {
+				return err
+			}
+			target, err := requiredString(fields, "target")
+			if err != nil {
+				return err
+			}
+			selected, err := decodeStrings(fields["colors"])
+			if err != nil {
+				return err
+			}
+			sub := hubSubscription{Target: statecharts.Identifier(target), Colors: selected}
 			d.Subscribers[sub.Target] = append([]string(nil), sub.Colors...)
-			ec.Send("snapshot", statecharts.SendOptions{Target: sub.Target, Data: hubSnapshot(d, sub.Colors)})
+			ec.Send("snapshot", statecharts.SendOptions{Target: sub.Target, Data: encodeProjections(hubSnapshot(d, sub.Colors))})
 			return nil
 		}))),
 		statecharts.On("unsubscribe", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
 			ev, _ := ec.Event()
-			delete(d.Subscribers, ev.Data.(statecharts.Identifier))
+			target, ok := ev.Data.AsString()
+			if !ok {
+				return fmt.Errorf("unsubscribe target is not a string")
+			}
+			delete(d.Subscribers, statecharts.Identifier(target))
 			return nil
 		}))),
 		statecharts.On("query", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
 			ev, _ := ec.Event()
-			q := ev.Data.(hubQuery)
-			q.Reply <- hubSnapshot(d, q.Colors)
+			fields, err := taggedFields(ev.Data, hubQueryValueTag)
+			if err != nil {
+				return err
+			}
+			id, err := requiredString(fields, "request_id")
+			if err != nil {
+				return err
+			}
+			q, ok := requests.take(id)
+			if !ok {
+				return nil
+			}
+			q.reply <- hubSnapshot(d, q.colors)
 			return nil
 		}))),
 	), statecharts.WithNewDatamodel(func() any {
@@ -212,42 +349,61 @@ type streamModel struct {
 	Mode   string
 	Colors []string
 	Output statecharts.Identifier
-	Last   []byte
+	Last   string
 }
 
 func buildStreamChart() (*statecharts.Chart, error) {
 	start := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		s := ev.Data.(streamStart)
+		fields, err := taggedFields(ev.Data, streamStartValueTag)
+		if err != nil {
+			return err
+		}
+		mode, err := requiredString(fields, "mode")
+		if err != nil {
+			return err
+		}
+		output, err := requiredString(fields, "output")
+		if err != nil {
+			return err
+		}
+		selected, err := decodeStrings(fields["colors"])
+		if err != nil {
+			return err
+		}
+		s := streamStart{Mode: mode, Colors: selected, Output: statecharts.Identifier(output)}
 		d.Mode, d.Colors, d.Output = s.Mode, s.Colors, s.Output
-		ec.Send("subscribe", statecharts.SendOptions{Target: "hub", Data: hubSubscription{Target: statecharts.Identifier(ec.SessionID()), Colors: s.Colors}})
+		ec.Send("subscribe", statecharts.SendOptions{Target: "hub", Data: taggedMap(subscriptionValueTag, map[string]statecharts.Value{"target": stringValue(ec.SessionID()), "colors": encodeStrings(s.Colors)})})
 		ec.Send("keepalive", statecharts.SendOptions{Delay: 15 * time.Second})
 		return nil
 	})
 	emit := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		ps := ev.Data.([]projection)
-		var frame []byte
+		ps, err := decodeProjections(ev.Data)
+		if err != nil {
+			return err
+		}
+		var frame string
 		if d.Mode == "browser" {
-			frame = []byte(datastarPatch(renderString(renderDashboard("online", ps))))
+			frame = datastarPatch(renderString(renderDashboard("online", ps)))
 		} else {
 			b, _ := json.Marshal(ps)
-			frame = []byte("event: snapshot\ndata: " + string(b) + "\n\n")
+			frame = "event: snapshot\ndata: " + string(b) + "\n\n"
 		}
-		if bytes.Equal(frame, d.Last) {
+		if frame == d.Last {
 			return nil
 		}
-		d.Last = append(d.Last[:0], frame...)
-		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: frame})
+		d.Last = frame
+		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: stringValue(frame)})
 		return nil
 	})
 	keepalive := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
-		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: ": keepalive\n\n"})
+		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: stringValue(": keepalive\n\n")})
 		ec.Send("keepalive", statecharts.SendOptions{Delay: 15 * time.Second})
 		return nil
 	})
 	closeStream := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
-		ec.Send("unsubscribe", statecharts.SendOptions{Target: "hub", Data: statecharts.Identifier(ec.SessionID())})
+		ec.Send("unsubscribe", statecharts.SendOptions{Target: "hub", Data: stringValue(ec.SessionID())})
 		return nil
 	})
 	return statecharts.Build(statecharts.Compound(streamKind, "open", statecharts.Children(

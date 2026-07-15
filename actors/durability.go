@@ -56,9 +56,9 @@ func (p *durableProcessor) IOProcessors() []statecharts.IOProcessorInfo {
 }
 
 func (p *durableProcessor) Send(ctx context.Context, req statecharts.SendRequest) error {
+	req.Data = req.Data.Clone()
 	m := statecharts.OutboundMessage{SessionID: p.sid, DeliveryID: req.DeliveryID, Request: req, Status: statecharts.OutboundPending}
-	// StoreOutbound also performs codec validation. It deliberately precedes
-	// the transport call, so an unsupported payload cannot escape the WAL.
+	// Persist the canonical intent before the transport call.
 	if err := p.storage.StoreOutbound(ctx, m); err != nil {
 		return err
 	}
@@ -160,7 +160,7 @@ func (p *durableProcessor) report(req statecharts.SendRequest, result statechart
 	}
 	_ = disp.Deliver(context.Background(), statecharts.Event{
 		Name: name, Type: statecharts.EventPlatform, SendID: req.SendID,
-		Data: errors.New(result.Error), DeliveryID: statecharts.DeliveryID(string(req.DeliveryID) + ":result"),
+		Data: statecharts.PlatformErrorValue(name, errors.New(result.Error)), DeliveryID: statecharts.DeliveryID(string(req.DeliveryID) + ":result"),
 	})
 }
 

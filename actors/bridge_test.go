@@ -248,6 +248,74 @@ func TestBridgeUsesSystemNodeNamesForQualifiedRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBridgePreservesNestedValueAndDeliveryIdentity(t *testing.T) {
+	ctx := context.Background()
+	received := make(chan statecharts.Event, 1)
+	record := statecharts.Action(func(_ *struct{}, ec statecharts.ExecContext) error {
+		ev, _ := ec.Event()
+		received <- ev
+		return nil
+	})
+	targetChart, err := statecharts.Build(
+		statecharts.Atomic("bridge-value-target", statecharts.On("nested", statecharts.Then(record))),
+		statecharts.WithNewDatamodel(func() any { return &struct{}{} }), statecharts.WithVersion("test-v1"))
+	if err != nil {
+		t.Fatalf("Build target: %v", err)
+	}
+	target := NewSystem(WithNodeName("warehouse-b"))
+	if err := target.Register(targetChart); err != nil {
+		t.Fatalf("Register target: %v", err)
+	}
+	if err := target.Spawn(ctx, "target", targetChart.ID()); err != nil {
+		t.Fatalf("Spawn target: %v", err)
+	}
+
+	label, err := statecharts.StringValue("fragile")
+	if err != nil {
+		t.Fatalf("StringValue: %v", err)
+	}
+	nested, err := statecharts.MapValue(map[string]statecharts.Value{
+		"items": statecharts.ListValue([]statecharts.Value{
+			statecharts.Int64Value(7),
+			statecharts.ListValue([]statecharts.Value{label}),
+		}),
+	})
+	if err != nil {
+		t.Fatalf("MapValue: %v", err)
+	}
+	payload, err := statecharts.TaggedValue("bridge.package/v1", nested)
+	if err != nil {
+		t.Fatalf("TaggedValue: %v", err)
+	}
+
+	bridge := NewBridge("warehouse-b", target, "warehouse-a")
+	const deliveryID statecharts.DeliveryID = "warehouse-a:delivery-17"
+	if err := bridge.Send(ctx, statecharts.SendRequest{
+		DeliveryID: deliveryID,
+		Target:     "target@warehouse-b",
+		Type:       statecharts.SCXMLEventProcessor,
+		Event:      "nested",
+		Data:       payload,
+	}); err != nil {
+		t.Fatalf("Bridge.Send: %v", err)
+	}
+
+	select {
+	case event := <-received:
+		if event.DeliveryID != deliveryID {
+			t.Fatalf("DeliveryID = %q, want %q", event.DeliveryID, deliveryID)
+		}
+		if !event.Data.Equal(payload) {
+			t.Fatalf("nested bridge payload = %#v, want %#v", event.Data, payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridge did not deliver nested payload")
+	}
+	if err := target.Stop(ctx); err != nil {
+		t.Fatalf("Stop target: %v", err)
+	}
+}
+
 func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 	ctx := context.Background()
 	entered := make(chan struct{})

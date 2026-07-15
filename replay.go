@@ -39,7 +39,7 @@ func (g *replayGate) Send(ctx context.Context, req SendRequest) error {
 // Rehydrate being called with WithLogger(nil) -- makes Log a permanent
 // no-op instead of a nil dereference, matching doLog's own nil-safe
 // handling of an unconfigured Logger.
-func (g *replayGate) Log(label string, data any) {
+func (g *replayGate) Log(label string, data Value) {
 	if g.logger == nil || !g.live.Load() {
 		return
 	}

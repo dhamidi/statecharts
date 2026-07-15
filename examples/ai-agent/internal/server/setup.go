@@ -30,9 +30,7 @@ func NewSystem(storage actors.Storage, clock statecharts.Clock, logger statechar
 // UserActor's own already-rehydrated state -- all before returning, so the
 // caller's HTTP listener never opens onto a workspace that isn't fully
 // resident yet.
-func Setup(ctx context.Context, sys *actors.System, clock statecharts.Clock) error {
-	registerDataTypes()
-
+func Setup(ctx context.Context, sys *actors.System, clock statecharts.Clock, requests *RequestRegistry) error {
 	charts := []struct {
 		kind  statecharts.Identifier
 		build func() (*statecharts.Chart, error)
@@ -41,9 +39,9 @@ func Setup(ctx context.Context, sys *actors.System, clock statecharts.Clock) err
 		{FanoutKind, BuildFanoutChart},
 		{ToolRegistryKind, func() (*statecharts.Chart, error) { return BuildToolRegistryChart(clock) }},
 		{UserKind, BuildUserChart},
-		{DirectoryKind, BuildDirectoryChart},
+		{DirectoryKind, func() (*statecharts.Chart, error) { return BuildDirectoryChart(requests) }},
 		{LLMRequestKind, BuildLLMRequestChart},
-		{ConnectionKind, BuildConnectionChart},
+		{ConnectionKind, func() (*statecharts.Chart, error) { return BuildConnectionChart(requests) }},
 	}
 	for _, c := range charts {
 		chart, err := c.build()

@@ -29,7 +29,7 @@ type interpretation struct {
 	internalQueue     []Event
 	externalQueue     []Event
 	running           bool
-	result            any
+	result            Value
 	completed         bool
 	lastEvent         Event
 	hasLastEvent      bool
@@ -186,11 +186,11 @@ func (ip *interpretation) enqueue(ev Event) {
 }
 
 func (ip *interpretation) reportError(err error) {
-	ip.enqueueInternal(Event{Name: ErrEventExecution, Type: EventPlatform, Data: err})
+	ip.enqueueInternal(Event{Name: ErrEventExecution, Type: EventPlatform, Data: PlatformErrorValue(ErrEventExecution, err)})
 }
 
 func (ip *interpretation) reportCommError(err error) {
-	ip.enqueueInternal(Event{Name: ErrEventCommunication, Type: EventPlatform, Data: err})
+	ip.enqueueInternal(Event{Name: ErrEventCommunication, Type: EventPlatform, Data: PlatformErrorValue(ErrEventCommunication, err)})
 }
 
 func (ip *interpretation) reportSendError(sendID Identifier, err error) {
@@ -199,7 +199,7 @@ func (ip *interpretation) reportSendError(sendID Identifier, err error) {
 	if errors.As(err, &executionError) {
 		name = ErrEventExecution
 	}
-	ip.enqueueInternal(Event{Name: name, Type: EventPlatform, SendID: sendID, Data: err})
+	ip.enqueueInternal(Event{Name: name, Type: EventPlatform, SendID: sendID, Data: PlatformErrorValue(name, err)})
 }
 
 // --- <send> / <cancel> (SCXML 6.2, 6.3) ---------------------------------
@@ -218,7 +218,7 @@ type SendOptions struct {
 	IDLocation IDLocationFunc // assigns a generated, author-visible ID; mutually exclusive with SendID
 	Target     Identifier     // "" = own external queue (default); "#_internal"; or an external target
 	Type       Identifier     // IOProcessor selector, meaningful for external targets only
-	Data       any
+	Data       Value
 	Delay      time.Duration // 0 = dispatch immediately
 }
 
@@ -240,15 +240,7 @@ func (ip *interpretation) doSend(name Identifier, opts SendOptions) {
 		opts.SendID = sendID
 	}
 	opts.Type = canonicalIOProcessorType(opts.Type)
-	data := opts.Data
-	if opts.Type == SCXMLEventProcessor {
-		var err error
-		data, err = clonePayload(data)
-		if err != nil {
-			ip.reportSendError(sendID, sendPayloadCopyError{err})
-			return
-		}
-	}
+	data := opts.Data.Clone()
 	ev := Event{Name: name, Data: data, SendID: opts.SendID}
 
 	if opts.Delay <= 0 {
@@ -327,10 +319,6 @@ func (ip *interpretation) dispatchToProcessor(sendID, target, typ Identifier, ev
 		ip.reportSendError(sendID, err)
 	}
 }
-
-type sendPayloadCopyError struct{ error }
-
-func (sendPayloadCopyError) SendExecutionError() {}
 
 type sendIDLocationError struct{ error }
 
@@ -434,12 +422,12 @@ func (unknownIOProcessorError) SendExecutionError() {}
 // dispatch-failure path. SCXML 4.7 requires logging to have no side effects
 // on document interpretation, so a broken platform Logger cannot abort an
 // action block or produce a platform error event.
-func (ip *interpretation) doLog(label string, data any) {
+func (ip *interpretation) doLog(label string, data Value) {
 	defer func() {
 		_ = recover()
 	}()
 	if ip.logger != nil {
-		ip.logger.Log(label, data)
+		ip.logger.Log(label, data.Clone())
 	}
 }
 
@@ -553,11 +541,11 @@ func callAction(action ActionFunc, ec ExecContext) (err error) {
 	return action(ec)
 }
 
-func (ip *interpretation) evaluateDone(done DoneDataFunc) (data any) {
+func (ip *interpretation) evaluateDone(done DoneDataFunc) (data Value) {
 	defer func() {
 		if value := recover(); value != nil {
 			ip.reportError(fmt.Errorf("statecharts: done data panicked: %v", value))
-			data = nil
+			data = Value{}
 		}
 	}()
 	return done(ip.execContext())
@@ -820,7 +808,7 @@ func (ip *interpretation) enterState(s *compiledState, defaults []actionBlock) {
 	}
 	parent := s.parent
 
-	var data any
+	var data Value
 	if s.done != nil {
 		data = ip.evaluateDone(s.done)
 	}
@@ -908,7 +896,7 @@ func (ip *interpretation) beginInvoke(s *compiledState, specIndex int, spec *com
 			return
 		}
 	}
-	var params any
+	var params Value
 	if spec.params != nil {
 		var ok bool
 		params, ok = ip.evaluateInvokeParams(spec.params, ip.execContext())
@@ -936,12 +924,12 @@ func (ip *interpretation) invokeIDReserved(id Identifier) bool {
 	return false
 }
 
-func (ip *interpretation) evaluateInvokeParams(fn func(ExecContext) any, ec ExecContext) (params any, ok bool) {
+func (ip *interpretation) evaluateInvokeParams(fn func(ExecContext) Value, ec ExecContext) (params Value, ok bool) {
 	ok = true
 	defer func() {
 		if value := recover(); value != nil {
 			ip.reportError(fmt.Errorf("statecharts: invoke params panicked: %v", value))
-			params, ok = nil, false
+			params, ok = Value{}, false
 		}
 	}()
 	return fn(ec), true
@@ -976,13 +964,7 @@ func (ip *interpretation) applyInvokeSideEffects(ev Event) {
 			ip.runFinalizeBlocks(ri.finalize)
 		}
 		if ri.autoForward && ri.incoming != nil {
-			forwarded := ev
-			data, err := clonePayload(ev.Data)
-			if err != nil {
-				ip.reportError(fmt.Errorf("statecharts: clone autoforward payload: %w", err))
-				continue
-			}
-			forwarded.Data = data
+			forwarded := cloneEvent(ev)
 			select {
 			case ri.incoming <- forwarded:
 			default:

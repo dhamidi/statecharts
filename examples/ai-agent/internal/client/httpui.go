@@ -38,13 +38,14 @@ var staticFiles embed.FS
 type uiHTTP struct {
 	sys        *actors.System
 	serverAddr string
+	requests   *uiRequests
 }
 
 // buildRunHTTPServer returns UIServerActor's own Invoke: a local HTTP
 // server on a random loopback port, printed to stdout, serving for as long
 // as "ui" is active.
-func buildRunHTTPServer(sys *actors.System, serverAddr string) statecharts.InvokeFunc {
-	h := &uiHTTP{sys: sys, serverAddr: serverAddr}
+func buildRunHTTPServer(sys *actors.System, serverAddr string, requests *uiRequests) statecharts.InvokeFunc {
+	h := &uiHTTP{sys: sys, serverAddr: serverAddr, requests: requests}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", h.handleIndex)
 	mux.HandleFunc("GET /events", h.handleDatastarEvents)
@@ -53,10 +54,10 @@ func buildRunHTTPServer(sys *actors.System, serverAddr string) statecharts.Invok
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.Handle("GET /static/", http.FileServerFS(staticFiles))
 
-	return func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
+	return func(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
-			return nil, err
+			return statecharts.NullValue(), err
 		}
 		fmt.Printf("ai-agent UI: http://%s/\n", ln.Addr())
 
@@ -67,12 +68,12 @@ func buildRunHTTPServer(sys *actors.System, serverAddr string) statecharts.Invok
 		select {
 		case <-ctx.Done():
 			_ = srv.Shutdown(context.Background())
-			return nil, nil
+			return statecharts.NullValue(), nil
 		case err := <-errCh:
 			if err != nil && err != http.ErrServerClosed {
-				return nil, err
+				return statecharts.NullValue(), err
 			}
-			return nil, nil
+			return statecharts.NullValue(), nil
 		}
 	}
 }
@@ -140,11 +141,11 @@ func (h *uiHTTP) handleIndex(w http.ResponseWriter, r *http.Request) {
 		// itself -- that stays exclusively LinkActor's own notification.
 		_ = h.sys.Tell(ctx, "link", statecharts.Event{
 			Name: "switch", Type: statecharts.EventExternal,
-			Data: switchRequest{ConversationID: id},
+			Data: switchValue(id),
 		})
-		snap, err = getUISnapshotForSwitch(ctx, h.sys, id)
+		snap, err = getUISnapshotForSwitch(ctx, h.sys, h.requests, id)
 	} else {
-		snap, err = getUISnapshot(ctx, h.sys)
+		snap, err = getUISnapshot(ctx, h.sys, h.requests)
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -178,8 +179,13 @@ func (h *uiHTTP) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (h *uiHTTP) handleDatastarEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	reply := make(chan chan string, 1)
+	id := h.requests.newID()
+	h.requests.mu.Lock()
+	h.requests.subscriptions[id] = reply
+	h.requests.mu.Unlock()
+	defer func() { h.requests.mu.Lock(); delete(h.requests.subscriptions, id); h.requests.mu.Unlock() }()
 	if err := h.sys.Tell(ctx, "ui", statecharts.Event{
-		Name: "subscribe_browser", Type: statecharts.EventExternal, Data: browserSubscribeRequest{Reply: reply},
+		Name: "subscribe_browser", Type: statecharts.EventExternal, Data: uiRequestValue(id, ""),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -191,8 +197,17 @@ func (h *uiHTTP) handleDatastarEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() {
+		id := h.requests.newID()
+		h.requests.mu.Lock()
+		h.requests.unsubscribes[id] = patches
+		h.requests.mu.Unlock()
+		defer func() {
+			h.requests.mu.Lock()
+			delete(h.requests.unsubscribes, id)
+			h.requests.mu.Unlock()
+		}()
 		_ = h.sys.Tell(context.Background(), "ui", statecharts.Event{
-			Name: "unsubscribe_browser", Type: statecharts.EventExternal, Data: browserUnsubscribeRequest{Channel: patches},
+			Name: "unsubscribe_browser", Type: statecharts.EventExternal, Data: uiRequestValue(id, ""),
 		})
 	}()
 
@@ -203,7 +218,7 @@ func (h *uiHTTP) handleDatastarEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 
 	writeAll := func() {
-		snap, _ := getUISnapshot(ctx, h.sys)
+		snap, _ := getUISnapshot(ctx, h.sys, h.requests)
 		_, _ = fmt.Fprint(w, datastarPatch(renderToString(renderLinkBanner(snap.LinkStatus))))
 		_, _ = fmt.Fprint(w, datastarPatch(renderToString(renderSidebar(snap))))
 		_, _ = fmt.Fprint(w, datastarPatch(renderToString(renderMain(snap))))
@@ -273,7 +288,7 @@ func (h *uiHTTP) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	_ = h.sys.Tell(r.Context(), "link", statecharts.Event{
 		Name: "switch", Type: statecharts.EventExternal,
-		Data: switchRequest{ConversationID: created.ID},
+		Data: switchValue(created.ID),
 	})
 	http.Redirect(w, r, conversationLink(created.ID.String()), http.StatusSeeOther)
 }

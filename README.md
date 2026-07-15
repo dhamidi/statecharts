@@ -166,7 +166,8 @@ func buildChart() (*statecharts.Chart, error) {
 		c.Retries++
 		conn, err := c.Dialer.Dial(context.Background())
 		if err != nil {
-			ec.Raise(statecharts.Event{Name: "dial.failed", Data: err})
+			message, _ := statecharts.StringValue(err.Error())
+			ec.Raise(statecharts.Event{Name: "dial.failed", Data: message})
 			return nil
 		}
 		c.conn = conn
@@ -178,7 +179,7 @@ func buildChart() (*statecharts.Chart, error) {
 		return nil
 	})
 	giveUp := statecharts.Action(func(c *Connection, ec statecharts.ExecContext) error {
-		ec.Log("giving up", c.Retries)
+		ec.Log("giving up", statecharts.Int64Value(int64(c.Retries)))
 		return nil
 	})
 
@@ -458,8 +459,8 @@ addSize := statecharts.Action(func(j *Job, ec statecharts.ExecContext) error {
 	if !ok {
 		return nil
 	}
-	if size, ok := statecharts.Payload[int](ev); ok {
-		j.Sizes = append(j.Sizes, size)
+	if size, ok := ev.Data.AsInt64(); ok {
+		j.Sizes = append(j.Sizes, int(size))
 	}
 	return nil
 })
@@ -469,8 +470,9 @@ hasSizes := statecharts.Cond(func(j *Job, ec statecharts.ExecContext) bool {
 })
 ```
 
-`Send`'s own `Event.Data` field is where a caller attaches the payload
-`Payload` recovers above:
+`Send`'s own `Event.Data` field carries a canonical `Value`, whose typed
+accessors recover scalars and nested values without a concrete Go type
+registry:
 
 ```go
 chart, err := statecharts.Build(
@@ -485,7 +487,7 @@ in := statecharts.New(chart, job)
 in.Start(ctx)
 defer in.Stop(ctx)
 
-in.Send(ctx, statecharts.Event{Name: "thumbnail.done", Type: statecharts.EventExternal, Data: 128})
+in.Send(ctx, statecharts.Event{Name: "thumbnail.done", Type: statecharts.EventExternal, Data: statecharts.Int64Value(128)})
 fmt.Println(job.Sizes) // [128]
 ```
 
@@ -540,7 +542,7 @@ func (p *notifyProcessor) Send(ctx context.Context, req statecharts.SendRequest)
 	if req.Target != "notifier" {
 		return fmt.Errorf("no transport for target %q", req.Target)
 	}
-	jobID, _ := req.Data.(string)
+	jobID, _ := req.Data.AsString()
 	// db.ExecContext(ctx, `UPDATE jobs SET status = 'done' WHERE id = ?`, jobID)
 	// mailer.Send(ctx, ownerEmail(jobID), "your thumbnails are ready")
 	return nil
@@ -548,11 +550,12 @@ func (p *notifyProcessor) Send(ctx context.Context, req statecharts.SendRequest)
 ```
 
 ```go
+jobID, _ := statecharts.StringValue("job-482")
 statecharts.On("job.done",
 	statecharts.Target("done"),
 	statecharts.Then(statecharts.SendEvent("notify", statecharts.SendOptions{
 		Target: "notifier",
-		Data:   "job-482",
+		Data:   jobID,
 	})),
 )
 ```
@@ -573,7 +576,8 @@ by `Type` directly:
 ```go
 notify := func(ec statecharts.ExecContext) error {
 	replyTo, _ := ec.IOProcessorLocation(statecharts.SCXMLEventProcessor)
-	ec.Send("job.notify", statecharts.SendOptions{Target: "notifier", Data: replyTo})
+	location, _ := statecharts.StringValue(replyTo.String())
+	ec.Send("job.notify", statecharts.SendOptions{Target: "notifier", Data: location})
 	return nil
 }
 ```
@@ -593,8 +597,8 @@ default `Instance`.
 An `ActionFunc` that returns a non-nil error doesn't propagate that error
 to the caller of `Send`. Per SCXML's own error model, it's reported as an
 `error.execution` event on the internal queue instead — an ordinary event
-a sibling transition can match against, carrying the error itself as its
-`Data`:
+a sibling transition can match against. Its `Data` is a tagged canonical
+error value with stable classification and message fields:
 
 ```go
 validate := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
@@ -603,7 +607,9 @@ validate := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
 
 recordFailure := statecharts.ActionFunc(func(ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	ec.Log("validation failed", ev.Data) // "corrupt image: unexpected EOF"
+	_, message, _ := statecharts.PlatformErrorDetails(ev.Data)
+	text, _ := statecharts.StringValue(message)
+	ec.Log("validation failed", text) // "corrupt image: unexpected EOF"
 	return nil
 })
 
@@ -671,13 +677,19 @@ before the service finishes on its own:
 
 ```go
 resize := statecharts.Invoke(
-	func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
-		size, _ := params.(int)
+	func(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
+		size, ok := params.AsInt64()
+		if !ok {
+			return statecharts.Value{}, fmt.Errorf("resize size is not an integer")
+		}
 		// stand-in for the actual image-resize work
-		return fmt.Sprintf("thumb-%dpx.jpg", size), nil
+		result, _ := statecharts.StringValue(fmt.Sprintf("thumb-%dpx.jpg", size))
+		return result, nil
 	},
 	statecharts.WithInvokeID("resize"),
-	statecharts.WithInvokeParams(func(ec statecharts.ExecContext) any { return 128 }),
+	statecharts.WithInvokeParams(func(ec statecharts.ExecContext) statecharts.Value {
+		return statecharts.Int64Value(128)
+	}),
 )
 
 statecharts.Atomic("thumbnailing", resize, statecharts.On("done.invoke.resize", statecharts.Target("notifying")))
@@ -697,7 +709,7 @@ of a hand-written `InvokeFunc`:
 
 ```go
 statecharts.Invoke(
-	statecharts.InvokeChart(childChart, func(params any) any {
+	statecharts.InvokeChart(childChart, func(params statecharts.Value) any {
 		return &ChildDatamodel{}
 	}, nil),
 	statecharts.WithInvokeID("child"),
@@ -732,30 +744,42 @@ subprocess, keyed by its PID:
 
 ```go
 resize := statecharts.Invoke(
-	func(ctx context.Context, params any, io statecharts.InvokeIO) (any, error) {
-		cmd := exec.CommandContext(ctx, "resize-thumb", fmt.Sprint(params))
+	func(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
+		size, ok := params.AsInt64()
+		if !ok {
+			return statecharts.Value{}, fmt.Errorf("resize size is not an integer")
+		}
+		cmd := exec.CommandContext(ctx, "resize-thumb", strconv.FormatInt(size, 10))
 		if err := cmd.Start(); err != nil {
-			return nil, err
+			return statecharts.Value{}, err
 		}
 		// recordPID("resize", cmd.Process.Pid) -- durable store WithInvokeResume reads back
-		return fmt.Sprintf("thumb-%dpx.jpg", params), cmd.Wait()
+		result, _ := statecharts.StringValue(fmt.Sprintf("thumb-%dpx.jpg", size))
+		return result, cmd.Wait()
 	},
 	statecharts.WithInvokeID("resize"),
-	statecharts.WithInvokeParams(func(ec statecharts.ExecContext) any { return 128 }),
-	statecharts.WithInvokeResume(func(ctx context.Context, id statecharts.Identifier, params any, io statecharts.InvokeIO) (any, error) {
+	statecharts.WithInvokeParams(func(ec statecharts.ExecContext) statecharts.Value {
+		return statecharts.Int64Value(128)
+	}),
+	statecharts.WithInvokeResume(func(ctx context.Context, id statecharts.Identifier, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
+		size, ok := params.AsInt64()
+		if !ok {
+			return statecharts.Value{}, fmt.Errorf("resize size is not an integer")
+		}
 		pid := 0 // loadPID(id) -- read back whatever the live invocation recorded
 		proc, err := os.FindProcess(pid)
 		if err != nil || proc.Signal(syscall.Signal(0)) != nil {
-			return nil, fmt.Errorf("resize subprocess %d is gone", pid)
+			return statecharts.Value{}, fmt.Errorf("resize subprocess %d is gone", pid)
 		}
 		for proc.Signal(syscall.Signal(0)) == nil {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return statecharts.Value{}, ctx.Err()
 			case <-time.After(time.Second):
 			}
 		}
-		return fmt.Sprintf("thumb-%dpx.jpg", params), nil
+		result, _ := statecharts.StringValue(fmt.Sprintf("thumb-%dpx.jpg", size))
+		return result, nil
 	}),
 )
 ```
@@ -903,7 +927,7 @@ import (
 func run(ctx context.Context) error {
 	onOpen := func(ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		ec.Log("opened", ev)
+		ec.Log("opened", ev.Data)
 		return nil
 	}
 	connChart, err := statecharts.Build(
@@ -1039,8 +1063,9 @@ durability is fixed at its first `Spawn` -- a name spawned without
 
 Durable charts must set `WithVersion`. Bump it when chart logic or the
 datamodel changes; snapshots are then discarded and rebuilt transparently
-from the Log. Any event payload crossing a durable ingress or outbox boundary
-must implement `DataMarshaler` and have a registered `DataUnmarshaler`.
+from the Log. Every event payload crossing a durable ingress or outbox
+boundary is a canonical `statecharts.Value`; tagged values give application
+payloads stable identities without process-global type registration.
 
 ### Addressing actors by ID
 
@@ -1051,9 +1076,10 @@ content -- `Target` is its actor ID. A target on a named node uses
 
 ```go
 sendNotify := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
+	source, _ := statecharts.StringValue(j.Source)
 	ec.Send("job.done", statecharts.SendOptions{
 		Target: "notifier",
-		Data:   j.Source,
+		Data:   source,
 	})
 	return nil
 })
@@ -1067,8 +1093,8 @@ is just another `Send` targeting `ev.Origin`:
 ```go
 notify := statecharts.Action(func(n *Notifier, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	source, _ := statecharts.Payload[string](ev)
-	ec.Log("notifying owner of", source) // stand-in for actually sending a notification
+	source, _ := ev.Data.AsString()
+	ec.Log("notifying owner of", ev.Data) // stand-in for actually sending a notification
 	ec.Send("notified", statecharts.SendOptions{Target: ev.Origin})
 	return nil
 })
@@ -1078,10 +1104,11 @@ Application code outside any chart addresses an actor the same way, with
 `System.Tell`:
 
 ```go
+source, _ := statecharts.StringValue("uploads/482.png")
 sys.Tell(ctx, "job-482", statecharts.Event{
 	Name: "job.start",
 	Type: statecharts.EventExternal,
-	Data: &sourcePayload{TypeName: "source", Value: "uploads/482.png"},
+	Data: source,
 })
 ```
 
@@ -1188,22 +1215,25 @@ type JobData struct {
 	Status string
 }
 
-// sourcePayload crosses a durable boundary in both directions: job.start is
-// logged as durable ingress, and job.done is first recorded in the durable
-// job actor's outbox. JSONData supplies both persistence methods.
-type sourcePayload = statecharts.JSONData[string]
+func sourceValue(source string) statecharts.Value {
+	text, _ := statecharts.StringValue(source)
+	value, _ := statecharts.TaggedValue("example.source/v1", text)
+	return value
+}
 
-func init() {
-	statecharts.RegisterDataType("source", func() statecharts.DataUnmarshaler {
-		return &sourcePayload{TypeName: "source"}
-	})
+func sourceFromValue(value statecharts.Value) (string, bool) {
+	tag, payload, ok := value.AsTagged()
+	if !ok || tag != "example.source/v1" {
+		return "", false
+	}
+	return payload.AsString()
 }
 
 func buildNotifierChart() (*statecharts.Chart, error) {
 	notify := statecharts.Action(func(n *Notifier, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		source, _ := statecharts.Payload[*sourcePayload](ev)
-		ec.Log("notifying owner of", source.Value) // stand-in for actually sending a notification
+		source, _ := sourceFromValue(ev.Data)
+		ec.Log("notifying owner of", sourceValue(source)) // stand-in for actually sending a notification
 		ec.Send("notified", statecharts.SendOptions{Target: ev.Origin})
 		return nil
 	})
@@ -1217,8 +1247,8 @@ func buildNotifierChart() (*statecharts.Chart, error) {
 func buildJobChart() (*statecharts.Chart, error) {
 	recordSource := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		if payload, ok := statecharts.Payload[*sourcePayload](ev); ok {
-			j.Source = payload.Value
+		if source, ok := sourceFromValue(ev.Data); ok {
+			j.Source = source
 		}
 		return nil
 	})
@@ -1235,7 +1265,7 @@ func buildJobChart() (*statecharts.Chart, error) {
 	sendNotify := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
 		ec.Send("job.done", statecharts.SendOptions{
 			Target: "notifier",
-			Data:   &sourcePayload{TypeName: "source", Value: j.Source},
+			Data:   sourceValue(j.Source),
 		})
 		return nil
 	})
@@ -1324,7 +1354,7 @@ func run(ctx context.Context) error {
 	if err := sys.Tell(ctx, "job-482", statecharts.Event{
 		Name: "job.start",
 		Type: statecharts.EventExternal,
-		Data: &sourcePayload{TypeName: "source", Value: "uploads/482.png"},
+		Data: sourceValue("uploads/482.png"),
 	}); err != nil {
 		return err
 	}
@@ -1443,15 +1473,16 @@ type ConnData struct {
 
 func buildConnChart() (*statecharts.Chart, error) {
 	forwardUpload := statecharts.Action(func(c *ConnData, ec statecharts.ExecContext) error {
+		source, _ := statecharts.StringValue("uploads/482.png")
 		ec.Send("job.start", statecharts.SendOptions{
 			Target: "job-482@jobs-system",
-			Data:   "uploads/482.png",
+			Data:   source,
 		})
 		return nil
 	})
 	recordResult := statecharts.Action(func(c *ConnData, ec statecharts.ExecContext) error {
 		ev, _ := ec.Event()
-		c.Result, _ = statecharts.Payload[string](ev)
+		c.Result, _ = ev.Data.AsString()
 		return nil
 	})
 	return statecharts.Build(
@@ -1483,7 +1514,8 @@ func buildJobChart() (*statecharts.Chart, error) {
 	})
 	reply := statecharts.Action(func(j *JobData, ec statecharts.ExecContext) error {
 		j.Status = "done"
-		ec.Send("job.result", statecharts.SendOptions{Target: j.Origin, Data: "thumbnails ready"})
+		result, _ := statecharts.StringValue("thumbnails ready")
+		ec.Send("job.result", statecharts.SendOptions{Target: j.Origin, Data: result})
 		return nil
 	})
 	return statecharts.Build(

@@ -91,10 +91,7 @@ func reportState(state protocol.ConversationState) statecharts.ActionFunc {
 		}
 		ec.Send("state_changed", statecharts.SendOptions{
 			Target: "user",
-			Data: &conversationStatePayload{
-				TypeName: "aiagent.conversation_state",
-				Value:    ConversationStateData{ID: convID, State: state},
-			},
+			Data:   encodeConversationState(ConversationStateData{ID: convID, State: state}),
 		})
 		return nil
 	}
@@ -116,21 +113,21 @@ var broadcastLastMessage = statecharts.Action(func(d *conversationModel, ec stat
 	last := d.History[len(d.History)-1]
 	ec.Send("broadcast", statecharts.SendOptions{
 		Target: "fanout",
-		Data: &fanoutBroadcast{
+		Data: encodeFanoutBroadcast(fanoutBroadcast{
 			ConversationID: convID,
 			Kind:           "message",
 			Seq:            len(d.History),
-			Frame:          protocol.MessageFrame{Role: mapRole(last.Role), Text: last.Text},
-		},
+			Message:        protocol.MessageFrame{Role: mapRole(last.Role), Text: last.Text},
+		}),
 	})
 	return nil
 })
 
 var appendUserMessage = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, _ := statecharts.Payload[*userMessagePayload](ev)
-	if payload != nil {
-		d.History = append(d.History, llm.Message{Role: llm.RoleUser, Text: payload.Value.Text})
+	payload, ok := decodeUserMessage(ev.Data)
+	if ok {
+		d.History = append(d.History, llm.Message{Role: llm.RoleUser, Text: payload.Text})
 	}
 	return nil
 })
@@ -151,10 +148,10 @@ var startRequest = statecharts.Action(func(d *conversationModel, ec statecharts.
 	ec.Send("generate", statecharts.SendOptions{
 		Target: reqName,
 		Type:   "llm",
-		Data: &dispatchPayload{
+		Data: encodeDispatch(dispatchPayload{
 			ConversationID: convID,
 			Request:        llm.GenerateRequest{History: history, Tools: staticToolDefs},
-		},
+		}),
 	})
 	return nil
 })
@@ -166,24 +163,24 @@ func matchesPendingRequest(d *conversationModel, ec statecharts.ExecContext) boo
 
 func isToolCallReply(d *conversationModel, ec statecharts.ExecContext) bool {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*llmReplyPayload](ev)
-	return ok && payload.Value.IsToolCall
+	payload, ok := decodeLLMReply(ev.Data)
+	return ok && payload.IsToolCall
 }
 
 func isTextReply(d *conversationModel, ec statecharts.ExecContext) bool {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*llmReplyPayload](ev)
-	return ok && !payload.Value.IsToolCall
+	payload, ok := decodeLLMReply(ev.Data)
+	return ok && !payload.IsToolCall
 }
 
 var recordPendingToolCall = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, _ := statecharts.Payload[*llmReplyPayload](ev)
-	if payload == nil {
+	payload, ok := decodeLLMReply(ev.Data)
+	if !ok {
 		return nil
 	}
-	d.PendingToolName = payload.Value.ToolName
-	d.PendingArgs = payload.Value.ToolArgs
+	d.PendingToolName = payload.ToolName
+	d.PendingArgs = payload.ToolArgs
 	d.PendingCallID = protocol.CallID(d.PendingRequest) // one llmrequest per turn: reusing its name as the call id is unambiguous
 	d.PendingRetries = 0
 	return nil
@@ -191,9 +188,9 @@ var recordPendingToolCall = statecharts.Action(func(d *conversationModel, ec sta
 
 var appendAssistantMessage = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, _ := statecharts.Payload[*llmReplyPayload](ev)
-	if payload != nil {
-		d.History = append(d.History, llm.Message{Role: llm.RoleAssistant, Text: payload.Value.Text})
+	payload, ok := decodeLLMReply(ev.Data)
+	if ok {
+		d.History = append(d.History, llm.Message{Role: llm.RoleAssistant, Text: payload.Text})
 	}
 	return nil
 })
@@ -213,12 +210,12 @@ var offerToolCall = statecharts.Action(func(d *conversationModel, ec statecharts
 	}
 	ec.Send("offer", statecharts.SendOptions{
 		Target: "toolregistry",
-		Data: &toolOffer{
+		Data: encodeToolOffer(toolOffer{
 			ConversationID: convID,
 			Tool:           d.PendingToolName,
 			CallID:         d.PendingCallID,
 			Args:           d.PendingArgs,
-		},
+		}),
 	})
 	return nil
 })
@@ -265,14 +262,10 @@ func retriesExhausted(d *conversationModel, ec statecharts.ExecContext) bool {
 var failPendingToolCall = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
 	ec.Send("tool_result", statecharts.SendOptions{
 		Target: statecharts.Identifier(ec.SessionID()),
-		Data: &toolResultPayload{
-			TypeName: "aiagent.tool_result",
-			Value: ToolResultData{
-				CallID: d.PendingCallID,
-				Error: fmt.Sprintf("no executor claimed %q within %s; giving up",
-					d.PendingToolName, toolOfferRetryInterval*time.Duration(toolOfferMaxRetries)),
-			},
-		},
+		Data: encodeToolResult(ToolResultData{
+			CallID: d.PendingCallID,
+			Error:  fmt.Sprintf("no executor claimed %q within %s; giving up", d.PendingToolName, toolOfferRetryInterval*time.Duration(toolOfferMaxRetries)),
+		}),
 	})
 	return nil
 })
@@ -307,19 +300,19 @@ var retryOfferAndReschedule = statecharts.Action(func(d *conversationModel, ec s
 
 func matchesPendingCallID(d *conversationModel, ec statecharts.ExecContext) bool {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*toolResultPayload](ev)
-	return ok && d.PendingCallID != "" && payload.Value.CallID == d.PendingCallID
+	payload, ok := decodeToolResult(ev.Data)
+	return ok && d.PendingCallID != "" && payload.CallID == d.PendingCallID
 }
 
 var appendToolResultMessage = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, _ := statecharts.Payload[*toolResultPayload](ev)
-	if payload == nil {
+	payload, ok := decodeToolResult(ev.Data)
+	if !ok {
 		return nil
 	}
-	text := payload.Value.Output
-	if payload.Value.Error != "" {
-		text = fmt.Sprintf("error: %s", payload.Value.Error)
+	text := payload.Output
+	if payload.Error != "" {
+		text = fmt.Sprintf("error: %s", payload.Error)
 	}
 	d.History = append(d.History, llm.Message{Role: llm.RoleTool, Text: text})
 	return nil
@@ -340,19 +333,19 @@ var clearPendingToolCall = statecharts.Action(func(d *conversationModel, ec stat
 // it runs (and answers correctly) no matter which child state is current.
 var replyWithCatchup = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
 	ev, _ := ec.Event()
-	payload, ok := statecharts.Payload[*catchupRequestPayload](ev)
+	payload, ok := decodeCatchupRequest(ev.Data)
 	if !ok {
 		return nil
 	}
-	from := payload.Value.FromSeq
+	from := payload.FromSeq
 	if from < 0 || from > len(d.History) {
 		from = 0
 	}
 	for i := from; i < len(d.History); i++ {
 		m := d.History[i]
 		ec.Send("catchup_message", statecharts.SendOptions{
-			Target: statecharts.Identifier(payload.Value.Connection),
-			Data:   &catchupMessage{Seq: i + 1, Frame: protocol.MessageFrame{Role: mapRole(m.Role), Text: m.Text}},
+			Target: statecharts.Identifier(payload.Connection),
+			Data:   encodeCatchupMessage(catchupMessage{Seq: i + 1, Frame: protocol.MessageFrame{Role: mapRole(m.Role), Text: m.Text}}),
 		})
 	}
 	return nil

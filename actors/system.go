@@ -960,7 +960,7 @@ func (s *System) reportDeliveryFailure(ctx context.Context, origin statecharts.D
 		Name:   statecharts.ErrEventCommunication,
 		Type:   statecharts.EventPlatform,
 		SendID: sendID,
-		Data:   fmt.Errorf("actors: deliver to %q failed: %w", target, cause),
+		Data:   statecharts.PlatformErrorValue(statecharts.ErrEventCommunication, fmt.Errorf("actors: deliver to %q failed: %w", target, cause)),
 	}
 	_ = origin.Deliver(ctx, ev)
 }
