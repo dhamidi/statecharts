@@ -4,7 +4,7 @@ Date: 2026-07-13
 
 ## Status
 
-Accepted
+Superseded by [ADR 0015](0015-serializable-definitions-pluggable-datamodels-and-hot-deployment.md)
 
 ## Context
 
