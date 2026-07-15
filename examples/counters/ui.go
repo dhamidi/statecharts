@@ -34,6 +34,7 @@ func renderCounterBox(p projection) HTMLElement {
 		New("span", map[string]string{"class": "counter-header"},
 			New("strong", nil, Text(p.Name)), renderResidency(state)),
 		renderCounterValue(p.Value),
+		renderRevision(p.Revision),
 	)
 }
 
@@ -47,6 +48,17 @@ func renderResidency(state string) HTMLElement {
 
 func renderCounterValue(value int) HTMLElement {
 	return New("data", map[string]string{"value": strconv.Itoa(value)}, Text(strconv.Itoa(value)))
+}
+
+func renderRevision(revision string) HTMLElement {
+	label := revision
+	if len(label) > 19 {
+		label = label[:19]
+	}
+	if label == "" {
+		label = "pending"
+	}
+	return New("span", map[string]string{"class": "revision", "data-revision": revision, "title": revision}, Text("rev "+label))
 }
 
 func renderConnectionStatus(status string) HTMLElement {
@@ -90,7 +102,7 @@ func renderString(e HTMLElement) string {
 	return b.String()
 }
 
-const pageCSS = `*{box-sizing:border-box}body{margin:0;background:#f4f4f5;font:16px system-ui;color:#18181b}main{max-width:1100px;margin:auto;padding:2rem}.page-header{border-bottom:3px solid #18181b;margin-bottom:1rem;position:relative}.page-header p{font:700 .75rem ui-monospace,monospace;letter-spacing:.12em;margin:0}.page-header h1{font-size:2.4rem;margin:.3rem 0 1rem}.page-header .hint{position:absolute;right:0;bottom:1.2rem;font-weight:500;letter-spacing:0;text-transform:none}.status,.summary{padding:.65rem .8rem;border:1px solid #18181b;margin-bottom:.7rem;display:flex;justify-content:space-between}.status{background:#86efac}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;background:#18181b;border:1px solid #18181b}.counter{appearance:none;border:0;border-radius:0;padding:1.2rem;min-height:155px;display:flex;flex-direction:column;justify-content:space-between;text-align:left;font:inherit;cursor:pointer}.counter:hover,.counter:focus-visible{outline:4px solid #18181b;outline-offset:-7px}.counter:active{transform:translate(2px,2px)}.counter.is-paged-out{filter:saturate(.2);opacity:.5}.counter.is-hydrating{filter:saturate(.45);opacity:.75;outline:4px solid currentColor;outline-offset:-7px}.counter-header{display:flex;justify-content:space-between;align-items:start}.counter strong{text-transform:uppercase;letter-spacing:.08em}.counter data{font:700 3rem ui-monospace,monospace}.residency{font:700 .65rem ui-monospace,monospace;text-transform:uppercase;padding:.2rem .3rem;border:1px solid currentColor}.nonresident{opacity:.65}.hydrating{opacity:1}@media(max-width:700px){main{padding:1rem}.page-header .hint{position:static;margin-bottom:1rem}.page-header h1{font-size:2rem}}`
+const pageCSS = `*{box-sizing:border-box}body{margin:0;background:#f4f4f5;font:16px system-ui;color:#18181b}main{max-width:1100px;margin:auto;padding:2rem}.page-header{border-bottom:3px solid #18181b;margin-bottom:1rem;position:relative}.page-header p{font:700 .75rem ui-monospace,monospace;letter-spacing:.12em;margin:0}.page-header h1{font-size:2.4rem;margin:.3rem 0 1rem}.page-header .hint{position:absolute;right:0;bottom:1.2rem;font-weight:500;letter-spacing:0;text-transform:none}.status,.summary{padding:.65rem .8rem;border:1px solid #18181b;margin-bottom:.7rem;display:flex;justify-content:space-between}.status{background:#86efac}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;background:#18181b;border:1px solid #18181b}.counter{appearance:none;border:0;border-radius:0;padding:1.2rem;min-height:175px;display:flex;flex-direction:column;justify-content:space-between;text-align:left;font:inherit;cursor:pointer}.counter:hover,.counter:focus-visible{outline:4px solid #18181b;outline-offset:-7px}.counter:active{transform:translate(2px,2px)}.counter.is-paged-out{filter:saturate(.2);opacity:.5}.counter.is-hydrating{filter:saturate(.45);opacity:.75;outline:4px solid currentColor;outline-offset:-7px}.counter-header{display:flex;justify-content:space-between;align-items:start}.counter strong{text-transform:uppercase;letter-spacing:.08em}.counter data{font:700 3rem ui-monospace,monospace}.residency{font:700 .65rem ui-monospace,monospace;text-transform:uppercase;padding:.2rem .3rem;border:1px solid currentColor}.revision{font:600 .62rem ui-monospace,monospace;letter-spacing:.03em}.nonresident{opacity:.65}.hydrating{opacity:1}@media(max-width:700px){main{padding:1rem}.page-header .hint{position:static;margin-bottom:1rem}.page-header h1{font-size:2rem}}`
 
 //go:embed datastar.js
 var datastarJS []byte

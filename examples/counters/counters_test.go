@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/dhamidi/statecharts"
+	statejson "github.com/dhamidi/statecharts/syntax/json"
 )
 
 func mustQuery(t *testing.T, rt *counterRuntime, selected []string) []projection {
@@ -37,6 +39,59 @@ func waitValue(t *testing.T, rt *counterRuntime, name string, want int) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("%s never reached %d: %#v", name, want, mustQuery(t, rt, colors))
+}
+
+func waitSelectedValue(t *testing.T, rt *counterRuntime, name string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		projections, err := rt.query(context.Background(), []string{name})
+		if err == nil && len(projections) == 1 && projections[0].Value == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	projections, _ := rt.query(context.Background(), []string{name})
+	t.Fatalf("%s never reached %d: %#v", name, want, projections)
+}
+
+func setIncrementVersion(t *testing.T, definition *statecharts.Definition, version string) {
+	t.Helper()
+	for _, transition := range definition.Root.Transitions {
+		for _, block := range transition.Actions {
+			for _, executable := range block {
+				if executable.Call != nil && executable.Call.Function.Name == "counters.counter.apply-idempotent-increment" {
+					executable.Call.Function.Version = version
+					return
+				}
+			}
+		}
+	}
+	t.Fatal("counter increment function reference not found")
+}
+
+func incrementVersion(t *testing.T, definition statecharts.Definition) string {
+	t.Helper()
+	for _, transition := range definition.Root.Transitions {
+		for _, block := range transition.Actions {
+			for _, executable := range block {
+				if executable.Call != nil && executable.Call.Function.Name == "counters.counter.apply-idempotent-increment" {
+					return executable.Call.Function.Version
+				}
+			}
+		}
+	}
+	t.Fatal("counter increment function reference not found")
+	return ""
+}
+
+func definitionJSON(t *testing.T, definition statecharts.Definition) []byte {
+	t.Helper()
+	data, err := statejson.MarshalIndent(definition, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestDurableIdempotenceAndRecovery(t *testing.T) {
@@ -218,9 +273,13 @@ func TestServerPageStartsDatastarEventStreamAndCountersAreClickable(t *testing.T
 	if strings.Contains(page, `\"`) {
 		t.Fatalf("page contains backslash-escaped HTML attributes: %s", page)
 	}
-	card := renderString(renderCounterBox(projection{Name: "red", Color: "red", Value: 12, Resident: true}))
+	revision := "sha256:1234567890abcdef"
+	card := renderString(renderCounterBox(projection{Name: "red", Color: "red", Value: 12, Resident: true, Revision: revision}))
 	if !strings.Contains(card, `<button`) || !strings.Contains(card, `data-on:click="@post(&#39;/counters/red/increment&#39;)"`) {
 		t.Fatalf("counter is not an increment control: %s", card)
+	}
+	if !strings.Contains(card, `data-revision="`+revision+`"`) || !strings.Contains(card, `rev sha256:1234567890ab`) {
+		t.Fatalf("counter does not show its pinned revision: %s", card)
 	}
 	pagedOut := renderString(renderCounterBox(projection{Name: "blue", Color: "blue", Value: 9}))
 	if !strings.Contains(pagedOut, "is-hydrating") || strings.Contains(pagedOut, "querySelector(&#39;data&#39;)") {
@@ -251,11 +310,11 @@ func TestServerUIIncrementEndpointUpdatesCounter(t *testing.T) {
 	if definitionResponse.Code != http.StatusOK || definitionResponse.Header().Get("Content-Type") != "application/json" {
 		t.Fatalf("definition response = %d %q", definitionResponse.Code, definitionResponse.Header().Get("Content-Type"))
 	}
-	var definition statecharts.Definition
-	if err := json.Unmarshal(definitionResponse.Body.Bytes(), &definition); err != nil {
+	definition, err := statejson.Unmarshal(definitionResponse.Body.Bytes())
+	if err != nil {
 		t.Fatalf("decode canonical definition: %v", err)
 	}
-	if definition.ID != counterKind || !strings.Contains(definitionResponse.Body.String(), "counters.counter.apply-idempotent-increment") || strings.Contains(definitionResponse.Body.String(), "func") {
+	if definition.ID != counterKind || !strings.Contains(definitionResponse.Body.String(), "counters.counter.apply-idempotent-increment") || strings.Contains(definitionResponse.Body.String(), "func(") {
 		t.Fatalf("counter definition is not stable and inspectable: %s", definitionResponse.Body.String())
 	}
 
@@ -283,6 +342,161 @@ func TestServerUIIncrementEndpointUpdatesCounter(t *testing.T) {
 		t.Fatalf("Datastar increment response does not contain the updated dashboard: %s", body)
 	}
 	waitValue(t, rt, "red", before+2)
+}
+
+func TestDefinitionAdministrationPublishesWholeRevisionAndKeepsActorsPinned(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, err := openLog(t.TempDir() + "/counters.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := setupCounters(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.stop(context.Background())
+	handler := counterHandler(rt)
+
+	_, oldRevision, ok := rt.counters.CurrentDefinition(counterKind)
+	if !ok {
+		t.Fatal("counter definition is not registered")
+	}
+	if rt.counters.IsResident("red") {
+		t.Fatal("red must begin paged out so the test exercises pinned-revision reactivation")
+	}
+	if got := projectionFor(t, mustQuery(t, rt, []string{"red"}), "red").Revision; got != string(oldRevision) {
+		t.Fatalf("red projected revision = %q, want %q", got, oldRevision)
+	}
+	chartsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(chartsResponse, httptest.NewRequest(http.MethodGet, "/definitions", nil))
+	var charts chartList
+	if err := json.Unmarshal(chartsResponse.Body.Bytes(), &charts); err != nil {
+		t.Fatalf("decode chart listing: %v", err)
+	}
+	if chartsResponse.Code != http.StatusOK || len(charts.Charts) != 1 || charts.Charts[0].ChartID != counterKind || charts.Charts[0].Revision != oldRevision {
+		t.Fatalf("chart listing = %d %s", chartsResponse.Code, chartsResponse.Body.String())
+	}
+
+	exported := httptest.NewRecorder()
+	handler.ServeHTTP(exported, httptest.NewRequest(http.MethodGet, "/definitions/counter", nil))
+	if exported.Code != http.StatusOK {
+		t.Fatalf("export status = %d: %s", exported.Code, exported.Body.String())
+	}
+	definition, err := statejson.Unmarshal(exported.Body.Bytes())
+	if err != nil {
+		t.Fatalf("decode exported definition: %v", err)
+	}
+
+	invalid := definition.Clone()
+	setIncrementVersion(t, &invalid, "missing")
+	invalidRequest := httptest.NewRequest(http.MethodPut, "/definitions/counter", bytes.NewReader(definitionJSON(t, invalid)))
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid publish status = %d, want 422: %s", invalidResponse.Code, invalidResponse.Body.String())
+	}
+	if _, current, _ := rt.counters.CurrentDefinition(counterKind); current != oldRevision {
+		t.Fatalf("invalid candidate changed current revision to %q, want %q", current, oldRevision)
+	}
+
+	candidate := definition.Clone()
+	candidate.RevisionSalt = "counter-v2"
+	setIncrementVersion(t, &candidate, "v2")
+	validateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(validateResponse, httptest.NewRequest(http.MethodPost, "/definitions/counter/validate", bytes.NewReader(definitionJSON(t, candidate))))
+	if validateResponse.Code != http.StatusOK {
+		t.Fatalf("validate status = %d: %s", validateResponse.Code, validateResponse.Body.String())
+	}
+	var validated definitionStatus
+	if err := json.Unmarshal(validateResponse.Body.Bytes(), &validated); err != nil || validated.ChartID != counterKind || validated.Revision == oldRevision {
+		t.Fatalf("validate response = %#v, %v", validated, err)
+	}
+	if _, current, _ := rt.counters.CurrentDefinition(counterKind); current != oldRevision {
+		t.Fatalf("validation published revision %q, want current %q", current, oldRevision)
+	}
+
+	publishResponse := httptest.NewRecorder()
+	handler.ServeHTTP(publishResponse, httptest.NewRequest(http.MethodPut, "/definitions/counter", bytes.NewReader(definitionJSON(t, candidate))))
+	if publishResponse.Code != http.StatusOK {
+		t.Fatalf("publish status = %d: %s", publishResponse.Code, publishResponse.Body.String())
+	}
+	var published definitionStatus
+	if err := json.Unmarshal(publishResponse.Body.Bytes(), &published); err != nil || published != validated {
+		t.Fatalf("publish response = %#v, %v; want %#v", published, err, validated)
+	}
+	_, newRevision, _ := rt.counters.CurrentDefinition(counterKind)
+	if newRevision == oldRevision {
+		t.Fatalf("published revision = old revision %q", oldRevision)
+	}
+	if got, _ := rt.counters.ActorRevision("red"); got != oldRevision {
+		t.Fatalf("red revision after publish = %q, want %q", got, oldRevision)
+	}
+
+	spawnResponse := httptest.NewRecorder()
+	handler.ServeHTTP(spawnResponse, httptest.NewRequest(http.MethodPost, "/actors/blue.canary", nil))
+	if spawnResponse.Code != http.StatusNoContent {
+		t.Fatalf("spawn status = %d: %s", spawnResponse.Code, spawnResponse.Body.String())
+	}
+	if got, _ := rt.counters.ActorRevision("blue.canary"); got != newRevision {
+		t.Fatalf("blue.canary revision = %q, want %q", got, newRevision)
+	}
+	waitSelectedValue(t, rt, "blue.canary", 0)
+
+	redBefore := projectionFor(t, mustQuery(t, rt, []string{"red"}), "red").Value
+	redWrite := httptest.NewRecorder()
+	handler.ServeHTTP(redWrite, httptest.NewRequest(http.MethodPost, "/counters/red/writes/old-revision-write", nil))
+	if redWrite.Code != http.StatusNoContent {
+		t.Fatalf("red write status = %d: %s", redWrite.Code, redWrite.Body.String())
+	}
+	canaryWrite := httptest.NewRecorder()
+	handler.ServeHTTP(canaryWrite, httptest.NewRequest(http.MethodPost, "/counters/blue.canary/writes/new-revision-write", nil))
+	if canaryWrite.Code != http.StatusNoContent {
+		t.Fatalf("blue.canary write status = %d: %s", canaryWrite.Code, canaryWrite.Body.String())
+	}
+	waitSelectedValue(t, rt, "red", redBefore+1)
+	waitSelectedValue(t, rt, "blue.canary", 2)
+	for actorID, want := range map[string]string{"red": fmt.Sprintf(`"value":%d`, redBefore+1), "blue.canary": `"value":2`} {
+		counterResponse := httptest.NewRecorder()
+		handler.ServeHTTP(counterResponse, httptest.NewRequest(http.MethodGet, "/counters/"+actorID, nil))
+		if counterResponse.Code != http.StatusOK || !strings.Contains(counterResponse.Body.String(), want) {
+			t.Fatalf("counter %s response = %d %s, want %s", actorID, counterResponse.Code, counterResponse.Body.String(), want)
+		}
+	}
+
+	retained := httptest.NewRecorder()
+	retainedURL := "/definitions/counter?revision=" + url.QueryEscape(string(oldRevision))
+	handler.ServeHTTP(retained, httptest.NewRequest(http.MethodGet, retainedURL, nil))
+	if retained.Code != http.StatusOK {
+		t.Fatalf("retained export status = %d: %s", retained.Code, retained.Body.String())
+	}
+	oldDefinition, err := statejson.Unmarshal(retained.Body.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := incrementVersion(t, oldDefinition); got != "v1" {
+		t.Fatalf("retained increment version = %q, want v1", got)
+	}
+
+	actorsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(actorsResponse, httptest.NewRequest(http.MethodGet, "/actors", nil))
+	if actorsResponse.Code != http.StatusOK {
+		t.Fatalf("actors status = %d: %s", actorsResponse.Code, actorsResponse.Body.String())
+	}
+	var listed actorList
+	if err := json.Unmarshal(actorsResponse.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode actor listing: %v", err)
+	}
+	byID := make(map[statecharts.Identifier]actorStatus, len(listed.Actors))
+	for _, actor := range listed.Actors {
+		byID[actor.ActorID] = actor
+	}
+	if got := byID["red"]; got.ChartID != counterKind || got.Revision != oldRevision || got.Lifecycle != statecharts.ActorLifecycleActive {
+		t.Fatalf("listed red = %#v", got)
+	}
+	if got := byID["blue.canary"]; got.ChartID != counterKind || got.Revision != newRevision || got.Lifecycle != statecharts.ActorLifecycleActive {
+		t.Fatalf("listed blue.canary = %#v", got)
+	}
 }
 
 func TestEventStreamColorSelection(t *testing.T) {

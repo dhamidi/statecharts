@@ -286,7 +286,7 @@ application registry:
 ```go
 definition := chart.Definition()
 
-wire, err := json.MarshalIndent(definition, "", "  ")
+wire, err := statejson.MarshalIndent(definition, "", "  ")
 if err != nil {
 	return err
 }
@@ -299,8 +299,8 @@ wire, err = os.ReadFile("door.json")
 if err != nil {
 	return err
 }
-var edited statecharts.Definition
-if err := json.Unmarshal(wire, &edited); err != nil {
+edited, err := statejson.Unmarshal(wire)
+if err != nil {
 	return err
 }
 nextChart, err := statecharts.Compile(edited, model)
@@ -314,22 +314,32 @@ The same pattern supports a running program's inspection endpoint:
 ```go
 func definitionHandler(chart *statecharts.Chart) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
+		data, err := statejson.MarshalIndent(chart.Definition(), "", "  ")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(chart.Definition())
+		_, _ = w.Write(data)
 	}
 }
 ```
 
-The durable counters example serves `GET /definitions/counter` and recompiles
-its own encoded definition during startup. The ai-agent example performs the
-same encode/decode/recompile path for every chart family before returning a
-chart, so its behavioral tests run against transported definitions.
+Here `statejson` is the optional
+`github.com/dhamidi/statecharts/syntax/json` package. JSON is one editable
+surface syntax, not the canonical in-memory program or revision encoding. The
+durable counters example serves `GET /definitions/counter`, validates and
+publishes edited complete definitions, and recompiles its own encoded
+definition during startup. The ai-agent example performs an equivalent
+encode/decode/recompile path for every chart family before returning a chart,
+so its behavioral tests run against transported definitions.
 
 Compilation creates a new immutable chart; it never mutates an existing one.
-That is the foundation for Erlang-style deployment: a publication layer can
-pin existing instances to their old chart while routing newly spawned
-instances to the new chart. Runtime chart publication and version pinning are
-separate concerns and are not yet part of this package.
+`actors.System.Publish` provides Erlang-style deployment: existing actors stay
+pinned to their old chart while newly spawned actors select the new current
+revision. The counters example documents the complete export → edit → validate
+→ publish → canary loop; its dashboard cards and actor-inspection endpoint make
+the corresponding revision pins visible.
 
 Definitions are syntax neutral. JSON is convenient for transport today, but a
 different text syntax or editor only needs to produce the same `Definition`.
@@ -527,7 +537,8 @@ systems, but each system owns isolated durable storage.
 - [`examples/counters`](examples/counters) runs seven durable actors with a
   three-actor residency limit, a live Datastar UI, and reconnecting writer and
   reader load instruments. It demonstrates paging, hydration visibility,
-  canonical definition inspection, bridges, and custom IOProcessors.
+  complete-definition hot publication, revision-pinned canaries, bridges, and
+  custom IOProcessors.
 - [`examples/ai-agent`](examples/ai-agent) is a multi-conversation durable
   workspace with ephemeral connection actors, resumable clients, streamed
   provider work, tool leasing, and capability registries kept outside model

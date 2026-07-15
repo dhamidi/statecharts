@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -160,6 +159,11 @@ func setupCounters(ctx context.Context, store *sqlite3.Storage) (*counterRuntime
 		}
 	}
 	rt := &counterRuntime{counters: counters, ui: ui, streams: transport, storage: store, requests: requests, counterChart: chart}
+	for _, name := range colors {
+		if err = rt.notifyRevision(ctx, statecharts.Identifier(name)); err != nil {
+			return fail(err)
+		}
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		ps, e := rt.query(ctx, colors)
@@ -172,6 +176,30 @@ func setupCounters(ctx context.Context, store *sqlite3.Storage) (*counterRuntime
 		time.Sleep(time.Millisecond)
 	}
 	return rt, nil
+}
+
+func (rt *counterRuntime) notifyRevision(ctx context.Context, actorID statecharts.Identifier) error {
+	revision, ok := rt.counters.ActorRevision(actorID)
+	if !ok {
+		return fmt.Errorf("counter actor %q has no revision", actorID)
+	}
+	return rt.ui.Tell(ctx, "hub", statecharts.Event{Name: "revision", Type: statecharts.EventExternal, Data: taggedMap(revisionValueTag, map[string]statecharts.Value{"actor_id": stringValue(string(actorID)), "revision": stringValue(string(revision))})})
+}
+
+func (rt *counterRuntime) spawnCounter(ctx context.Context, actorID statecharts.Identifier) error {
+	if _, err := statecharts.NewIdentifier(string(actorID)); err != nil {
+		return fmt.Errorf("invalid actor ID: %w", err)
+	}
+	if _, ok := counterColor(string(actorID)); !ok {
+		return fmt.Errorf("actor ID %q must begin with a known color and optional dot-separated suffix", actorID)
+	}
+	if err := rt.counters.Spawn(ctx, actorID, counterKind, actors.Durable()); err != nil {
+		return err
+	}
+	if err := rt.notifyRevision(ctx, actorID); err != nil {
+		return err
+	}
+	return rt.counters.Tell(ctx, actorID, statecharts.Event{Name: "publish", Type: statecharts.EventExternal})
 }
 
 func (rt *counterRuntime) query(ctx context.Context, selected []string) ([]projection, error) {
@@ -201,27 +229,20 @@ func counterHandler(rt *counterRuntime) http.Handler {
 	mux.HandleFunc("GET /", pageHandler(func() []projection { p, _ := rt.query(context.Background(), colors); return p }))
 	mux.HandleFunc("GET /datastar.js", datastarHandler)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	// This read-only endpoint demonstrates that the running chart exposes its
-	// canonical, portable definition independently of actor state.
-	mux.HandleFunc("GET /definitions/counter", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(rt.counterChart.Definition()); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	})
+	registerAdministrationRoutes(mux, rt)
 	mux.HandleFunc("GET /ui/events", rt.streamHandler("browser", func(*http.Request) ([]string, error) { return append([]string(nil), colors...), nil }))
 	mux.HandleFunc("GET /events", rt.streamHandler("terminal", eventStreamColors))
 	mux.HandleFunc("POST /counters/{color}/writes/{writeID}", func(w http.ResponseWriter, r *http.Request) {
-		color, id := r.PathValue("color"), r.PathValue("writeID")
-		if _, ok := colorValues[color]; !ok {
-			http.Error(w, "unknown color", 404)
+		actorID, id := r.PathValue("color"), r.PathValue("writeID")
+		if _, ok := counterColor(actorID); !ok {
+			http.Error(w, "counter actor ID must begin with a known color", 404)
 			return
 		}
 		if _, err := statecharts.NewIdentifier(id); err != nil || strings.Contains(id, ".") {
 			http.Error(w, "invalid write ID", 400)
 			return
 		}
-		if err := rt.counters.Tell(r.Context(), statecharts.Identifier(color), incrementEvent(statecharts.Identifier(id))); err != nil {
+		if err := rt.counters.Tell(r.Context(), statecharts.Identifier(actorID), incrementEvent(statecharts.Identifier(id))); err != nil {
 			http.Error(w, err.Error(), 503)
 			return
 		}

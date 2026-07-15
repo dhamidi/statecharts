@@ -34,10 +34,76 @@ state to manufacture updates.
 Every chart uses its own typed `GoModel[D]`. Application behavior is registered
 under explicit, versioned names and chart nodes contain only serializable
 references to those registrations; runtime transports, channels, callbacks,
-and log storage are not part of snapshot data. The running server also exposes
-the durable counter's current canonical definition as read-only JSON at
-`GET /definitions/counter`. This is inspection only; the example deliberately
-does not implement hot publication.
+and log storage are not part of snapshot data. Each of the seven dashboard
+cards displays its actor's pinned chart revision in addition to residency and
+value; `GET /actors` reports pins for every actor, including canaries.
+
+## Inspect, edit, and publish
+
+The server exposes a deliberately small, unauthenticated administration API
+for the complete-definition deployment loop. It is an example seam, not a
+recommendation to expose these endpoints without your application's normal
+authentication and authorization.
+
+Start with the Go-built `counter-v1` definition, export it through the optional
+JSON surface codec, and inspect the current revision:
+
+```sh
+curl -s http://127.0.0.1:8080/definitions | jq
+curl -s http://127.0.0.1:8080/definitions/counter > counter-v1.json
+```
+
+The server has both `v1` (+1) and `v2` (+2) implementations of
+`counters.counter.apply-idempotent-increment` in its Go model registry. The
+initial Go definition references `v1`. Edit that reference as ordinary data
+and give the chart revision an operator-visible salt:
+
+```sh
+jq '(.root.transitions[].actions[][] |
+     select(.call.function.name? == "counters.counter.apply-idempotent-increment") |
+     .call.function.version) = "v2" |
+    .revisionSalt = "counter-v2"' \
+  counter-v1.json > counter-v2.json
+
+curl -fsS -X POST --data-binary @counter-v2.json \
+  http://127.0.0.1:8080/definitions/counter/validate | jq
+curl -fsS -X PUT --data-binary @counter-v2.json \
+  http://127.0.0.1:8080/definitions/counter | jq
+```
+
+Validation compiles the complete candidate without publication. Publication
+stores and atomically selects the complete revision; malformed JSON, invalid
+definitions, and unresolved function versions return actionable errors and do
+not move the current pointer.
+
+The original seven actors were spawned before publication and remain pinned
+to `v1`, including after paging and rehydration. Spawn a hierarchical canary
+after publication, send one unique write to each, and compare both behavior and
+revision pins:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:8080/actors/blue.canary
+curl -fsS -X POST http://127.0.0.1:8080/counters/red/writes/demo-old
+curl -fsS -X POST http://127.0.0.1:8080/counters/blue.canary/writes/demo-new
+curl -s http://127.0.0.1:8080/counters/red | jq
+curl -s http://127.0.0.1:8080/counters/blue.canary | jq
+curl -s http://127.0.0.1:8080/actors | jq
+```
+
+The red value advances by one on its retained revision; the canary advances by
+two on the new revision. `GET /definitions/counter?revision=<revision>` exports
+either retained definition while it remains pinned. Revisions can be copied
+from publication responses or the actor listing. This is revision coexistence
+inside one deployment, not old-format compatibility.
+
+Definition artifacts and durable actor pins survive process restart. The
+current revision is deployment configuration: this example's Go startup path
+registers `counter-v1`, so republish `counter-v2.json` after restarting when it
+should remain the revision selected by future actors. Every named Go function
+version referenced by a non-terminal actor must remain registered so its
+pinned definition can compile during rehydration. Terminal actors release
+their revision pin; an application may then collect an unreferenced,
+non-current definition with `System.CollectDefinition`.
 
 Positional color names select the counters exercised by `writer` or observed
 by `reader`; omitting them selects all seven. The writer terminal shows
