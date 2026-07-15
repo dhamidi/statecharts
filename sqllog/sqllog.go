@@ -225,11 +225,19 @@ func (l *Storage) AppendIngress(ctx context.Context, entry statecharts.LogEntry,
 		seq, err := l.Append(ctx, entry)
 		return seq, err == nil, err
 	}
-	tx, err := l.db.BeginTx(ctx, nil)
+	tx, err := l.beginWrite(ctx)
 	if err != nil {
 		return 0, false, err
 	}
 	defer tx.Rollback()
+	var lifecycle string
+	err = tx.QueryRowContext(ctx, `SELECT lifecycle FROM statechart_actor WHERE session_id=?`, entry.SessionID).Scan(&lifecycle)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, false, err
+	}
+	if err == nil && statecharts.ActorLifecycle(lifecycle) == statecharts.ActorLifecycleTerminal {
+		return 0, false, statecharts.ErrActorTerminal
+	}
 	r, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO statechart_inbound(session_id,delivery_id) VALUES(?,?)`, entry.SessionID, id)
 	if err != nil {
 		return 0, false, err

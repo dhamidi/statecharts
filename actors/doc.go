@@ -23,6 +23,14 @@
 // applying it. Paging and process restart resolve the stored revision rather
 // than whichever revision is currently published.
 //
+// Natural top-level completion is the end of an actor identity. A durable
+// actor is marked terminal before completion is acknowledged; later Spawn and
+// Tell calls return statecharts.ErrActorTerminal instead of resurrecting it.
+// Once every actor pinned to a non-current revision is terminal,
+// CollectDefinition atomically verifies references, deletes its stored
+// artifact, and releases the compiled revision. Current revisions are never
+// collectible.
+//
 // Every actor a System spawns addresses its peers by actor ID or by an
 // "<actor-id>@<node>" routing key, through the same routing IOProcessor the
 // System wires into every Instance it spawns.

@@ -112,6 +112,10 @@ type OutboundMessage struct {
 // DurableLog combines the WAL inbox/dedup and durable outbox boundary.
 type DurableLog interface {
 	Log
+	// AppendIngress atomically deduplicates deliveryID and appends entry. When
+	// the implementation also stores ActorMetadata for entry.SessionID, it
+	// must linearize with MarkActorTerminal and return ErrActorTerminal instead
+	// of appending after that actor is terminal.
 	AppendIngress(ctx context.Context, entry LogEntry, deliveryID DeliveryID) (seq uint64, appended bool, err error)
 	StoreOutbound(ctx context.Context, message OutboundMessage) error
 	ResolveOutbound(ctx context.Context, sessionID SessionID, deliveryID DeliveryID, result OutboundResult) error

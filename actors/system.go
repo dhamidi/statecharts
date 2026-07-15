@@ -271,8 +271,10 @@ type actorEntry struct {
 	kind        statecharts.Identifier
 	revision    statecharts.RevisionID
 	sessionID   statecharts.SessionID
+	startedAt   time.Time
 	durable     bool
 	initialized bool
+	terminal    atomic.Bool
 
 	// mu serializes activation (page-in) and eviction (page-out) for this
 	// one name, so at most one live Instance for it ever exists at a time
@@ -505,6 +507,84 @@ func (s *System) Definition(kind statecharts.Identifier, revision statecharts.Re
 	return chart.Definition(), true
 }
 
+// ErrCurrentDefinition is returned when CollectDefinition is asked to remove
+// the currently published revision. Current remains retained even when no
+// actor references it because every future Spawn selects it.
+var ErrCurrentDefinition = errors.New("actors: cannot collect the current definition")
+
+// CollectDefinition removes one non-current definition revision after proving
+// that no non-terminal actor can still execute it. Durable references are
+// checked atomically by Storage against concurrent BeginActor calls;
+// process-local ephemeral references are checked in the actor table. The
+// method serializes with Publish for kind, removes the compiled revision only
+// after durable deletion succeeds, and is safe to retry.
+func (s *System) CollectDefinition(ctx context.Context, kind statecharts.Identifier, revision statecharts.RevisionID) (statecharts.DefinitionDeleteResult, error) {
+	s.chartsMu.Lock()
+	registry, ok := s.charts[kind]
+	s.chartsMu.Unlock()
+	if !ok {
+		return 0, fmt.Errorf("actors: CollectDefinition: chart %q was never Registered: %w", kind, ErrKindNotRegistered)
+	}
+
+	registry.publishMu.Lock()
+	defer registry.publishMu.Unlock()
+
+	s.chartsMu.Lock()
+	if s.charts[kind] != registry {
+		s.chartsMu.Unlock()
+		return 0, fmt.Errorf("actors: CollectDefinition: chart %q registry changed", kind)
+	}
+	if registry.current == revision {
+		s.chartsMu.Unlock()
+		return 0, fmt.Errorf("actors: CollectDefinition chart %q revision %q: %w", kind, revision, ErrCurrentDefinition)
+	}
+	_, retained := registry.revisions[revision]
+	s.chartsMu.Unlock()
+
+	if !retained {
+		if s.cfg.storage == nil {
+			return statecharts.DefinitionNotFound, nil
+		}
+		artifact, found, err := s.cfg.storage.GetDefinition(ctx, revision)
+		if err != nil {
+			return 0, fmt.Errorf("actors: CollectDefinition: inspect revision %q: %w", revision, err)
+		}
+		if !found || artifact.ChartID != kind {
+			return statecharts.DefinitionNotFound, nil
+		}
+	}
+
+	s.tableMu.Lock()
+	for _, entry := range s.table {
+		if entry.initialized && entry.revision == revision && !entry.terminal.Load() {
+			s.tableMu.Unlock()
+			return statecharts.DefinitionReferenced, nil
+		}
+	}
+	s.tableMu.Unlock()
+
+	result := statecharts.DefinitionDeleted
+	if s.cfg.storage != nil {
+		var err error
+		result, err = s.cfg.storage.DeleteDefinitionIfUnreferenced(ctx, revision)
+		if err != nil {
+			return 0, fmt.Errorf("actors: CollectDefinition: delete revision %q: %w", revision, err)
+		}
+		if result == statecharts.DefinitionReferenced {
+			return result, nil
+		}
+	}
+
+	s.chartsMu.Lock()
+	if s.charts[kind] != registry || registry.current == revision {
+		s.chartsMu.Unlock()
+		return 0, fmt.Errorf("actors: CollectDefinition chart %q revision %q: %w", kind, revision, ErrCurrentDefinition)
+	}
+	delete(registry.revisions, revision)
+	s.chartsMu.Unlock()
+	return result, nil
+}
+
 // SpawnOption configures a Spawn call.
 type SpawnOption func(*spawnConfig)
 
@@ -619,20 +699,44 @@ func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Ident
 		opt(&cfg)
 	}
 
-	chart, ok := s.chartFor(kind)
+	s.chartsMu.Lock()
+	registry, ok := s.charts[kind]
+	s.chartsMu.Unlock()
 	if !ok {
 		return fmt.Errorf("actors: Spawn: kind %q was never Registered: %w", kind, ErrKindNotRegistered)
 	}
+	// Serialize current-revision selection and table insertion with Publish
+	// and CollectDefinition. Once a non-current revision is collectible, no
+	// concurrent ephemeral Spawn may still be between reading it and pinning
+	// its actor entry.
+	registry.publishMu.Lock()
+	s.chartsMu.Lock()
+	if s.charts[kind] != registry {
+		s.chartsMu.Unlock()
+		registry.publishMu.Unlock()
+		return fmt.Errorf("actors: Spawn: chart %q registry changed", kind)
+	}
+	chart, ok := registry.revisions[registry.current]
+	s.chartsMu.Unlock()
+	if !ok {
+		registry.publishMu.Unlock()
+		return fmt.Errorf("actors: Spawn: current revision for kind %q is not retained: %w", kind, statecharts.ErrDefinitionNotFound)
+	}
 	if cfg.durable && s.cfg.storage == nil {
+		registry.publishMu.Unlock()
 		return fmt.Errorf("actors: Spawn: %w", ErrDurabilityUnsupported)
 	}
 	entry, err := s.entryFor(name, kind, chart.Revision(), cfg.durable)
+	registry.publishMu.Unlock()
 	if err != nil {
 		return err
 	}
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	if entry.terminal.Load() {
+		return fmt.Errorf("actors: Spawn %q: %w", name, statecharts.ErrActorTerminal)
+	}
 	if cfg.durable {
 		if err := s.prepareDurableEntry(entry, kind); err != nil {
 			return err
@@ -744,6 +848,7 @@ func (s *System) pinDurableEntry(entry *actorEntry, metadata statecharts.ActorMe
 	}
 	entry.revision = metadata.Revision
 	entry.sessionID = metadata.SessionID
+	entry.startedAt = metadata.StartedAt
 	entry.initialized = true
 	entry.startLive = startLive
 	return nil
@@ -863,6 +968,9 @@ func (s *System) IsResident(target statecharts.Identifier) bool {
 // refuses, or it doesn't and Stop's per-entry lock acquisition blocks
 // until activation finishes and then finds (and stops) the result.
 func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err error) {
+	if entry.terminal.Load() {
+		return statecharts.ErrActorTerminal
+	}
 	if entry.instance.Load() != nil {
 		return nil
 	}
@@ -960,6 +1068,34 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 		}
 		return nil
 	}
+	completionHook := func() error {
+		if !entry.durable {
+			entry.terminal.Store(true)
+			s.reapTerminalWhenDone(entry)
+			return nil
+		}
+		terminalAt := s.cfg.clock.Now().UTC()
+		if terminalAt.Before(entry.startedAt) {
+			terminalAt = entry.startedAt
+		}
+		metadata, result, err := s.cfg.storage.MarkActorTerminal(context.Background(), entry.name, terminalAt)
+		if err != nil {
+			return fmt.Errorf("actors: mark %q terminal: %w", entry.name, err)
+		}
+		switch result {
+		case statecharts.ActorMarkedTerminal, statecharts.ActorAlreadyTerminal:
+			if metadata.ActorID != entry.name || metadata.ChartID != entry.kind || metadata.Revision != entry.revision || metadata.SessionID != entry.sessionID || metadata.Lifecycle != statecharts.ActorLifecycleTerminal {
+				return fmt.Errorf("actors: mark %q terminal returned inconsistent metadata: %w", entry.name, statecharts.ErrInvalidActorMetadata)
+			}
+		case statecharts.ActorNotFound:
+			return fmt.Errorf("actors: mark %q terminal: actor metadata was not found: %w", entry.name, statecharts.ErrInvalidActorMetadata)
+		default:
+			return fmt.Errorf("actors: mark %q terminal returned unknown result %d", entry.name, result)
+		}
+		entry.terminal.Store(true)
+		s.reapTerminalWhenDone(entry)
+		return nil
+	}
 
 	var inst *statecharts.Instance
 	if entry.durable {
@@ -974,6 +1110,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger),
 			statecharts.WithIngressHook(ingressHook),
+			statecharts.WithCompletionHook(completionHook),
 			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.storage, sessionID, s.cfg.clock)),
 			statecharts.WithDeliveryNamespace(deliveryNamespace),
 		)
@@ -1000,6 +1137,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 		opts = append(opts,
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger), statecharts.WithIngressHook(ingressHook),
+			statecharts.WithCompletionHook(completionHook),
 			statecharts.WithSessionID(sessionID))
 		inst, err = chart.NewInstance(opts...)
 		if err == nil {
@@ -1008,6 +1146,11 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 	}
 	if err != nil {
 		return fmt.Errorf("actors: activate %q: %w", entry.name, err)
+	}
+	if entry.terminal.Load() {
+		_ = inst.Stop(context.Background())
+		s.notifyResidency(entry, ResidencyPagedOut)
+		return nil
 	}
 
 	entry.instance.Store(inst)
@@ -1020,6 +1163,27 @@ func (s *System) notifyResidency(entry *actorEntry, state ResidencyState) {
 	if s.cfg.onResidency != nil {
 		s.cfg.onResidency(ResidencyChange{ActorID: entry.name, State: state})
 	}
+}
+
+// reapTerminalWhenDone releases a naturally completed resident without
+// waiting for another message, admission, or idle sweep. The completion hook
+// runs before Done closes and cannot take entry.mu because a synchronous Tell
+// may already hold it, so a short-lived waiter performs the locked cleanup.
+// Immediate completion during activation has no published instance yet and is
+// handled directly by activateLocked instead.
+func (s *System) reapTerminalWhenDone(entry *actorEntry) {
+	inst := entry.instance.Load()
+	if inst == nil {
+		return
+	}
+	go func() {
+		<-inst.Done()
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
+		if entry.instance.Load() == inst {
+			_ = s.evictLocked(context.Background(), entry)
+		}
+	}()
 }
 
 // admit makes room for one more resident actor, if the configured residency
@@ -1232,14 +1396,24 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	if entry.terminal.Load() {
+		return fmt.Errorf("actors: %q: %w", name, statecharts.ErrActorTerminal)
+	}
 
 	inst := entry.instance.Load()
+	if inst != nil && instanceFinished(inst) {
+		_ = s.evictLocked(context.Background(), entry)
+		inst = nil
+	}
 	if inst == nil {
 		if !entry.durable {
 			return fmt.Errorf("actors: %q is not resident (non-durable actors are never paged back in)", name)
 		}
 		if err := s.activateLocked(ctx, entry); err != nil {
 			return err
+		}
+		if entry.terminal.Load() {
+			return fmt.Errorf("actors: %q: %w", name, statecharts.ErrActorTerminal)
 		}
 		inst = entry.instance.Load()
 	}
@@ -1253,6 +1427,19 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 		}
 		if !appended {
 			return nil
+		}
+		if entry.terminal.Load() || instanceFinished(inst) {
+			_ = s.evictLocked(context.Background(), entry)
+			if entry.terminal.Load() {
+				return fmt.Errorf("actors: %q: %w", name, statecharts.ErrActorTerminal)
+			}
+			if err := s.activateLocked(ctx, entry); err != nil {
+				return err
+			}
+			if entry.terminal.Load() {
+				return fmt.Errorf("actors: %q: %w", name, statecharts.ErrActorTerminal)
+			}
+			inst = entry.instance.Load()
 		}
 	}
 

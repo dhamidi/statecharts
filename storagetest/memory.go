@@ -372,6 +372,11 @@ func (s *MemoryStore) AppendIngress(ctx context.Context, entry statecharts.LogEn
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, actor := range s.actors {
+		if actor.SessionID == entry.SessionID && actor.Lifecycle == statecharts.ActorLifecycleTerminal {
+			return 0, false, statecharts.ErrActorTerminal
+		}
+	}
 	deliveries := s.ingress[entry.SessionID]
 	if deliveries == nil {
 		deliveries = make(map[statecharts.DeliveryID]struct{})

@@ -1388,9 +1388,55 @@ func TestDurableActorReachingFinalStateIsEvictedImmediately(t *testing.T) {
 	if testResident(sys, "finisher") {
 		t.Fatalf("expected finisher evicted immediately after reaching its top-level final state")
 	}
+	metadata, found, err := log.GetActor(ctx, "finisher")
+	if err != nil || !found {
+		t.Fatalf("GetActor after completion = %#v, %v, %v", metadata, found, err)
+	}
+	if metadata.Lifecycle != statecharts.ActorLifecycleTerminal || metadata.TerminalAt.IsZero() {
+		t.Fatalf("completed actor metadata = %#v, want terminal", metadata)
+	}
+	if err := sys.Tell(ctx, "finisher", statecharts.Event{Name: "finish", Type: statecharts.EventExternal}); !errors.Is(err, statecharts.ErrActorTerminal) {
+		t.Fatalf("Tell after completion = %v, want ErrActorTerminal", err)
+	}
+	if err := sys.Spawn(ctx, "finisher", chart.ID(), Durable()); !errors.Is(err, statecharts.ErrActorTerminal) {
+		t.Fatalf("Spawn after completion = %v, want ErrActorTerminal", err)
+	}
 
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestImmediatelyFinalDurableActorIsPersistedTerminalWithoutResidency(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	chart, err := statecharts.Build(
+		statecharts.Final("done"),
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }),
+		statecharts.WithRevisionSalt("immediately-final-v1"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := NewSystem(WithStorage(storage), WithIdleTimeout(0))
+	if err := system.Register(chart); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Spawn(ctx, "already-done", chart.ID(), Durable()); err != nil {
+		t.Fatal(err)
+	}
+	if system.IsResident("already-done") {
+		t.Fatal("immediately final actor became resident")
+	}
+	metadata, found, err := storage.GetActor(ctx, "already-done")
+	if err != nil || !found || metadata.Lifecycle != statecharts.ActorLifecycleTerminal {
+		t.Fatalf("GetActor = %#v, %v, %v; want terminal", metadata, found, err)
+	}
+	if err := system.Spawn(ctx, "already-done", chart.ID(), Durable()); !errors.Is(err, statecharts.ErrActorTerminal) {
+		t.Fatalf("second Spawn = %v, want ErrActorTerminal", err)
+	}
+	if err := system.Stop(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1425,12 +1471,11 @@ func TestNonDurableActorReachingFinalStateIsEvictedImmediately(t *testing.T) {
 	}
 }
 
-// TestSweepReapsActorThatFinishedViaInternalTimerWithNoFurtherTell
-// confirms runSweep's own reaping catches a finished actor that deliver's
-// inline check never had a chance to: one that reaches its top-level final
-// state entirely from an internal delayed <send>, with nothing ever Told
-// to it afterward.
-func TestSweepReapsActorThatFinishedViaInternalTimerWithNoFurtherTell(t *testing.T) {
+// TestInternalTimerCompletionReleasesResidencyWithoutSweep confirms the
+// completion hook's waiter catches the path deliver's inline check cannot: an
+// actor that reaches its top-level final state entirely from an internal
+// delayed send, with nothing ever Told to it afterward.
+func TestInternalTimerCompletionReleasesResidencyWithoutSweep(t *testing.T) {
 	ctx := context.Background()
 	log := openTestLog(t)
 	clock := statecharts.NewManualClock(time.Unix(0, 0))
@@ -1447,31 +1492,35 @@ func TestSweepReapsActorThatFinishedViaInternalTimerWithNoFurtherTell(t *testing
 	if err := sys.Spawn(ctx, "delayed", chart.ID(), Durable()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
+	inst := testInstanceFor(sys, "delayed")
+	if inst == nil {
+		t.Fatal("expected delayed resident after Spawn")
+	}
 
-	// Past the delayed send's own 30s delay, but short of idleTimeout (1m):
+	// Past the delayed send's own 30s delay, but short of idleTimeout (1m),
 	// the internal timer fires and the machine reaches "done" entirely
-	// inside the actor's own goroutine, with no System.deliver call
-	// involved at all, so it's still resident until a sweep notices.
+	// inside the actor's own goroutine, with no System.deliver call involved.
 	// Firing the timer only enqueues onto the actor's own inbox (see
 	// actorClock.AfterFunc) -- Advance returns as soon as that enqueue
 	// succeeds, before the actor's goroutine has necessarily processed it
 	// -- so wait for Instance.Done() directly rather than racing it.
 	clock.Advance(35 * time.Second)
-	inst := testInstanceFor(sys, "delayed")
-	if inst == nil {
-		t.Fatalf("expected delayed still resident right after Advance")
-	}
 	select {
 	case <-inst.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatalf("delayed's internal timer never fired / never reached its final state")
 	}
-	if !testResident(sys, "delayed") {
-		t.Fatalf("expected delayed still resident right after reaching its final state (nothing has reaped it yet)")
+	metadata, found, err := log.GetActor(ctx, "delayed")
+	if err != nil || !found {
+		t.Fatalf("GetActor after internal completion = %#v, %v, %v", metadata, found, err)
 	}
+	if metadata.Lifecycle != statecharts.ActorLifecycleTerminal {
+		t.Fatalf("internal completion lifecycle = %q, want terminal", metadata.Lifecycle)
+	}
+	waitFor(t, 2*time.Second, func() bool { return !testResident(sys, "delayed") })
 
-	// Past idleTimeout: the periodic sweep fires and reaps it regardless
-	// of its actual idle time, since it has already finished.
+	// Past idleTimeout: the periodic sweep remains harmless after the
+	// completion reaper has already released residency.
 	clock.Advance(30 * time.Second)
 	if testResident(sys, "delayed") {
 		t.Fatalf("expected delayed reaped once the periodic sweep ran")
@@ -1489,8 +1538,7 @@ func TestSweepReapsActorThatFinishedViaInternalTimerWithNoFurtherTell(t *testing
 // Instance.Snapshot always fails (ErrInstanceStopped) against an
 // already-stopped Instance -- so Stop would have reported a spurious
 // failure for an actor that had simply, legitimately finished. Idle-timeout
-// sweeping is disabled here so nothing reaps the actor before Stop itself
-// does, isolating that path specifically.
+// sweeping is disabled to prove completion cleanup does not depend on it.
 func TestStopDoesNotErrorForActorThatAlreadyFinished(t *testing.T) {
 	ctx := context.Background()
 	log := openTestLog(t)
@@ -1508,20 +1556,18 @@ func TestStopDoesNotErrorForActorThatAlreadyFinished(t *testing.T) {
 	if err := sys.Spawn(ctx, "delayed", chart.ID(), Durable()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-
-	clock.Advance(2 * time.Second)
 	inst := testInstanceFor(sys, "delayed")
 	if inst == nil {
-		t.Fatalf("expected delayed resident right after Advance")
+		t.Fatal("expected delayed resident after Spawn")
 	}
+
+	clock.Advance(2 * time.Second)
 	select {
 	case <-inst.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatalf("delayed never reached its final state")
 	}
-	if !testResident(sys, "delayed") {
-		t.Fatalf("expected delayed still resident (sweeping disabled, nothing else has touched it)")
-	}
+	waitFor(t, 2*time.Second, func() bool { return !testResident(sys, "delayed") })
 
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v, want nil (an already-finished durable actor must not error Stop)", err)
@@ -1591,16 +1637,19 @@ func TestFinishedDurableActorDoesNotAppendUndeliverableMessage(t *testing.T) {
 	if err := sys.Spawn(ctx, "finished", chart.ID(), Durable()); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	clock.Advance(2 * time.Second)
 	inst := testInstanceFor(sys, "finished")
+	if inst == nil {
+		t.Fatal("expected finished actor resident after Spawn")
+	}
+	clock.Advance(2 * time.Second)
 	select {
 	case <-inst.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatalf("actor did not finish from its internal timer")
 	}
 
-	if err := sys.Tell(ctx, "finished", statecharts.Event{Name: "too-late", Type: statecharts.EventExternal}); !errors.Is(err, statecharts.ErrInstanceStopped) {
-		t.Fatalf("Tell after final state = %v, want ErrInstanceStopped", err)
+	if err := sys.Tell(ctx, "finished", statecharts.Event{Name: "too-late", Type: statecharts.EventExternal}); !errors.Is(err, statecharts.ErrActorTerminal) {
+		t.Fatalf("Tell after final state = %v, want ErrActorTerminal", err)
 	}
 	seq, err := log.LastSeq(ctx, "finished")
 	if err != nil {
@@ -1609,11 +1658,122 @@ func TestFinishedDurableActorDoesNotAppendUndeliverableMessage(t *testing.T) {
 	if seq != 2 {
 		t.Fatalf("LastSeq after rejected post-final Tell = %d, want 2 (start plus timer only)", seq)
 	}
-	if err := sys.Spawn(ctx, "finished", chart.ID(), Durable()); err != nil {
-		t.Fatalf("re-Spawn after rejected message poisoned replay: %v", err)
+	if err := sys.Spawn(ctx, "finished", chart.ID(), Durable()); !errors.Is(err, statecharts.ErrActorTerminal) {
+		t.Fatalf("re-Spawn after terminal = %v, want ErrActorTerminal", err)
 	}
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+type failTerminalStorage struct {
+	Storage
+	mu       sync.Mutex
+	failures int
+}
+
+var errInjectedTerminalCommit = errors.New("injected terminal commit failure")
+
+func (s *failTerminalStorage) MarkActorTerminal(ctx context.Context, actorID statecharts.Identifier, terminalAt time.Time) (statecharts.ActorMetadata, statecharts.ActorTerminalResult, error) {
+	s.mu.Lock()
+	if s.failures > 0 {
+		s.failures--
+		s.mu.Unlock()
+		return statecharts.ActorMetadata{}, 0, errInjectedTerminalCommit
+	}
+	s.mu.Unlock()
+	return s.Storage.MarkActorTerminal(ctx, actorID, terminalAt)
+}
+
+func TestTerminalPersistenceFailureKeepsRevisionPinnedAndReplayRetries(t *testing.T) {
+	ctx := context.Background()
+	base := openTestLog(t)
+	storage := &failTerminalStorage{Storage: base, failures: 2}
+	chart := buildFinishingChart()
+	system := NewSystem(WithStorage(storage), WithIdleTimeout(0))
+	if err := system.Register(chart); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Spawn(ctx, "finisher", chart.ID(), Durable()); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Tell(ctx, "finisher", statecharts.Event{Name: "finish", Type: statecharts.EventExternal}); !errors.Is(err, errInjectedTerminalCommit) {
+		t.Fatalf("Tell error = %v, want terminal persistence failure", err)
+	}
+	metadata, found, err := base.GetActor(ctx, "finisher")
+	if err != nil || !found {
+		t.Fatalf("GetActor after failed terminal commit = %#v, %v, %v", metadata, found, err)
+	}
+	if metadata.Lifecycle != statecharts.ActorLifecycleActive {
+		t.Fatalf("lifecycle after failed terminal commit = %q, want active", metadata.Lifecycle)
+	}
+	if _, appended, err := base.AppendIngress(ctx, statecharts.LogEntry{
+		SessionID: metadata.SessionID,
+		Kind:      statecharts.KindExternalEvent,
+		Timestamp: time.Now().UTC(),
+		Event: statecharts.Event{
+			Name: "accepted-too-late", Type: statecharts.EventExternal,
+			DeliveryID: "late-delivery",
+		},
+	}, "late-delivery"); err != nil || !appended {
+		t.Fatalf("append accepted-but-unapplied event = %v, %v", appended, err)
+	}
+	definition := chart.Definition()
+	definition.RevisionSalt = "test-v2"
+	if _, err := system.Publish(ctx, definition); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := system.CollectDefinition(ctx, chart.ID(), chart.Revision()); err != nil || result != statecharts.DefinitionReferenced {
+		t.Fatalf("CollectDefinition after failed terminal commit = %v, %v; want referenced", result, err)
+	}
+	if err := system.Spawn(ctx, "finisher", chart.ID(), Durable()); !errors.Is(err, errInjectedTerminalCommit) {
+		t.Fatalf("first retry Spawn = %v, want terminal persistence failure during replay", err)
+	}
+	metadata, found, err = base.GetActor(ctx, "finisher")
+	if err != nil || !found || metadata.Lifecycle != statecharts.ActorLifecycleActive {
+		t.Fatalf("GetActor after failed replay terminal commit = %#v, %v, %v; want active", metadata, found, err)
+	}
+	if system.IsResident("finisher") {
+		t.Fatal("actor became resident after failed replay terminal commit")
+	}
+	if err := system.Spawn(ctx, "finisher", chart.ID(), Durable()); err != nil {
+		t.Fatalf("second retry Spawn: %v", err)
+	}
+	metadata, found, err = base.GetActor(ctx, "finisher")
+	if err != nil || !found || metadata.Lifecycle != statecharts.ActorLifecycleTerminal {
+		t.Fatalf("GetActor after replay retry = %#v, %v, %v; want terminal", metadata, found, err)
+	}
+	if system.IsResident("finisher") {
+		t.Fatal("terminal actor remained resident after replay retry")
+	}
+	if result, err := system.CollectDefinition(ctx, chart.ID(), chart.Revision()); err != nil || result != statecharts.DefinitionDeleted {
+		t.Fatalf("CollectDefinition after terminal retry = %v, %v; want deleted", result, err)
+	}
+	if err := system.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStoppingDurableActorDoesNotMarkItTerminal(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	chart := buildFinishingChart()
+	system := NewSystem(WithStorage(storage), WithIdleTimeout(0))
+	if err := system.Register(chart); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Spawn(ctx, "running", chart.ID(), Durable()); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	metadata, found, err := storage.GetActor(ctx, "running")
+	if err != nil || !found {
+		t.Fatalf("GetActor after Stop = %#v, %v, %v", metadata, found, err)
+	}
+	if metadata.Lifecycle != statecharts.ActorLifecycleActive {
+		t.Fatalf("lifecycle after Stop = %q, want active", metadata.Lifecycle)
 	}
 }
 

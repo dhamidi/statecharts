@@ -443,6 +443,17 @@ is current—and fail before replay if its definition, datamodel implementation,
 named function version, invoke handler, or pending outbox processor is missing.
 Snapshots are only same-revision caches; a mismatch falls back to replay.
 
+Reaching a top-level final state marks a durable actor terminal before its
+completion is acknowledged and releases its stored revision reference. Actor
+IDs are tombstones after terminal: `Spawn` and `Tell` return
+`statecharts.ErrActorTerminal` rather than silently creating a new generation.
+After publishing a replacement and allowing the last old actor to finish, use
+`system.CollectDefinition(ctx, chart.ID(), oldRevision)` to remove that
+non-current revision from storage and the compiled registry. Collection is
+idempotent, refuses the current revision, and reports
+`statecharts.DefinitionReferenced` while any resident, paged-out, or ephemeral
+non-terminal actor still uses it.
+
 Actor IDs are hierarchical `Identifier` values. Routing locations use `@`:
 `billing.invoice-42@host-a`. The node name is routing metadata, not durable
 identity. Each system has an isolated storage boundary, so moving a system to

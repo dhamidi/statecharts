@@ -206,9 +206,11 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 	// start neither invocations nor timers that could repeat real-world work.
 	in.suppressInvoke.Store(true)
 	in.deferTimerActivation.Store(true)
+	in.deferCompletionHook.Store(true)
 	keepInstance := false
 	defer func() {
 		if !keepInstance {
+			_ = in.releaseDeferredCompletion(false)
 			if ctx.Err() != nil {
 				// A model callback may still be unwinding after Start's caller
 				// deadline. Request cleanup without making Rehydrate ignore that
@@ -242,6 +244,9 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 	}
 
 	if hasFirst {
+		if in.completionPending.Load() && first.Kind != KindSessionStarted {
+			return nil, fmt.Errorf("statecharts: Rehydrate: log entry seq %d appears after natural completion", first.Seq)
+		}
 		if err := replayEntry(first); err != nil {
 			return nil, fmt.Errorf("statecharts: Rehydrate: replay seq %d: %w", first.Seq, err)
 		}
@@ -254,14 +259,27 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 		if readErr != nil {
 			return nil, fmt.Errorf("statecharts: Rehydrate: read log: %w", readErr)
 		}
+		if in.completionPending.Load() {
+			if entry.Kind == KindExternalEvent {
+				// AppendIngress may win its storage race with natural completion
+				// before Deliver discovers the actor has stopped. Such an event was
+				// accepted into the WAL but never applied; preserve that runtime
+				// outcome instead of making the actor unrecoverable.
+				continue
+			}
+			return nil, fmt.Errorf("statecharts: Rehydrate: non-external log entry seq %d appears after natural completion", entry.Seq)
+		}
 		if err := replayEntry(entry); err != nil {
 			return nil, fmt.Errorf("statecharts: Rehydrate: replay seq %d: %w", entry.Seq, err)
 		}
 	}
+	// Release any connection or lock held by a streaming Log before terminal
+	// persistence can call back into the same storage implementation.
+	stop()
 
 	// A cache is disposable: refresh a rejected or absent one best-effort at
 	// the exact final log boundary, while replay side effects remain gated.
-	if cacheMiss {
+	if cacheMiss && !in.completionPending.Load() {
 		if snap, snapErr := in.Snapshot(ctx); snapErr == nil {
 			_ = snapshots.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: lastSeq})
 		}
@@ -276,6 +294,14 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 			return nil, fmt.Errorf("statecharts: Rehydrate: recover outbox: %w", err)
 		}
 	}
+	if in.completionPending.Load() {
+		if err := in.releaseDeferredCompletion(true); err != nil {
+			return nil, fmt.Errorf("statecharts: Rehydrate: complete: %w", err)
+		}
+		keepInstance = true
+		return in, nil
+	}
+	in.deferCompletionHook.Store(false)
 
 	// Timer activation and invocation reconciliation run together on the
 	// Instance's actor goroutine. An overdue timer may exit an invoking state

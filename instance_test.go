@@ -185,6 +185,106 @@ func TestInstanceNaturalTerminationRunsOnExitForRemainingStates(t *testing.T) {
 	}
 }
 
+func TestCompletionHookRunsBeforeNaturalCompletionReturns(t *testing.T) {
+	chart, err := Build(
+		Compound("completion-hook", "running", Children(
+			Atomic("running", On("finish", Target("done"))),
+			Final("done"),
+		)),
+		NewGoModel(func() *struct{} { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	instance, err := chart.NewInstance(WithCompletionHook(func() error {
+		called++
+		return nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := instance.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if called != 0 {
+		t.Fatalf("completion hook calls after Start = %d, want 0", called)
+	}
+	if err := instance.Send(ctx, Event{Name: "finish"}); err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 {
+		t.Fatalf("completion hook calls when Send returned = %d, want 1", called)
+	}
+	select {
+	case <-instance.Done():
+	default:
+		t.Fatal("Done was not closed after natural completion")
+	}
+}
+
+func TestCompletionHookFailureIsTerminalAndReturnedByStart(t *testing.T) {
+	chart, err := Build(
+		Final("done"),
+		NewGoModel(func() *struct{} { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("persist terminal state")
+	instance, err := chart.NewInstance(WithCompletionHook(func() error { return want }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Start(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("Start error = %v, want %v", err, want)
+	}
+	if !errors.Is(instance.Err(), want) {
+		t.Fatalf("Instance.Err = %v, want %v", instance.Err(), want)
+	}
+}
+
+func TestCompletionHookDoesNotRunForStopOrCheckpoint(t *testing.T) {
+	chart, err := Build(
+		Atomic("running"),
+		NewGoModel(func() *struct{} { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		stop func(context.Context, *Instance) error
+	}{
+		{name: "stop", stop: func(ctx context.Context, instance *Instance) error { return instance.Stop(ctx) }},
+		{name: "checkpoint", stop: func(ctx context.Context, instance *Instance) error {
+			return instance.Checkpoint(ctx, func(Snapshot) error { return nil })
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			called := 0
+			instance, err := chart.NewInstance(WithCompletionHook(func() error {
+				called++
+				return nil
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			if err := instance.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.stop(ctx, instance); err != nil {
+				t.Fatal(err)
+			}
+			if called != 0 {
+				t.Fatalf("completion hook calls = %d, want 0", called)
+			}
+		})
+	}
+}
+
 func TestInstanceActionPanicBecomesExecutionError(t *testing.T) {
 	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	boom := b.action("TestInstanceActionPanicBecomesExecutionError.action.1", func(d *struct{}, ec ExecContext) error {

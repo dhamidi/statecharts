@@ -461,3 +461,188 @@ func TestConcurrentDurableFirstSpawnAndPublishPersistOneCoherentPin(t *testing.T
 		t.Fatal(err)
 	}
 }
+
+func terminalPublicationDefinition(target, salt string) statecharts.Definition {
+	definition := publicationDefinition(target, salt)
+	definition.Root.Children[1].Kind = statecharts.KindFinal
+	definition.Root.Children[2].Kind = statecharts.KindFinal
+	return definition
+}
+
+func TestCollectDefinitionWaitsForFinalDurableActorAndRemovesRetainedRevision(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	v1, err := statecharts.Compile(terminalPublicationDefinition("finished-v1", "v1"), model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := NewSystem(WithStorage(storage), WithMaxResident(1), WithIdleTimeout(0))
+	if err := system.Register(v1); err != nil {
+		t.Fatal(err)
+	}
+	for _, actor := range []statecharts.Identifier{"red", "orange"} {
+		if err := system.Spawn(ctx, actor, v1.ID(), Durable()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if system.IsResident("red") == system.IsResident("orange") {
+		t.Fatal("expected one resident and one paged-out v1 actor")
+	}
+	v2Revision, err := system.Publish(ctx, terminalPublicationDefinition("finished-v2", "v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := system.CollectDefinition(ctx, v1.ID(), v1.Revision()); err != nil || result != statecharts.DefinitionReferenced {
+		t.Fatalf("CollectDefinition with two actors = %v, %v; want referenced", result, err)
+	}
+	if err := system.Tell(ctx, "red", statecharts.Event{Name: "finish", Type: statecharts.EventExternal}); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := system.CollectDefinition(ctx, v1.ID(), v1.Revision()); err != nil || result != statecharts.DefinitionReferenced {
+		t.Fatalf("CollectDefinition with one actor = %v, %v; want referenced", result, err)
+	}
+	if err := system.Tell(ctx, "orange", statecharts.Event{Name: "finish", Type: statecharts.EventExternal}); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := system.CollectDefinition(ctx, v1.ID(), v1.Revision()); err != nil || result != statecharts.DefinitionDeleted {
+		t.Fatalf("CollectDefinition after final actor = %v, %v; want deleted", result, err)
+	}
+	if _, ok := system.Definition(v1.ID(), v1.Revision()); ok {
+		t.Fatal("collected revision remains inspectable in memory")
+	}
+	if _, found, err := storage.GetDefinition(ctx, v1.Revision()); err != nil || found {
+		t.Fatalf("GetDefinition after collection = found %v, err %v", found, err)
+	}
+	if _, revision, ok := system.CurrentDefinition(v1.ID()); !ok || revision != v2Revision {
+		t.Fatalf("current definition = %q, %v; want %q", revision, ok, v2Revision)
+	}
+	if err := system.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCollectDefinitionRejectsCurrentAndActiveEphemeralRevision(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+	v1, err := statecharts.Compile(terminalPublicationDefinition("finished-v1", "v1"), model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := NewSystem(WithStorage(storage), WithIdleTimeout(0))
+	if err := system.Register(v1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.CollectDefinition(ctx, v1.ID(), v1.Revision()); !errors.Is(err, ErrCurrentDefinition) {
+		t.Fatalf("collect current error = %v, want ErrCurrentDefinition", err)
+	}
+	if err := system.Spawn(ctx, "ephemeral", v1.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.Publish(ctx, terminalPublicationDefinition("finished-v2", "v2")); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := system.CollectDefinition(ctx, v1.ID(), v1.Revision()); err != nil || result != statecharts.DefinitionReferenced {
+		t.Fatalf("collect active ephemeral revision = %v, %v; want referenced", result, err)
+	}
+	if err := system.Tell(ctx, "ephemeral", statecharts.Event{Name: "finish", Type: statecharts.EventExternal}); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := system.CollectDefinition(ctx, v1.ID(), v1.Revision()); err != nil || result != statecharts.DefinitionDeleted {
+		t.Fatalf("collect completed ephemeral revision = %v, %v; want deleted", result, err)
+	}
+	if err := system.Spawn(ctx, "ephemeral", v1.ID()); !errors.Is(err, statecharts.ErrActorTerminal) {
+		t.Fatalf("reuse completed ephemeral ID = %v, want ErrActorTerminal", err)
+	}
+	if err := system.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentSpawnPublicationAndCollectionStayCoherent(t *testing.T) {
+	for _, durable := range []bool{false, true} {
+		name := "ephemeral"
+		if durable {
+			name = "durable"
+		}
+		t.Run(name, func(t *testing.T) {
+			for range 32 {
+				ctx := context.Background()
+				storage := openTestLog(t)
+				model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
+				v1 := publicationChart(t, model, "finished-v1", "v1")
+				v2 := publicationChart(t, model, "finished-v2", "v2")
+				system := NewSystem(WithStorage(storage), WithIdleTimeout(0))
+				if err := system.Register(v1); err != nil {
+					t.Fatal(err)
+				}
+
+				start := make(chan struct{})
+				spawnErr := make(chan error, 1)
+				collectResult := make(chan struct {
+					result statecharts.DefinitionDeleteResult
+					err    error
+				}, 1)
+				go func() {
+					<-start
+					if durable {
+						spawnErr <- system.Spawn(ctx, "red", v1.ID(), Durable())
+						return
+					}
+					spawnErr <- system.Spawn(ctx, "red", v1.ID())
+				}()
+				go func() {
+					<-start
+					_, err := system.Publish(ctx, v2.Definition())
+					if err != nil {
+						collectResult <- struct {
+							result statecharts.DefinitionDeleteResult
+							err    error
+						}{err: err}
+						return
+					}
+					result, err := system.CollectDefinition(ctx, v1.ID(), v1.Revision())
+					collectResult <- struct {
+						result statecharts.DefinitionDeleteResult
+						err    error
+					}{result: result, err: err}
+				}()
+				close(start)
+				err := <-spawnErr
+				collected := <-collectResult
+				if collected.err != nil {
+					t.Fatal(collected.err)
+				}
+				if durable && errors.Is(err, statecharts.ErrDefinitionNotFound) {
+					// Collection won before BeginActor. The uninitialized placeholder
+					// must not poison the name; retry pins current v2.
+					if err := system.Spawn(ctx, "red", v1.ID(), Durable()); err != nil {
+						t.Fatalf("retry after collection won: %v", err)
+					}
+				} else if err != nil {
+					t.Fatalf("Spawn: %v", err)
+				}
+				revision, ok := system.ActorRevision("red")
+				if !ok {
+					t.Fatal("successful actor has no revision pin")
+				}
+				switch revision {
+				case v1.Revision():
+					if collected.result != statecharts.DefinitionReferenced {
+						t.Fatalf("v1 actor with collection result %v, want referenced", collected.result)
+					}
+				case v2.Revision():
+					if collected.result != statecharts.DefinitionDeleted && collected.result != statecharts.DefinitionNotFound {
+						t.Fatalf("v2 actor with collection result %v, want deleted/not found", collected.result)
+					}
+				default:
+					t.Fatalf("actor revision = %q, want v1 %q or v2 %q", revision, v1.Revision(), v2.Revision())
+				}
+				if err := system.Stop(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}

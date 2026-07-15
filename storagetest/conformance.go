@@ -450,6 +450,22 @@ func Run(t *testing.T, factory Factory) {
 		if _, _, err := store.BeginActor(ctx, actors[0]); !errors.Is(err, statecharts.ErrActorTerminal) {
 			t.Fatalf("BeginActor after terminal error = %v", err)
 		}
+		before, err := store.LastSeq(ctx, actors[0].SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, appended, err := store.AppendIngress(ctx, statecharts.LogEntry{
+			SessionID: actors[0].SessionID,
+			Kind:      statecharts.KindExternalEvent,
+			Timestamp: terminalAt.Add(time.Second),
+			Event:     statecharts.Event{Name: "late", Type: statecharts.EventExternal},
+		}, "late-delivery"); !errors.Is(err, statecharts.ErrActorTerminal) || appended {
+			t.Fatalf("AppendIngress after terminal = appended %v, err %v; want ErrActorTerminal", appended, err)
+		}
+		after, err := store.LastSeq(ctx, actors[0].SessionID)
+		if err != nil || after != before {
+			t.Fatalf("LastSeq after terminal ingress = %d, %v; want %d", after, err, before)
+		}
 		if _, _, err := store.MarkActorTerminal(ctx, actors[1].ActorID, terminalAt); err != nil {
 			t.Fatal(err)
 		}

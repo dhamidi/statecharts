@@ -28,6 +28,18 @@ type Instance struct {
 	// write-ahead logging so invocation results and IOProcessor callbacks pass
 	// through the same persistence boundary as direct application messages.
 	ingressHook func(Event) error
+	// completionHook runs synchronously on the actor goroutine after natural
+	// top-level completion, but before the triggering request is acknowledged
+	// or Done closes. Actor runtimes use it to persist terminal lifecycle state.
+	completionHook       func() error
+	completionHookCalled bool
+	completionHookErr    error
+	// Rehydrate defers a completion hook until its streaming Log reader is
+	// closed. A completed actor waits quiescently for that release instead of
+	// closing Done or accepting another request.
+	deferCompletionHook atomic.Bool
+	completionPending   atomic.Bool
+	completionRelease   chan deferredCompletionRequest
 
 	inbox   chan actorRequest
 	doneCh  chan struct{}
@@ -77,6 +89,11 @@ type actorRequest struct {
 	invokesOut chan bool           // reqActiveInvokes only
 }
 
+type deferredCompletionRequest struct {
+	run   bool
+	reply chan error
+}
+
 type snapshotResult struct {
 	snapshot Snapshot
 	err      error
@@ -93,6 +110,7 @@ type instanceConfig struct {
 	logger                   Logger
 	inboxSize                int
 	ingressHook              func(Event) error
+	completionHook           func() error
 	timerFiredHook           func(Identifier, Identifier, Identifier, Event) error
 	idGen                    IDGenerator
 	sessionID                SessionID
@@ -206,6 +224,16 @@ func WithInboxSize(n int) Option {
 // the Log, then enables it for new live arrivals.
 func WithIngressHook(fn func(Event) error) Option {
 	return func(c *instanceConfig) { c.ingressHook = fn }
+}
+
+// WithCompletionHook registers a callback run exactly once when the Instance
+// reaches a top-level final state. It runs synchronously on the interpreter
+// goroutine after exit processing and before Send, Start, or Done can report
+// completion. Returning an error makes completion fail and records that error
+// as the Instance's terminal error. Stop, Checkpoint, and fatal interpreter
+// exits do not invoke the hook.
+func WithCompletionHook(fn func() error) Option {
+	return func(c *instanceConfig) { c.completionHook = fn }
 }
 
 // WithTimerFiredHook registers a callback invoked synchronously, on the
@@ -336,13 +364,15 @@ func newInstanceForSession(chart *Chart, session DatamodelSession, opts ...Optio
 
 func newInstance(chart *Chart, ip *interpretation, session DatamodelSession, cfg instanceConfig, id SessionID) *Instance {
 	in := &Instance{
-		chart:       chart,
-		session:     session,
-		clock:       cfg.clock,
-		ingressHook: cfg.ingressHook,
-		inbox:       make(chan actorRequest, cfg.inboxSize),
-		doneCh:      make(chan struct{}),
-		readyCh:     make(chan struct{}),
+		chart:             chart,
+		session:           session,
+		clock:             cfg.clock,
+		ingressHook:       cfg.ingressHook,
+		completionHook:    cfg.completionHook,
+		inbox:             make(chan actorRequest, cfg.inboxSize),
+		doneCh:            make(chan struct{}),
+		readyCh:           make(chan struct{}),
+		completionRelease: make(chan deferredCompletionRequest),
 	}
 
 	ip.ioProcessorsByType = make(map[Identifier]IOProcessor, len(cfg.processors))
@@ -688,7 +718,7 @@ func (in *Instance) Start(ctx context.Context) error {
 	go in.run()
 	select {
 	case <-in.readyCh:
-		return nil
+		return in.Err()
 	case <-in.doneCh:
 		return in.Err()
 	case <-ctx.Done():
@@ -723,6 +753,7 @@ func (in *Instance) run() {
 		in.ip.exitInterpreter()
 	}
 	in.publishConfig()
+	in.finishNaturalCompletion()
 	close(in.readyCh)
 
 	for in.ip.running {
@@ -788,6 +819,9 @@ func (in *Instance) run() {
 			in.ip.exitInterpreter()
 		}
 		in.publishConfig()
+		if completionErr := in.finishNaturalCompletion(); reqErr == nil {
+			reqErr = completionErr
+		}
 
 		if snapOut != nil {
 			snap, err := in.buildSnapshot()
@@ -809,6 +843,84 @@ func (in *Instance) run() {
 		if req.reply != nil {
 			req.reply <- reqErr
 		}
+	}
+	in.awaitDeferredCompletion()
+}
+
+func (in *Instance) finishNaturalCompletion() error {
+	if !in.ip.completed {
+		return nil
+	}
+	if in.deferCompletionHook.Load() {
+		in.completionPending.Store(true)
+		return nil
+	}
+	if in.completionHookCalled {
+		return in.completionHookErr
+	}
+	in.completionHookCalled = true
+	if in.completionHook == nil {
+		return nil
+	}
+	if err := in.completionHook(); err != nil {
+		in.completionHookErr = fmt.Errorf("statecharts: completion hook: %w", err)
+		in.setTerminalErr(in.completionHookErr)
+	}
+	return in.completionHookErr
+}
+
+func (in *Instance) awaitDeferredCompletion() {
+	if !in.completionPending.Load() {
+		return
+	}
+	for {
+		select {
+		case release := <-in.completionRelease:
+			in.deferCompletionHook.Store(false)
+			var err error
+			if release.run {
+				err = in.finishNaturalCompletion()
+			}
+			release.reply <- err
+			return
+		case req := <-in.inbox:
+			if req.kind == reqFinishReplay {
+				in.deferCompletionHook.Store(false)
+				err := in.finishNaturalCompletion()
+				if req.reply != nil {
+					req.reply <- err
+				}
+				return
+			}
+			if req.reply != nil {
+				req.reply <- ErrInstanceStopped
+			}
+			if req.snapOut != nil {
+				req.snapOut <- snapshotResult{err: ErrInstanceStopped}
+			}
+			if req.invokesOut != nil {
+				req.invokesOut <- false
+			}
+		}
+	}
+}
+
+func (in *Instance) releaseDeferredCompletion(run bool) error {
+	if !in.completionPending.Load() {
+		in.deferCompletionHook.Store(false)
+		return nil
+	}
+	release := deferredCompletionRequest{run: run, reply: make(chan error, 1)}
+	select {
+	case in.completionRelease <- release:
+	case <-in.doneCh:
+		return in.Err()
+	}
+	select {
+	case err := <-release.reply:
+		return err
+	case <-in.doneCh:
+		return in.Err()
 	}
 }
 
