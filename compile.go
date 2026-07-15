@@ -18,9 +18,6 @@ func Compile(definition Definition, model Datamodel) (*Chart, error) {
 	if d.Datamodel != model.Name() {
 		return nil, definitionError("definition.datamodel", "datamodel %q does not match compiler %q", d.Datamodel, model.Name())
 	}
-	if path, ok := definitionInvokePath(&d.Root, "root"); ok {
-		return nil, definitionError(path, "declarative invokes are not supported until issue #14")
-	}
 	program, err := model.Compile(&d)
 	if err != nil {
 		return nil, err
@@ -32,7 +29,11 @@ func Compile(definition Definition, model Datamodel) (*Chart, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &Chart{byID: map[Identifier]*compiledState{}, name: d.Name, program: program, definition: &d, data: globalData, dataBinding: d.DataBinding}
+	c := &Chart{
+		byID: map[Identifier]*compiledState{}, name: d.Name, program: program,
+		definition: &d, data: globalData, dataBinding: d.DataBinding,
+		invokesByDefinitionID: map[Identifier]*compiledInvoke{},
+	}
 	order := 0
 	root, err := compileDefinitionState(c, &d.Root, nil, &order, program, "root")
 	if err != nil {
@@ -43,18 +44,6 @@ func Compile(definition Definition, model Datamodel) (*Chart, error) {
 		return nil, err
 	}
 	return c, nil
-}
-
-func definitionInvokePath(s *StateDefinition, path string) (string, bool) {
-	if len(s.Invokes) > 0 {
-		return path + ".invokes", true
-	}
-	for i := range s.Children {
-		if result, ok := definitionInvokePath(&s.Children[i], fmt.Sprintf("%s.children[%d]", path, i)); ok {
-			return result, true
-		}
-	}
-	return "", false
 }
 
 func compileDefinitionState(c *Chart, s *StateDefinition, parent *compiledState, order *int, p DatamodelProgram, path string) (*compiledState, error) {
@@ -91,6 +80,14 @@ func compileDefinitionState(c *Chart, s *StateDefinition, parent *compiledState,
 		}
 		cs.transitions = append(cs.transitions, t)
 	}
+	for i := range s.Invokes {
+		invoke, e := compileDefinitionInvoke(&s.Invokes[i], cs, p, fmt.Sprintf("%s.invokes[%d]", path, i))
+		if e != nil {
+			return nil, e
+		}
+		cs.invokes = append(cs.invokes, invoke)
+		c.invokesByDefinitionID[invoke.definitionID] = invoke
+	}
 	for i := range s.Children {
 		child, e := compileDefinitionState(c, &s.Children[i], cs, order, p, fmt.Sprintf("%s.children[%d]", path, i))
 		if e != nil {
@@ -99,6 +96,49 @@ func compileDefinitionState(c *Chart, s *StateDefinition, parent *compiledState,
 		cs.children = append(cs.children, child)
 	}
 	return cs, nil
+}
+
+func compileDefinitionInvoke(invoke *InvokeDefinition, owner *compiledState, p DatamodelProgram, path string) (*compiledInvoke, error) {
+	compiled := &compiledInvoke{
+		definitionID: invoke.DefinitionID,
+		owner:        owner,
+		id:           invoke.ID,
+		staticType:   canonicalInvokeType(Identifier(invoke.Type)),
+		staticSource: invoke.Src,
+		autoForward:  invoke.AutoForward,
+		declarative:  true,
+	}
+	var err error
+	if invoke.IDLocation != nil {
+		compiled.modelIDLocation, err = p.ResolveExpression(*invoke.IDLocation)
+		if err != nil {
+			return nil, definitionError(path+".idLocation", "%v", err)
+		}
+		compiled.hasModelIDLocation = true
+	}
+	if invoke.TypeExpr != nil {
+		compiled.typeExpr, err = p.ResolveExpression(*invoke.TypeExpr)
+		if err != nil {
+			return nil, definitionError(path+".typeExpr", "%v", err)
+		}
+		compiled.hasTypeExpr = true
+	}
+	if invoke.SrcExpr != nil {
+		compiled.sourceExpr, err = p.ResolveExpression(*invoke.SrcExpr)
+		if err != nil {
+			return nil, definitionError(path+".srcExpr", "%v", err)
+		}
+		compiled.hasSourceExpr = true
+	}
+	compiled.payload, err = compilePayload(invoke.Params, invoke.Content, p, path)
+	if err != nil {
+		return nil, err
+	}
+	compiled.finalize, err = compileBlocks(invoke.Finalize, p, path+".finalize")
+	if err != nil {
+		return nil, err
+	}
+	return compiled, nil
 }
 func compileDefinitionTransition(t *TransitionDefinition, s *compiledState, p DatamodelProgram, path string) (*compiledTransition, error) {
 	x := &compiledTransition{events: append([]Identifier(nil), t.Events...), target: append([]Identifier(nil), t.Targets...), internal: t.Type == TransitionInternal, source: s}

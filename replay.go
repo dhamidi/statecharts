@@ -104,6 +104,9 @@ func (c *Chart) Rehydrate(ctx context.Context, log Log, snapshots SnapshotStore,
 }
 
 func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFactory datamodelSessionFactory, log Log, snapshots SnapshotStore, sessionID SessionID, realIO IOProcessor, opts ...Option) (*Instance, error) {
+	if err := chart.Prepare(opts...); err != nil {
+		return nil, fmt.Errorf("statecharts: Rehydrate: prepare environment: %w", err)
+	}
 	// Logger and Clock, unlike IOProcessor, have no explicit Rehydrate
 	// parameters -- they only arrive via opts. Apply opts to a throwaway
 	// config so replay can gate the real Logger and defer the real Clock;

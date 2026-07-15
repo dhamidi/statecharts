@@ -25,6 +25,53 @@ type InvokeIO struct {
 	Incoming <-chan Event
 }
 
+// SCXMLInvokeType is the standard handler type used when an invocation does
+// not declare a type. Environments may bind it to a child-chart resolver.
+const SCXMLInvokeType Identifier = "http://www.w3.org/TR/scxml/"
+
+// InvokeRequest is the fully evaluated, immutable input to one invocation.
+// DefinitionID identifies the declaration across definition edits; ID is the
+// runtime address visible to events and #_<invokeid> sends.
+type InvokeRequest struct {
+	DefinitionID Identifier
+	ID           Identifier
+	Type         Identifier
+	Source       string
+	Data         Value
+}
+
+// InvokeHandler implements one environment-provided invocation type. The
+// runtime cancels ctx when the owning state exits and owns event delivery,
+// completion, and error classification around the handler call.
+type InvokeHandler interface {
+	Start(context.Context, InvokeRequest, InvokeIO) (Value, error)
+}
+
+// InvokeHandlerFunc adapts a function to InvokeHandler.
+type InvokeHandlerFunc func(context.Context, InvokeRequest, InvokeIO) (Value, error)
+
+func (fn InvokeHandlerFunc) Start(ctx context.Context, request InvokeRequest, io InvokeIO) (Value, error) {
+	return fn(ctx, request, io)
+}
+
+// ResumableInvokeHandler can reattach to an invocation that was active when
+// a durable process stopped. A fresh handler is created for every resume.
+type ResumableInvokeHandler interface {
+	InvokeHandler
+	Resume(context.Context, InvokeRequest, InvokeIO) (Value, error)
+}
+
+// InvokeHandlerFactory creates isolated mutable handler state for one start
+// or resume. Registrations are Instance- or System-scoped, never global.
+type InvokeHandlerFactory func() InvokeHandler
+
+func canonicalInvokeType(typ Identifier) Identifier {
+	if typ == "" || typ == "scxml" {
+		return SCXMLInvokeType
+	}
+	return typ
+}
+
 // InvokeFunc is the body of one <invoke> instance (SCXML 6.4): it starts
 // when its containing state is entered (deferred to the point the
 // containing macrostep settles, so a state entered and exited again within
@@ -151,13 +198,27 @@ func Invoke(fn InvokeFunc, opts ...InvokeOption) StateOption {
 // compiledInvoke is the compiled form of one InvokeSpec, owned by the
 // compiledState it was declared on.
 type compiledInvoke struct {
-	id          Identifier
-	start       InvokeFunc
-	params      func(ExecContext) Value
-	finalize    []actionBlock
-	autoForward bool
-	resume      InvokeResumeFunc
-	idLocation  IDLocationFunc
+	definitionID       Identifier
+	owner              *compiledState
+	id                 Identifier
+	staticType         Identifier
+	typeExpr           CompiledExpression
+	hasTypeExpr        bool
+	staticSource       string
+	sourceExpr         CompiledExpression
+	hasSourceExpr      bool
+	payload            *compiledPayload
+	modelIDLocation    CompiledExpression
+	hasModelIDLocation bool
+	finalize           []actionBlock
+	autoForward        bool
+	declarative        bool
+
+	// Temporary callback-builder path, removed by issue #15.
+	start      InvokeFunc
+	params     func(ExecContext) Value
+	resume     InvokeResumeFunc
+	idLocation IDLocationFunc
 }
 
 // runningInvoke is the interpreter-core bookkeeping for one active
@@ -171,7 +232,9 @@ type compiledInvoke struct {
 type runningInvoke struct {
 	id          Identifier
 	state       *compiledState
-	specIndex   int // this invocation's position among state's <invoke> elements, in document order
+	spec        *compiledInvoke
+	typ         Identifier
+	source      string
 	finalize    []actionBlock
 	autoForward bool
 	cancel      func()
@@ -185,10 +248,10 @@ type runningInvoke struct {
 // concerns, not core-interpreter ones -- the same seam actorClock already
 // uses for <send delay="...">. The default, used by a bare interpretation
 // with no owning Instance (e.g. under test), starts nothing.
-type invokeRunnerFunc func(id Identifier, spec *compiledInvoke, params Value) (cancel func(), incoming chan<- Event)
+type invokeRunnerFunc func(request InvokeRequest, spec *compiledInvoke) (cancel func(), incoming chan<- Event, err error)
 
-func noopInvokeRunner(Identifier, *compiledInvoke, Value) (func(), chan<- Event) {
-	return func() {}, nil
+func noopInvokeRunner(InvokeRequest, *compiledInvoke) (func(), chan<- Event, error) {
+	return func() {}, nil, nil
 }
 
 // parentIOProcessor is the IOProcessor InvokeChart gives a child session:
@@ -317,5 +380,18 @@ func InvokeChart(chart *Chart, newDatamodel func(params Value) any, baseIO IOPro
 			return Value{}, err
 		}
 		return child.Result()
+	}
+}
+
+// InvokeChartHandler returns an environment-scoped handler factory for the
+// standard child-chart invocation type. The child chart, datamodel factory,
+// and fallback transport remain runtime capabilities; only their source key
+// belongs in a serializable InvokeDefinition.
+func InvokeChartHandler(chart *Chart, newDatamodel func(data Value) any, baseIO IOProcessor) InvokeHandlerFactory {
+	return func() InvokeHandler {
+		run := InvokeChart(chart, newDatamodel, baseIO)
+		return InvokeHandlerFunc(func(ctx context.Context, request InvokeRequest, io InvokeIO) (Value, error) {
+			return run(ctx, request.Data.Clone(), io)
+		})
 	}
 }

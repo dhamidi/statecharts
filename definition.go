@@ -101,16 +101,17 @@ type TransitionDefinition struct {
 // forms avoids making static source identity model-dependent. Content is one
 // whole payload and is not a synthetic parameter map.
 type InvokeDefinition struct {
-	ID          Identifier        `json:"id,omitempty"`
-	IDLocation  *Expression       `json:"idLocation,omitempty"`
-	Type        string            `json:"type,omitempty"`
-	TypeExpr    *Expression       `json:"typeExpr,omitempty"`
-	Src         string            `json:"src,omitempty"`
-	SrcExpr     *Expression       `json:"srcExpr,omitempty"`
-	Params      []ParamDefinition `json:"params,omitempty"`
-	Content     *Expression       `json:"content,omitempty"`
-	AutoForward bool              `json:"autoForward,omitempty"`
-	Finalize    []ExecutableBlock `json:"finalize,omitempty"`
+	DefinitionID Identifier        `json:"definitionId,omitempty"`
+	ID           Identifier        `json:"id,omitempty"`
+	IDLocation   *Expression       `json:"idLocation,omitempty"`
+	Type         string            `json:"type,omitempty"`
+	TypeExpr     *Expression       `json:"typeExpr,omitempty"`
+	Src          string            `json:"src,omitempty"`
+	SrcExpr      *Expression       `json:"srcExpr,omitempty"`
+	Params       []ParamDefinition `json:"params,omitempty"`
+	Content      *Expression       `json:"content,omitempty"`
+	AutoForward  bool              `json:"autoForward,omitempty"`
+	Finalize     []ExecutableBlock `json:"finalize,omitempty"`
 }
 
 // DoneDataDefinition computes the payload of a final state's done event.

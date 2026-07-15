@@ -38,19 +38,21 @@ type definitionStateNode struct {
 }
 
 type definitionValidator struct {
-	definition *Definition
-	byID       map[Identifier]*definitionStateNode
-	invokeIDs  map[Identifier]string
-	dataIDs    map[Identifier]string
+	definition          *Definition
+	byID                map[Identifier]*definitionStateNode
+	invokeDefinitionIDs map[Identifier]string
+	invokeIDs           map[Identifier]string
+	dataIDs             map[Identifier]string
 }
 
 func normalizeDefinition(input Definition) (Definition, error) {
 	definition := input.Clone()
 	validator := definitionValidator{
-		definition: &definition,
-		byID:       make(map[Identifier]*definitionStateNode),
-		invokeIDs:  make(map[Identifier]string),
-		dataIDs:    make(map[Identifier]string),
+		definition:          &definition,
+		byID:                make(map[Identifier]*definitionStateNode),
+		invokeDefinitionIDs: make(map[Identifier]string),
+		invokeIDs:           make(map[Identifier]string),
+		dataIDs:             make(map[Identifier]string),
 	}
 	if err := validator.validateHeader(); err != nil {
 		return Definition{}, err
@@ -67,6 +69,10 @@ func normalizeDefinition(input Definition) (Definition, error) {
 	if err := assignGeneratedStateIDs(&definition.Root, "root", reserved, &nextGenerated); err != nil {
 		return Definition{}, err
 	}
+	reservedInvokes := make(map[Identifier]bool)
+	collectReservedInvokeDefinitionIDs(&definition.Root, reservedInvokes)
+	nextGeneratedInvoke := 0
+	assignGeneratedInvokeDefinitionIDs(&definition.Root, reservedInvokes, &nextGeneratedInvoke)
 	normalizeImplicitInitials(&definition.Root)
 	normalizeTransitionTypes(&definition.Root)
 	root, err := validator.collectStates(&definition.Root, nil, "root")
@@ -77,6 +83,37 @@ func normalizeDefinition(input Definition) (Definition, error) {
 		return Definition{}, err
 	}
 	return definition, nil
+}
+
+func collectReservedInvokeDefinitionIDs(state *StateDefinition, reserved map[Identifier]bool) {
+	for i := range state.Invokes {
+		if id := state.Invokes[i].DefinitionID; id != "" {
+			reserved[id] = true
+		}
+	}
+	for i := range state.Children {
+		collectReservedInvokeDefinitionIDs(&state.Children[i], reserved)
+	}
+}
+
+func assignGeneratedInvokeDefinitionIDs(state *StateDefinition, reserved map[Identifier]bool, next *int) {
+	for i := range state.Invokes {
+		if state.Invokes[i].DefinitionID != "" {
+			continue
+		}
+		for {
+			*next++
+			candidate := Identifier(fmt.Sprintf("invoke.%d", *next))
+			if !reserved[candidate] {
+				state.Invokes[i].DefinitionID = candidate
+				reserved[candidate] = true
+				break
+			}
+		}
+	}
+	for i := range state.Children {
+		assignGeneratedInvokeDefinitionIDs(&state.Children[i], reserved, next)
+	}
 }
 
 func (v *definitionValidator) validateHeader() error {
@@ -389,6 +426,13 @@ func (v *definitionValidator) validateTransition(transition *TransitionDefinitio
 }
 
 func (v *definitionValidator) validateInvoke(invoke *InvokeDefinition, path string, owner Identifier) error {
+	if err := validatePlainIdentifier(invoke.DefinitionID); err != nil {
+		return definitionError(path+".definitionId", "%v", err)
+	}
+	if previous, exists := v.invokeDefinitionIDs[invoke.DefinitionID]; exists {
+		return definitionError(path+".definitionId", "duplicate invoke definition ID %q (already declared at %s)", invoke.DefinitionID, previous)
+	}
+	v.invokeDefinitionIDs[invoke.DefinitionID] = path + ".definitionId"
 	if invoke.ID != "" && invoke.IDLocation != nil {
 		return definitionError(path+".idLocation", "invoke id and idLocation are mutually exclusive")
 	}

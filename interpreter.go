@@ -1133,13 +1133,13 @@ func (ip *interpretation) processInvokes() {
 	pending := sortAsc(ip.statesToInvoke)
 	ip.statesToInvoke = map[*compiledState]bool{}
 	for _, s := range pending {
-		for i, spec := range s.invokes {
-			ip.beginInvoke(s, i, spec)
+		for _, spec := range s.invokes {
+			ip.beginInvoke(s, spec)
 		}
 	}
 }
 
-func (ip *interpretation) beginInvoke(s *compiledState, specIndex int, spec *compiledInvoke) {
+func (ip *interpretation) beginInvoke(s *compiledState, spec *compiledInvoke) {
 	id := spec.id
 	if id == "" {
 		for {
@@ -1150,24 +1150,91 @@ func (ip *interpretation) beginInvoke(s *compiledState, specIndex int, spec *com
 			}
 		}
 	}
-	if spec.idLocation != nil {
-		if err := ip.assignIDLocation(spec.idLocation, id, "invoke"); err != nil {
+	request, ok := ip.evaluateInvokeRequest(spec, id, ip.execContext(), true)
+	if !ok {
+		return
+	}
+	cancel, incoming, err := ip.startInvoke(request, spec)
+	if err != nil {
+		var unavailable invokeHandlerUnavailableError
+		if errors.As(err, &unavailable) {
 			ip.reportError(err)
-			return
+		} else {
+			ip.enqueueInternal(Event{Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id, Data: PlatformErrorValue(ErrEventCommunication, err)})
 		}
+		return
 	}
-	var params Value
-	if spec.params != nil {
-		var ok bool
-		params, ok = ip.evaluateInvokeParams(spec.params, ip.execContext())
-		if !ok {
-			return
-		}
+	ri := &runningInvoke{
+		id: id, state: s, spec: spec, typ: request.Type, source: request.Source,
+		finalize: spec.finalize, autoForward: spec.autoForward, cancel: cancel, incoming: incoming,
 	}
-	cancel, incoming := ip.startInvoke(id, spec, params)
-	ri := &runningInvoke{id: id, state: s, specIndex: specIndex, finalize: spec.finalize, autoForward: spec.autoForward, cancel: cancel, incoming: incoming}
 	ip.activeInvokes[s] = append(ip.activeInvokes[s], ri)
 	ip.invokesByID[id] = ri
+}
+
+func (ip *interpretation) evaluateInvokeRequest(spec *compiledInvoke, id Identifier, ec ExecContext, assignID bool) (InvokeRequest, bool) {
+	request := InvokeRequest{DefinitionID: spec.definitionID, ID: id, Type: spec.staticType, Source: spec.staticSource}
+	if !spec.declarative {
+		if assignID && spec.idLocation != nil {
+			if err := ip.assignIDLocation(spec.idLocation, id, "invoke"); err != nil {
+				ip.reportError(err)
+				return InvokeRequest{}, false
+			}
+		}
+		if spec.params != nil {
+			params, ok := ip.evaluateInvokeParams(spec.params, ec)
+			if !ok {
+				return InvokeRequest{}, false
+			}
+			request.Data = params.Clone()
+		}
+		return request, true
+	}
+	if assignID && spec.hasModelIDLocation {
+		if err := ip.assignModel(ec, spec.modelIDLocation, stringValue(string(id))); err != nil {
+			ip.reportError(fmt.Errorf("statecharts: invoke idlocation: %w", err))
+			return InvokeRequest{}, false
+		}
+	}
+	if spec.hasTypeExpr {
+		typ, err := ip.evalString(ec, spec.typeExpr, "", "invoke type")
+		if err != nil {
+			ip.reportError(err)
+			return InvokeRequest{}, false
+		}
+		request.Type = Identifier(typ)
+	}
+	request.Type = canonicalInvokeType(request.Type)
+	if spec.hasSourceExpr {
+		source, err := ip.evalString(ec, spec.sourceExpr, "", "invoke source")
+		if err != nil {
+			ip.reportError(err)
+			return InvokeRequest{}, false
+		}
+		request.Source = source
+	}
+	data, err := ip.evaluatePayload(ec, spec.payload)
+	if err != nil {
+		ip.reportError(err)
+		return InvokeRequest{}, false
+	}
+	request.Data = data.Clone()
+	return request, true
+}
+
+func (ip *interpretation) evaluateInvokeResumeRequest(ri *runningInvoke, ec ExecContext) (InvokeRequest, bool) {
+	if !ri.spec.declarative {
+		return ip.evaluateInvokeRequest(ri.spec, ri.id, ec, false)
+	}
+	data, err := ip.evaluatePayload(ec, ri.spec.payload)
+	if err != nil {
+		ip.reportError(err)
+		return InvokeRequest{}, false
+	}
+	return InvokeRequest{
+		DefinitionID: ri.spec.definitionID,
+		ID:           ri.id, Type: ri.typ, Source: ri.source, Data: data.Clone(),
+	}, true
 }
 
 func (ip *interpretation) invokeIDReserved(id Identifier) bool {

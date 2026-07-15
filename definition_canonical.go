@@ -8,7 +8,7 @@ import (
 const (
 	// DefinitionCanonicalVersion identifies the internal canonical definition
 	// encoding. It must change when that encoding changes.
-	DefinitionCanonicalVersion uint32 = 1
+	DefinitionCanonicalVersion uint32 = 2
 
 	// DefinitionCanonicalMagic separates canonical definitions from other
 	// versioned byte formats when they are used as revision material.

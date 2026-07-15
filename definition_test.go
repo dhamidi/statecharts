@@ -303,7 +303,7 @@ func TestDefinitionCanonicalFormatVersionIsPinned(t *testing.T) {
 	}
 	digest := sha256.Sum256(canonical)
 	got := hex.EncodeToString(digest[:])
-	const want = "338d917d5668ddc4c18c89986d51357710cdbf41835cc6fb5ba52710f81b5deb"
+	const want = "da171dc369deb3df7abc04b6179be3914bf2cffda51f5f9f746a7b55f61d0609"
 	if got != want {
 		t.Fatalf("canonical format changed: sha256 = %s, want %s; bump DefinitionCanonicalVersion before intentionally changing the format", got, want)
 	}

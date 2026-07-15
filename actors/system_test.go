@@ -1541,3 +1541,86 @@ func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 }
+
+type systemInvokeHandler struct {
+	label   string
+	started chan<- string
+}
+
+func (h *systemInvokeHandler) Start(ctx context.Context, _ statecharts.InvokeRequest, _ statecharts.InvokeIO) (statecharts.Value, error) {
+	h.started <- h.label
+	<-ctx.Done()
+	return statecharts.Value{}, ctx.Err()
+}
+
+func declarativeInvokeChart(t *testing.T) *statecharts.Chart {
+	t.Helper()
+	definition := statecharts.Definition{
+		ID: "invoke-system-test", Datamodel: "go",
+		Root: statecharts.StateDefinition{
+			ID: statecharts.StateDefinitionID{Value: "invoke-system-test"}, Kind: statecharts.KindCompound,
+			Initial: &statecharts.TransitionDefinition{Targets: []statecharts.Identifier{"active"}},
+			Children: []statecharts.StateDefinition{{
+				ID: statecharts.StateDefinitionID{Value: "active"}, Kind: statecharts.KindAtomic,
+				Invokes: []statecharts.InvokeDefinition{{DefinitionID: "active.worker", ID: "job", Type: "worker"}},
+			}},
+		},
+	}
+	chart, err := statecharts.Compile(definition, statecharts.NewGoModel(func() *struct{} { return &struct{}{} }))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	return chart
+}
+
+func TestSystemPreparesInvokeHandlersAndKeepsBindingsIsolated(t *testing.T) {
+	chart := declarativeInvokeChart(t)
+	missing := NewSystem()
+	if err := missing.Register(chart); err == nil || !strings.Contains(err.Error(), "worker") {
+		t.Fatalf("Register without handler error = %v", err)
+	}
+	if _, ok := missing.chartFor(chart.ID()); ok {
+		t.Fatal("chart with an unsatisfied invoke requirement was published")
+	}
+	if err := missing.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan string, 2)
+	newSystem := func(label string) *System {
+		return NewSystem(WithInvokeHandler("worker", func() statecharts.InvokeHandler {
+			return &systemInvokeHandler{label: label, started: started}
+		}))
+	}
+	left, right := newSystem("left"), newSystem("right")
+	ctx := context.Background()
+	for _, system := range []*System{left, right} {
+		if err := system.Register(chart); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := left.Spawn(ctx, "left-actor", chart.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if err := right.Spawn(ctx, "right-actor", chart.ID()); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for range 2 {
+		select {
+		case label := <-started:
+			got[label] = true
+		case <-time.After(time.Second):
+			t.Fatal("invoke handler did not start")
+		}
+	}
+	if !got["left"] || !got["right"] {
+		t.Fatalf("handler bindings used = %v", got)
+	}
+	if err := left.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := right.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

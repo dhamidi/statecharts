@@ -1130,8 +1130,8 @@ func TestRestoreReconstructsActiveInvokeBookkeeping(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	wantID := Identifier("a.invoke1")
-	if len(snap.ActiveInvokes) != 1 || snap.ActiveInvokes[0] != (ActiveInvoke{State: "a", SpecIndex: 0, ID: wantID}) {
-		t.Fatalf("snap.ActiveInvokes = %+v, want a single {State:a SpecIndex:0 ID:%s}", snap.ActiveInvokes, wantID)
+	if len(snap.ActiveInvokes) != 1 || snap.ActiveInvokes[0] != (ActiveInvoke{State: "a", DefinitionID: "invoke.1", ID: wantID}) {
+		t.Fatalf("snap.ActiveInvokes = %+v, want a single {State:a DefinitionID:invoke.1 ID:%s}", snap.ActiveInvokes, wantID)
 	}
 	if err := in.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -1146,8 +1146,8 @@ func TestRestoreReconstructsActiveInvokeBookkeeping(t *testing.T) {
 	if !ok {
 		t.Fatalf("ip.invokesByID missing %q after Restore", wantID)
 	}
-	if ri.state == nil || ri.state.id != "a" || ri.specIndex != 0 {
-		t.Fatalf("restored runningInvoke = %+v, want state=\"a\" specIndex=0", ri)
+	if ri.state == nil || ri.state.id != "a" || ri.spec == nil || ri.spec.definitionID != "invoke.1" {
+		t.Fatalf("restored runningInvoke = %+v, want state=\"a\" definitionID=invoke.1", ri)
 	}
 
 	stateA := chart.byID["a"]
@@ -1871,7 +1871,7 @@ func TestRestoreRejectsActiveInvokeNotInConfiguration(t *testing.T) {
 	// Hand-craft an ActiveInvoke for "a" onto an otherwise-legitimate
 	// snapshot whose Configuration does not contain "a" -- the corruption
 	// this test targets.
-	snap.ActiveInvokes = append(snap.ActiveInvokes, ActiveInvoke{State: "a", SpecIndex: 0, ID: "job"})
+	snap.ActiveInvokes = append(snap.ActiveInvokes, ActiveInvoke{State: "a", DefinitionID: "invoke.1", ID: "job"})
 
 	if _, err := Restore(chart, nil, snap); err == nil {
 		t.Fatalf("Restore succeeded, want an error for an active invoke referencing a state outside Configuration")

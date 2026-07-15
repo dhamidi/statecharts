@@ -34,11 +34,17 @@ type systemConfig struct {
 	onResidency    func(ResidencyChange)
 	scxmlPeer      statecharts.IOProcessor
 	processors     []processorRegistration
+	invokeHandlers []invokeHandlerRegistration
 }
 
 type processorRegistration struct {
 	typ     statecharts.Identifier
 	factory IOProcessorFactory
+}
+
+type invokeHandlerRegistration struct {
+	typ     statecharts.Identifier
+	factory statecharts.InvokeHandlerFactory
 }
 
 // IOProcessorFactory creates the processor binding for one actor Instance.
@@ -178,6 +184,26 @@ func WithIOProcessor(typ statecharts.Identifier, factory IOProcessorFactory) Opt
 	}
 }
 
+// WithInvokeHandler binds a declarative invocation type for every actor in
+// this System. The factory is Instance-scoped and called once per invocation
+// start or resume, so mutable handler state is never shared across actors.
+func WithInvokeHandler(typ statecharts.Identifier, factory statecharts.InvokeHandlerFactory) Option {
+	return func(c *systemConfig) {
+		if typ == "scxml" {
+			typ = statecharts.SCXMLInvokeType
+		}
+		if typ == "" || factory == nil {
+			panic("actors: invalid invoke handler registration")
+		}
+		for _, registered := range c.invokeHandlers {
+			if registered.typ == typ {
+				panic("actors: duplicate invoke handler type")
+			}
+		}
+		c.invokeHandlers = append(c.invokeHandlers, invokeHandlerRegistration{typ: typ, factory: factory})
+	}
+}
+
 func defaultSystemConfig() systemConfig {
 	return systemConfig{
 		idleTimeout:   5 * time.Minute,
@@ -268,6 +294,9 @@ func (s *System) Register(chart *statecharts.Chart) error {
 	if chart.DatamodelProgram() == nil {
 		return fmt.Errorf("actors: Register: chart %q has no datamodel program", chart.ID())
 	}
+	if err := chart.Prepare(s.invokeHandlerOptions()...); err != nil {
+		return fmt.Errorf("actors: Register: chart %q: %w", chart.ID(), err)
+	}
 	s.chartsMu.Lock()
 	defer s.chartsMu.Unlock()
 	if _, exists := s.charts[chart.ID()]; exists {
@@ -275,6 +304,14 @@ func (s *System) Register(chart *statecharts.Chart) error {
 	}
 	s.charts[chart.ID()] = chart
 	return nil
+}
+
+func (s *System) invokeHandlerOptions() []statecharts.Option {
+	options := make([]statecharts.Option, 0, len(s.cfg.invokeHandlers))
+	for _, registered := range s.cfg.invokeHandlers {
+		options = append(options, statecharts.WithInvokeHandler(registered.typ, registered.factory))
+	}
+	return options
 }
 
 func (s *System) chartFor(kind statecharts.Identifier) (*statecharts.Chart, bool) {
@@ -541,6 +578,10 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 	if !ok {
 		return fmt.Errorf("actors: activate %q: kind %q is not registered: %w", entry.name, entry.kind, ErrKindNotRegistered)
 	}
+	invokeOpts := s.invokeHandlerOptions()
+	if err := chart.Prepare(invokeOpts...); err != nil {
+		return fmt.Errorf("actors: activate %q: %w", entry.name, err)
+	}
 	address := s.address(entry.name)
 	sessionID := statecharts.SessionID(entry.name)
 	proc := newRoutingProcessor(s, address)
@@ -607,13 +648,14 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 		// counterpart to System.deliver's explicit Log.Append before each
 		// externally-originated message (Tell, peer Send). Without this, a
 		// durable actor's self-scheduled sends would never be durable.
-		instanceOpts := []statecharts.Option{
+		instanceOpts := append([]statecharts.Option{}, invokeOpts...)
+		instanceOpts = append(instanceOpts,
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger),
 			statecharts.WithIngressHook(ingressHook),
 			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.storage, sessionID, s.cfg.clock)),
 			statecharts.WithDeliveryNamespace(fmt.Sprintf("%d:%s:%s", len(sessionID), sessionID, chart.Version())),
-		}
+		)
 		hasLogEntries := false
 		for _, readErr := range s.cfg.storage.Read(ctx, sessionID, 1) {
 			if readErr != nil {
@@ -652,7 +694,9 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			inst, err = chart.Rehydrate(ctx, s.cfg.storage, s.cfg.storage, sessionID, processorValues[0], append(instanceOpts, processorOpts[1:]...)...)
 		}
 	} else {
-		opts := append(processorOpts,
+		opts := append([]statecharts.Option{}, invokeOpts...)
+		opts = append(opts, processorOpts...)
+		opts = append(opts,
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger), statecharts.WithIngressHook(ingressHook),
 			statecharts.WithSessionID(sessionID))

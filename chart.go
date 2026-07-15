@@ -7,16 +7,17 @@ import (
 // Chart is an immutable, validated, indexed chart definition produced by
 // Build. It is safe for concurrent use by multiple Instances.
 type Chart struct {
-	root         *compiledState
-	name         string
-	byID         map[Identifier]*compiledState
-	order        []*compiledState // document order (pre-order traversal of the state tree)
-	newDatamodel func() any
-	program      DatamodelProgram
-	version      string
-	definition   *Definition
-	data         []compiledData
-	dataBinding  DataBinding
+	root                  *compiledState
+	name                  string
+	byID                  map[Identifier]*compiledState
+	order                 []*compiledState // document order (pre-order traversal of the state tree)
+	newDatamodel          func() any
+	program               DatamodelProgram
+	version               string
+	definition            *Definition
+	data                  []compiledData
+	dataBinding           DataBinding
+	invokesByDefinitionID map[Identifier]*compiledInvoke
 }
 
 // Definition returns an independently editable copy of the normalized
@@ -137,7 +138,7 @@ func (c *Chart) States() []Identifier {
 // validating every Initial/Target/history-default Identifier reference.
 // Errors are static, discovered here rather than at interpretation time.
 func Build(root StateSpec, opts ...BuildOption) (*Chart, error) {
-	c := &Chart{byID: make(map[Identifier]*compiledState)}
+	c := &Chart{byID: make(map[Identifier]*compiledState), invokesByDefinitionID: make(map[Identifier]*compiledInvoke)}
 	explicit := make(map[Identifier]bool)
 	var collect func(StateSpec)
 	collect = func(s StateSpec) {
@@ -261,15 +262,19 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 		if err != nil {
 			return nil, fmt.Errorf("statecharts: state %q invoke finalize: %w", spec.ID, err)
 		}
-		cs.invokes = append(cs.invokes, &compiledInvoke{
-			id:          inv.ID,
-			start:       inv.Start,
-			params:      inv.Params,
-			finalize:    finalize,
-			autoForward: inv.AutoForward,
-			resume:      inv.Resume,
-			idLocation:  inv.IDLocation,
-		})
+		compiled := &compiledInvoke{
+			definitionID: Identifier(fmt.Sprintf("invoke.%d", len(c.invokesByDefinitionID)+1)),
+			owner:        cs,
+			id:           inv.ID,
+			start:        inv.Start,
+			params:       inv.Params,
+			finalize:     finalize,
+			autoForward:  inv.AutoForward,
+			resume:       inv.Resume,
+			idLocation:   inv.IDLocation,
+		}
+		cs.invokes = append(cs.invokes, compiled)
+		c.invokesByDefinitionID[compiled.definitionID] = compiled
 	}
 
 	for _, childSpec := range spec.Children {
@@ -441,10 +446,10 @@ func (c *Chart) validateReferences() error {
 			}
 		}
 		for _, inv := range cs.invokes {
-			if inv.id != "" && inv.idLocation != nil {
+			if inv.id != "" && (inv.idLocation != nil || inv.hasModelIDLocation) {
 				return fmt.Errorf("statecharts: state %q invoke id and idlocation are mutually exclusive", cs.id)
 			}
-			if inv.start == nil {
+			if !inv.declarative && inv.start == nil {
 				return fmt.Errorf("statecharts: state %q has invoke without a start function", cs.id)
 			}
 			if inv.id == "" {

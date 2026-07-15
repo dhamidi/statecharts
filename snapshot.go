@@ -51,9 +51,11 @@ type PendingSend struct {
 // ActiveInvoke records one <invoke> that was active in Configuration when a
 // Snapshot was taken.
 type ActiveInvoke struct {
-	State     Identifier // the state that owns this invocation
-	SpecIndex int        // this invocation's position among State's <invoke> elements, in document order
-	ID        Identifier // the invocation's own id, exactly as assigned when it started
+	State        Identifier `json:"state"`            // the state that owns this invocation
+	DefinitionID Identifier `json:"definition_id"`    // stable declaration identity in the pinned chart definition
+	ID           Identifier `json:"id"`               // the invocation's own id, exactly as assigned when it started
+	Type         Identifier `json:"type,omitempty"`   // evaluated handler type selected when this invocation began
+	Source       string     `json:"source,omitempty"` // evaluated source selected when this invocation began
 }
 
 // Checkpoint pairs a Snapshot with the Log sequence number it reflects.
@@ -63,7 +65,7 @@ type Checkpoint struct {
 	Seq      uint64
 }
 
-const snapshotVersion = 5
+const snapshotVersion = 6
 
 // Snapshot captures this Instance's current state (safely, by running on
 // the interpreter's own goroutine), suitable for persisting and later
@@ -146,9 +148,11 @@ func (in *Instance) buildSnapshot() (Snapshot, error) {
 	for _, invokes := range ip.activeInvokes {
 		for _, ri := range invokes {
 			snap.ActiveInvokes = append(snap.ActiveInvokes, ActiveInvoke{
-				State:     ri.state.id,
-				SpecIndex: ri.specIndex,
-				ID:        ri.id,
+				State:        ri.state.id,
+				DefinitionID: ri.spec.definitionID,
+				ID:           ri.id,
+				Type:         ri.typ,
+				Source:       ri.source,
 			})
 		}
 	}
@@ -172,6 +176,9 @@ func (in *Instance) buildSnapshot() (Snapshot, error) {
 // one gets error.communication or a real InvokeResumeFunc call. The Instance
 // is constructed but not started; call Start to spawn its goroutine.
 func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Instance, error) {
+	if err := chart.Prepare(opts...); err != nil {
+		return nil, err
+	}
 	if err := validateSnapshotHeader(chart, snap); err != nil {
 		return nil, err
 	}
@@ -184,6 +191,9 @@ func Restore(chart *Chart, datamodel any, snap Snapshot, opts ...Option) (*Insta
 func (c *Chart) Restore(snap Snapshot, opts ...Option) (*Instance, error) {
 	if c.program == nil {
 		return nil, fmt.Errorf("statecharts: chart has no datamodel program")
+	}
+	if err := c.Prepare(opts...); err != nil {
+		return nil, err
 	}
 	return restoreInstanceFromFactory(c, snap, func() (DatamodelSession, error) {
 		return c.program.NewSession(SessionOptions{})
@@ -326,6 +336,7 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 	// checkpoint.
 	ip.activeInvokes = map[*compiledState][]*runningInvoke{}
 	ip.invokesByID = map[Identifier]*runningInvoke{}
+	restoredDefinitions := map[Identifier]bool{}
 	for _, ai := range snap.ActiveInvokes {
 		s, ok := chart.byID[ai.State]
 		if !ok {
@@ -334,14 +345,37 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 		if !configuration[s] {
 			return fmt.Errorf("statecharts: restore: active invoke references state %q not in Configuration", ai.State)
 		}
-		if ai.SpecIndex < 0 || ai.SpecIndex >= len(s.invokes) {
-			return fmt.Errorf("statecharts: restore: state %q has no invoke at index %d", ai.State, ai.SpecIndex)
+		spec := chart.invokesByDefinitionID[ai.DefinitionID]
+		if spec == nil {
+			return fmt.Errorf("statecharts: restore: chart has no invoke definition %q", ai.DefinitionID)
 		}
-		spec := s.invokes[ai.SpecIndex]
+		if ai.ID == "" {
+			return fmt.Errorf("statecharts: restore: invoke definition %q has an empty runtime ID", ai.DefinitionID)
+		}
+		if spec.owner != s {
+			return fmt.Errorf("statecharts: restore: invoke definition %q belongs to state %q, not %q", ai.DefinitionID, spec.owner.id, ai.State)
+		}
+		if spec.declarative {
+			if ai.Type == "" {
+				return fmt.Errorf("statecharts: restore: invoke definition %q has an empty handler type", ai.DefinitionID)
+			}
+			if !spec.hasTypeExpr && ai.Type != spec.staticType {
+				return fmt.Errorf("statecharts: restore: invoke definition %q handler type %q does not match static type %q", ai.DefinitionID, ai.Type, spec.staticType)
+			}
+		}
+		if restoredDefinitions[ai.DefinitionID] {
+			return fmt.Errorf("statecharts: restore: duplicate active invoke definition %q", ai.DefinitionID)
+		}
+		if ip.invokesByID[ai.ID] != nil {
+			return fmt.Errorf("statecharts: restore: duplicate active invoke runtime ID %q", ai.ID)
+		}
+		restoredDefinitions[ai.DefinitionID] = true
 		ri := &runningInvoke{
 			id:          ai.ID,
 			state:       s,
-			specIndex:   ai.SpecIndex,
+			spec:        spec,
+			typ:         ai.Type,
+			source:      ai.Source,
 			finalize:    spec.finalize,
 			autoForward: spec.autoForward,
 			cancel:      func() {},
