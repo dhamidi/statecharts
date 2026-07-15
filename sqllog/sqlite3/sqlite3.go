@@ -23,26 +23,40 @@ type Storage struct {
 }
 
 // Open opens an isolated SQLite database, configures every pooled connection,
-// enables WAL for file-backed databases, and applies sqllog's schema.
+// uses immediate transactions for cross-handle writer linearization, enables
+// WAL for file-backed databases, and applies sqllog's schema.
 func Open(path string) (*Storage, error) {
 	if path == "" {
 		return nil, fmt.Errorf("sqllog/sqlite3: empty path")
 	}
-	fileBacked := path != ":memory:" && !strings.Contains(path, "mode=memory")
-	if fileBacked && !strings.HasPrefix(path, "file:") {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dsn := path
+	fileBacked := true
+	switch {
+	case path == ":memory:":
+		fileBacked = false
+	case strings.HasPrefix(path, "file:"):
+		uri, err := url.Parse(path)
+		if err != nil {
+			return nil, fmt.Errorf("sqllog/sqlite3: parse file URI: %w", err)
+		}
+		fileBacked = uri.Query().Get("mode") != "memory" && uri.Opaque != ":memory:"
+	default:
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("sqllog/sqlite3: resolve database path: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
 			return nil, fmt.Errorf("sqllog/sqlite3: create database directory: %w", err)
 		}
-	}
-	dsn := path
-	if !strings.HasPrefix(dsn, "file:") && dsn != ":memory:" {
-		dsn = "file:" + filepath.ToSlash(dsn)
+		dsn = (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}).String()
 	}
 	pragmas := []string{"busy_timeout(5000)", "foreign_keys(ON)", "synchronous(NORMAL)", "wal_autocheckpoint(1000)"}
 	sep := "?"
 	if strings.Contains(dsn, "?") {
 		sep = "&"
 	}
+	dsn += sep + "_txlock=immediate"
+	sep = "&"
 	for _, pragma := range pragmas {
 		dsn += sep + "_pragma=" + url.QueryEscape(pragma)
 		sep = "&"

@@ -473,9 +473,12 @@ if err != nil {
 defer storage.Close()
 ```
 
-File-backed SQLite databases use WAL mode and configured pooled connections.
-Use a different database file for each actor system; one process may host many
-systems, but each system owns an isolated log.
+`sqllog` stores immutable definition artifacts and durable actor revision pins
+alongside the event log and snapshot cache. File-backed SQLite databases use
+WAL mode, configured pooled connections, and immediate write transactions so
+actor start and revision deletion remain linearizable across handles. Use a
+different database file for each actor system; one process may host many
+systems, but each system owns isolated durable storage.
 
 ## Examples
 

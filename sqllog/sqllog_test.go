@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,12 +14,19 @@ import (
 
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/sqllog"
+	"github.com/dhamidi/statecharts/storagetest"
 )
 
 var (
-	_ statecharts.Log           = (*sqllog.Storage)(nil)
-	_ statecharts.SnapshotStore = (*sqllog.Storage)(nil)
+	_ statecharts.Log             = (*sqllog.Storage)(nil)
+	_ statecharts.SnapshotStore   = (*sqllog.Storage)(nil)
+	_ statecharts.DefinitionStore = (*sqllog.Storage)(nil)
+	_ statecharts.ActorStore      = (*sqllog.Storage)(nil)
 )
+
+func TestStorageConformance(t *testing.T) {
+	storagetest.Run(t, func(t *testing.T) storagetest.Store { return openTestLog(t) })
+}
 
 func TestLoadMalformedSnapshotIsInvalidSnapshot(t *testing.T) {
 	store := openTestLog(t)
@@ -45,6 +53,234 @@ func openTestLog(t *testing.T) *sqllog.Log {
 		t.Fatalf("sqllog.New: %v", err)
 	}
 	return log
+}
+
+type sqlArtifactModel struct{}
+
+func sqlTestArtifact(t *testing.T, id, salt string) statecharts.DefinitionArtifact {
+	t.Helper()
+	chart, err := statecharts.Build(
+		statecharts.Atomic(statecharts.Identifier(id)),
+		statecharts.NewGoModel(func() *sqlArtifactModel { return &sqlArtifactModel{} }),
+		statecharts.WithRevisionSalt(salt),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return chart.DefinitionArtifact()
+}
+
+func sqlTestActor(artifact statecharts.DefinitionArtifact, id string) statecharts.ActorMetadata {
+	return statecharts.ActorMetadata{
+		ActorID: statecharts.Identifier(id), ChartID: artifact.ChartID, Revision: artifact.Revision,
+		SessionID: statecharts.SessionID(id), Durable: true,
+		Lifecycle: statecharts.ActorLifecycleActive,
+		StartedAt: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func TestBeginActorRollsBackPinWhenSessionStartInsertFails(t *testing.T) {
+	store := openTestLog(t)
+	ctx := context.Background()
+	artifact := sqlTestArtifact(t, "counter", "v1")
+	if _, err := store.PutDefinition(ctx, artifact); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_actor_session_start
+		BEFORE INSERT ON statechart_log
+		WHEN NEW.kind = 'session_started'
+		BEGIN SELECT RAISE(ABORT, 'injected session-start failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	actor := sqlTestActor(artifact, "red")
+	if _, _, err := store.BeginActor(ctx, actor); err == nil || !strings.Contains(err.Error(), "injected session-start failure") {
+		t.Fatalf("BeginActor error = %v", err)
+	}
+	if _, ok, err := store.GetActor(ctx, actor.ActorID); err != nil || ok {
+		t.Fatalf("GetActor after rollback = ok %v, err %v", ok, err)
+	}
+	if seq, err := store.LastSeq(ctx, actor.SessionID); err != nil || seq != 0 {
+		t.Fatalf("LastSeq after rollback = %d, %v", seq, err)
+	}
+}
+
+func TestDefinitionAndActiveActorReadsRejectCorruptOrMissingArtifacts(t *testing.T) {
+	t.Run("corrupt definition", func(t *testing.T) {
+		store := openTestLog(t)
+		artifact := sqlTestArtifact(t, "counter", "v1")
+		if _, err := store.PutDefinition(context.Background(), artifact); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`UPDATE statechart_definition SET canonical_definition = x'00' WHERE revision = ?`, artifact.Revision); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.GetDefinition(context.Background(), artifact.Revision); !errors.Is(err, statecharts.ErrInvalidDefinitionArtifact) {
+			t.Fatalf("GetDefinition error = %v, want ErrInvalidDefinitionArtifact", err)
+		}
+	})
+	t.Run("malformed definition row", func(t *testing.T) {
+		store := openTestLog(t)
+		artifact := sqlTestArtifact(t, "counter", "v1")
+		if _, err := store.PutDefinition(context.Background(), artifact); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`UPDATE statechart_definition SET revision_envelope_version = 'not-an-integer' WHERE revision = ?`, artifact.Revision); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.GetDefinition(context.Background(), artifact.Revision); !errors.Is(err, statecharts.ErrInvalidDefinitionArtifact) {
+			t.Fatalf("GetDefinition error = %v, want ErrInvalidDefinitionArtifact", err)
+		}
+	})
+	t.Run("missing active definition", func(t *testing.T) {
+		store := openTestLog(t)
+		artifact := sqlTestArtifact(t, "counter", "v1")
+		if _, err := store.PutDefinition(context.Background(), artifact); err != nil {
+			t.Fatal(err)
+		}
+		actor := sqlTestActor(artifact, "red")
+		if _, _, err := store.BeginActor(context.Background(), actor); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`DELETE FROM statechart_definition WHERE revision = ?`, artifact.Revision); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.GetActor(context.Background(), actor.ActorID); !errors.Is(err, statecharts.ErrDefinitionNotFound) {
+			t.Fatalf("GetActor error = %v, want ErrDefinitionNotFound", err)
+		}
+	})
+	t.Run("malformed actor row", func(t *testing.T) {
+		store := openTestLog(t)
+		artifact := sqlTestArtifact(t, "counter", "v1")
+		if _, err := store.PutDefinition(context.Background(), artifact); err != nil {
+			t.Fatal(err)
+		}
+		actor := sqlTestActor(artifact, "red")
+		if _, _, err := store.BeginActor(context.Background(), actor); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`UPDATE statechart_actor SET started_at = 'not-a-time' WHERE actor_id = ?`, actor.ActorID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.GetActor(context.Background(), actor.ActorID); !errors.Is(err, statecharts.ErrInvalidActorMetadata) {
+			t.Fatalf("GetActor error = %v, want ErrInvalidActorMetadata", err)
+		}
+	})
+	t.Run("malformed session-start row", func(t *testing.T) {
+		store := openTestLog(t)
+		artifact := sqlTestArtifact(t, "counter", "v1")
+		if _, err := store.PutDefinition(context.Background(), artifact); err != nil {
+			t.Fatal(err)
+		}
+		actor := sqlTestActor(artifact, "red")
+		if _, _, err := store.BeginActor(context.Background(), actor); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`UPDATE statechart_log SET event_type = 'not-an-integer' WHERE session_id = ? AND seq = 1`, actor.SessionID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.GetActor(context.Background(), actor.ActorID); !errors.Is(err, statecharts.ErrInvalidActorMetadata) {
+			t.Fatalf("GetActor error = %v, want ErrInvalidActorMetadata", err)
+		}
+	})
+}
+
+func TestCallerProvidedSQLitePoolsSerializeRevisionWrites(t *testing.T) {
+	path := t.TempDir() + "/shared.db"
+	open := func() *sqllog.Storage {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.SetMaxOpenConns(2)
+		t.Cleanup(func() { _ = db.Close() })
+		store, err := sqllog.New(db, sqllog.SQLite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	first, second := open(), open()
+
+	// Hold an independent writer lock while PutDefinition starts. The generic
+	// sqllog package, not sqlite3.Open, must wait and linearize the write.
+	conn, err := first.DB().Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	artifact := sqlTestArtifact(t, "blocked-counter", "v1")
+	type putOutcome struct {
+		result statecharts.DefinitionPutResult
+		err    error
+	}
+	put := make(chan putOutcome, 1)
+	go func() {
+		result, err := second.PutDefinition(context.Background(), artifact)
+		put <- putOutcome{result: result, err: err}
+	}()
+	select {
+	case outcome := <-put:
+		t.Fatalf("PutDefinition returned before writer released lock: %v, %v", outcome.result, outcome.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := conn.ExecContext(context.Background(), `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case outcome := <-put:
+		if outcome.err != nil || outcome.result != statecharts.DefinitionStored {
+			t.Fatalf("PutDefinition = %v, %v", outcome.result, outcome.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PutDefinition did not resume after writer released lock")
+	}
+
+	// Competing actor creation and deletion must produce one of the two valid
+	// serial histories even without sqlite3.Open's DSN configuration.
+	for i := 0; i < 16; i++ {
+		artifact := sqlTestArtifact(t, fmt.Sprintf("counter-%d", i), "v1")
+		if _, err := first.PutDefinition(context.Background(), artifact); err != nil {
+			t.Fatal(err)
+		}
+		actor := sqlTestActor(artifact, fmt.Sprintf("actor-%d", i))
+		start := make(chan struct{})
+		var beginResult statecharts.ActorBeginResult
+		var beginErr error
+		var deleteResult statecharts.DefinitionDeleteResult
+		var deleteErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, beginResult, beginErr = first.BeginActor(context.Background(), actor)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			deleteResult, deleteErr = second.DeleteDefinitionIfUnreferenced(context.Background(), artifact.Revision)
+		}()
+		close(start)
+		wg.Wait()
+		if deleteErr != nil {
+			t.Fatalf("iteration %d delete: %v", i, deleteErr)
+		}
+		switch deleteResult {
+		case statecharts.DefinitionReferenced:
+			if beginErr != nil || beginResult != statecharts.ActorStarted {
+				t.Fatalf("iteration %d referenced begin = %v, %v", i, beginResult, beginErr)
+			}
+		case statecharts.DefinitionDeleted:
+			if !errors.Is(beginErr, statecharts.ErrDefinitionNotFound) {
+				t.Fatalf("iteration %d deleted begin error = %v", i, beginErr)
+			}
+		default:
+			t.Fatalf("iteration %d delete result = %v", i, deleteResult)
+		}
+	}
 }
 
 func TestAppendAssignsSequentialSeq(t *testing.T) {
@@ -318,7 +554,7 @@ func TestNewRejectsNonCurrentSchemaBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestNewRejectsPreRevisionOutboxSchema(t *testing.T) {
+func TestNewRejectsPreDefinitionAndActorSchema(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
@@ -328,11 +564,11 @@ func TestNewRejectsPreRevisionOutboxSchema(t *testing.T) {
 	if _, err := sqllog.New(db, sqllog.SQLite); err != nil {
 		t.Fatalf("create current schema: %v", err)
 	}
-	if _, err := db.Exec(`UPDATE statechart_schema SET version = 1`); err != nil {
+	if _, err := db.Exec(`UPDATE statechart_schema SET version = 2`); err != nil {
 		t.Fatalf("mark schema as pre-revision: %v", err)
 	}
-	if _, err := sqllog.New(db, sqllog.SQLite); err == nil || !strings.Contains(err.Error(), "want 2") {
-		t.Fatalf("New pre-revision schema error = %v, want current version 2 rejection", err)
+	if _, err := sqllog.New(db, sqllog.SQLite); err == nil || !strings.Contains(err.Error(), "want 3") {
+		t.Fatalf("New pre-revision schema error = %v, want current version 3 rejection", err)
 	}
 }
 
@@ -361,6 +597,41 @@ func TestFreshSchemaUsesOnlyCanonicalPayloadColumns(t *testing.T) {
 		if columns["data_type"] || columns["data_payload"] {
 			t.Fatalf("%s retains legacy payload columns: %v", table, columns)
 		}
+	}
+}
+
+func TestFreshSchemaIncludesDefinitionAndActorReferenceIndexes(t *testing.T) {
+	store := openTestLog(t)
+	for table, columns := range map[string][]string{
+		"statechart_definition": {"revision", "revision_envelope_version", "chart_id", "datamodel", "canonical_definition", "program_fingerprint"},
+		"statechart_actor":      {"actor_id", "chart_id", "revision", "session_id", "durable", "lifecycle", "started_at", "terminal_at"},
+	} {
+		for _, column := range columns {
+			var found int
+			if err := store.DB().QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name=?`, table), column).Scan(&found); err != nil {
+				t.Fatal(err)
+			}
+			if found != 1 {
+				t.Errorf("%s.%s is missing", table, column)
+			}
+		}
+	}
+	var indexSQL string
+	if err := store.DB().QueryRow(`SELECT sql FROM sqlite_schema WHERE type='index' AND name='statechart_actor_active_revision'`).Scan(&indexSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(indexSQL, "revision") || !strings.Contains(indexSQL, "lifecycle = 'active'") {
+		t.Fatalf("actor revision index = %q", indexSQL)
+	}
+}
+
+func TestNewRejectsCurrentVersionSchemaMissingActorReferenceIndex(t *testing.T) {
+	store := openTestLog(t)
+	if _, err := store.DB().Exec(`DROP INDEX statechart_actor_active_revision`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqllog.New(store.DB(), sqllog.SQLite); err == nil || !strings.Contains(err.Error(), "statechart_actor_active_revision") {
+		t.Fatalf("New error = %v, want missing actor reference index rejection", err)
 	}
 }
 

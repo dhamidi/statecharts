@@ -12,6 +12,32 @@ const (
 var createTableDDL = map[Dialect][]string{
 	SQLite: {
 		`CREATE TABLE IF NOT EXISTS statechart_schema (version INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS statechart_definition (
+			revision                  TEXT    PRIMARY KEY,
+			revision_envelope_version INTEGER NOT NULL,
+			chart_id                  TEXT    NOT NULL,
+			datamodel                 TEXT    NOT NULL,
+			canonical_definition      BLOB    NOT NULL,
+			program_fingerprint       BLOB    NOT NULL,
+			CHECK (revision <> ''),
+			CHECK (revision_envelope_version > 0),
+			CHECK (chart_id <> ''),
+			CHECK (datamodel <> ''),
+			CHECK (length(canonical_definition) > 0),
+			CHECK (length(program_fingerprint) > 0)
+		)`,
+		`CREATE TABLE IF NOT EXISTS statechart_actor (
+			actor_id    TEXT      PRIMARY KEY,
+			chart_id    TEXT      NOT NULL,
+			revision    TEXT      NOT NULL,
+			session_id  TEXT      NOT NULL UNIQUE,
+			durable     INTEGER   NOT NULL CHECK (durable = 1),
+			lifecycle   TEXT      NOT NULL CHECK (lifecycle IN ('active', 'terminal')),
+			started_at  TIMESTAMP NOT NULL,
+			terminal_at TIMESTAMP,
+			CHECK ((lifecycle = 'active' AND terminal_at IS NULL) OR (lifecycle = 'terminal' AND terminal_at IS NOT NULL))
+		)`,
+		`CREATE INDEX IF NOT EXISTS statechart_actor_active_revision ON statechart_actor(revision) WHERE lifecycle = 'active'`,
 		`CREATE TABLE IF NOT EXISTS statechart_log (
 			session_id        TEXT    NOT NULL,
 			seq               INTEGER NOT NULL,

@@ -1,5 +1,6 @@
-// Package sqllog provides a database/sql-backed implementation of
-// statecharts.Log and statecharts.SnapshotStore. It lives in its own
+// Package sqllog provides database/sql-backed durable statechart storage. It
+// implements the event log, snapshot cache, immutable definition store, and
+// durable actor revision-pin store. It lives in its own
 // package (rather than the statecharts root) so database/sql and whichever
 // driver a caller registers are not forced dependencies of core library
 // users.
@@ -17,8 +18,8 @@ import (
 	"github.com/dhamidi/statecharts"
 )
 
-// Storage implements statecharts.Log and statecharts.SnapshotStore against a
-// single *sql.DB.
+// Storage implements statecharts durable storage contracts against one
+// *sql.DB.
 type Storage struct {
 	db      *sql.DB
 	dialect Dialect
@@ -43,7 +44,7 @@ func New(db *sql.DB, dialect Dialect) (*Storage, error) {
 	return &Storage{db: db, dialect: dialect}, nil
 }
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 func initializeSchema(db *sql.DB, dialect Dialect) (err error) {
 	statements, err := ddlFor(dialect)
@@ -116,6 +117,9 @@ func schemaTables(ctx context.Context, tx *sql.Tx, query string) (map[string]boo
 
 func validateSchema(ctx context.Context, tx *sql.Tx) error {
 	queries := []string{
+		`SELECT revision,revision_envelope_version,chart_id,datamodel,canonical_definition,program_fingerprint FROM statechart_definition WHERE 1=0`,
+		`SELECT actor_id,chart_id,revision,session_id,durable,lifecycle,started_at,terminal_at FROM statechart_actor WHERE 1=0`,
+		`SELECT revision FROM statechart_actor INDEXED BY statechart_actor_active_revision WHERE lifecycle='active' AND 1=0`,
 		`SELECT session_id,seq,kind,ts,entry_send_id,entry_target,entry_type,event_name,event_type,event_send_id,event_origin,event_origin_type,event_invoke_id,delivery_id,value_data FROM statechart_log WHERE 1=0`,
 		`SELECT session_id,seq,snapshot_json FROM statechart_snapshot WHERE 1=0`,
 		`SELECT session_id,delivery_id FROM statechart_inbound WHERE 1=0`,
