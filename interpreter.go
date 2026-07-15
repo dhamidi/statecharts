@@ -34,6 +34,7 @@ type interpretation struct {
 	completed         bool
 	lastEvent         Event
 	hasLastEvent      bool
+	initializedData   map[*compiledState]bool
 
 	ioProcessorsByType map[Identifier]IOProcessor
 	ioProcessorOrder   []Identifier
@@ -105,6 +106,7 @@ func newInterpretation(chart *Chart, datamodel any) *interpretation {
 		statesToInvoke:     map[*compiledState]bool{},
 		activeInvokes:      map[*compiledState][]*runningInvoke{},
 		invokesByID:        map[Identifier]*runningInvoke{},
+		initializedData:    map[*compiledState]bool{},
 		startInvoke:        noopInvokeRunner,
 	}
 }
@@ -494,18 +496,182 @@ func (ip *interpretation) runActions(actions actionBlock) {
 
 func (ip *interpretation) runActionsWithContext(actions actionBlock, ec ExecContext) {
 	for _, a := range actions {
-		if !a.useModel && a.callback == nil {
-			continue
-		}
-		var err error
-		if a.useModel {
-			err = ip.executeModel(ec, a.model)
-		} else {
-			err = callAction(a.callback, ec)
-		}
-		if err != nil {
+		if err := ip.executeAction(ec, a); err != nil {
 			ip.reportError(err)
 			break
+		}
+	}
+}
+
+func (ip *interpretation) executeAction(ec ExecContext, action compiledAction) error {
+	if action.op != nil {
+		return ip.executeOperation(ec, action.op)
+	}
+	if action.useModel {
+		return ip.executeModel(ec, action.model)
+	}
+	if action.callback != nil {
+		return callAction(action.callback, ec)
+	}
+	return nil
+}
+
+func valueString(v Value, field string) (string, error) {
+	s, ok := v.AsString()
+	if !ok {
+		return "", fmt.Errorf("statecharts: %s expression returned %s, want string", field, v.Kind())
+	}
+	return s, nil
+}
+func (ip *interpretation) evalString(ec ExecContext, h CompiledExpression, fallback, field string) (string, error) {
+	if h == nil {
+		return fallback, nil
+	}
+	v, e := ip.evaluateModelValue(ec, h)
+	if e != nil {
+		return "", e
+	}
+	return valueString(v, field)
+}
+func (ip *interpretation) evaluatePayload(ec ExecContext, p *compiledPayload) (Value, error) {
+	if p == nil || (!p.hasContent && len(p.params) == 0) {
+		return NullValue(), nil
+	}
+	if p.hasContent {
+		return ip.evaluateModelValue(ec, p.content)
+	}
+	m := map[string]Value{}
+	for _, x := range p.params {
+		v, e := ip.evaluateModelValue(ec, x.expression)
+		if e != nil {
+			return Value{}, e
+		}
+		m[string(x.name)] = v
+	}
+	return MapValue(m)
+}
+func (ip *interpretation) runNested(ec ExecContext, blocks []actionBlock) {
+	for _, block := range blocks {
+		ip.runActionsWithContext(block, ec)
+	}
+}
+func (ip *interpretation) executeOperation(ec ExecContext, o *compiledOperation) error {
+	switch o.kind {
+	case ExecutableScript, ExecutableCall:
+		return ip.executeModel(ec, o.expressions[0])
+	case ExecutableAssign:
+		v, e := ip.evaluateModelValue(ec, o.expressions[1])
+		if e != nil {
+			return e
+		}
+		return ip.assignModel(ec, o.expressions[0], v)
+	case ExecutableRaise:
+		n, e := ip.evalString(ec, o.expressions[0], o.static[0], "raise event")
+		if e != nil {
+			return e
+		}
+		var d Value
+		if o.expressions[1] != nil {
+			d, e = ip.evaluateModelValue(ec, o.expressions[1])
+			if e != nil {
+				return e
+			}
+		}
+		ip.enqueueInternal(Event{Name: Identifier(n), Type: EventInternal, Data: d})
+		return nil
+	case ExecutableCancel:
+		n, e := ip.evalString(ec, o.expressions[0], o.static[0], "cancel send ID")
+		if e != nil {
+			return e
+		}
+		ip.doCancel(Identifier(n))
+		return nil
+	case ExecutableLog:
+		l, e := ip.evalString(ec, o.expressions[0], o.static[0], "log label")
+		if e != nil {
+			return e
+		}
+		d := NullValue()
+		if o.expressions[1] != nil {
+			d, e = ip.evaluateModelValue(ec, o.expressions[1])
+			if e != nil {
+				return e
+			}
+		}
+		ip.doLog(l, d)
+		return nil
+	case ExecutableChoose:
+		for i, h := range o.expressions {
+			ok, e := ip.evaluateModelBoolean(ec, h)
+			if e != nil {
+				return e
+			}
+			if ok {
+				ip.runNested(ec, o.blocks[i])
+				return nil
+			}
+		}
+		ip.runNested(ec, o.blocks[len(o.blocks)-1])
+		return nil
+	case ExecutableForEach:
+		return ip.forEachModel(ec, o.expressions[0], o.bindings, func() error {
+			ip.runNested(ec, o.blocks[0])
+			return nil
+		})
+	case ExecutableSend:
+		n, e := ip.evalString(ec, o.expressions[0], o.static[0], "send event")
+		if e != nil {
+			return e
+		}
+		target, e := ip.evalString(ec, o.expressions[1], o.static[1], "send target")
+		if e != nil {
+			return e
+		}
+		typ, e := ip.evalString(ec, o.expressions[2], o.static[2], "send type")
+		if e != nil {
+			return e
+		}
+		delay := o.delay
+		if o.expressions[4] != nil {
+			s, e := ip.evalString(ec, o.expressions[4], "", "send delay")
+			if e != nil {
+				return e
+			}
+			delay, e = time.ParseDuration(s)
+			if e != nil {
+				return e
+			}
+		}
+		data, e := ip.evaluatePayload(ec, o.payload)
+		if e != nil {
+			return e
+		}
+		opts := SendOptions{SendID: Identifier(o.static[3]), Target: Identifier(target), Type: Identifier(typ), Delay: delay, Data: data}
+		if o.expressions[3] != nil {
+			opts.IDLocation = func(cx ExecContext, id Identifier) error {
+				return ip.assignModel(cx, o.expressions[3], stringValue(string(id)))
+			}
+		}
+		ip.doSend(Identifier(n), opts)
+		return nil
+	}
+	return fmt.Errorf("statecharts: unsupported compiled operation %q", o.kind)
+}
+func stringValue(s string) Value { v, _ := StringValue(s); return v }
+
+func (ip *interpretation) initializeData(ds []compiledData) {
+	ec := ip.execContext()
+	for _, d := range ds {
+		v := NullValue()
+		var e error
+		if d.hasInitializer {
+			v, e = ip.evaluateModelValue(ec, d.initializer)
+		}
+		if e == nil {
+			e = ip.assignModel(ec, d.location, v)
+		}
+		if e != nil {
+			ip.reportError(e)
 		}
 	}
 }
@@ -559,6 +725,14 @@ func (ip *interpretation) evaluateDone(done DoneDataFunc) (data Value) {
 }
 
 func (ip *interpretation) evaluateStateDone(state *compiledState) Value {
+	if state.modelPayload != nil {
+		v, err := ip.evaluatePayload(ip.execContext(), state.modelPayload)
+		if err != nil {
+			ip.reportError(err)
+			return Value{}
+		}
+		return v
+	}
 	if !state.hasModelDone {
 		return ip.evaluateDone(state.done)
 	}
@@ -865,6 +1039,10 @@ func (ip *interpretation) isInFinalState(s *compiledState) bool {
 
 func (ip *interpretation) enterState(s *compiledState, defaults []actionBlock) {
 	ip.configuration[s] = true
+	if len(s.data) > 0 && !ip.initializedData[s] {
+		ip.initializeData(s.data)
+		ip.initializedData[s] = true
+	}
 	ip.runActionBlocks(s.onEntry)
 	ip.runActionBlocks(defaults)
 
@@ -1319,6 +1497,15 @@ func (ip *interpretation) runToStable() {
 // start enters the chart's initial configuration and runs to the first
 // stable point (interpret(), minus datamodel/global-script concerns).
 func (ip *interpretation) start() {
+	ip.initializeData(ip.chart.data)
+	if ip.chart.dataBinding == DataBindingEarly {
+		for _, state := range ip.chart.order {
+			if len(state.data) > 0 {
+				ip.initializeData(state.data)
+				ip.initializedData[state] = true
+			}
+		}
+	}
 	entrySet := map[*compiledState]bool{}
 	forDefault := map[*compiledState][]actionBlock{}
 	root := ip.chart.root

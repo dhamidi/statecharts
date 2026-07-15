@@ -34,6 +34,7 @@ type Snapshot struct {
 	DeliveryNamespace string
 	PendingSends      []PendingSend
 	ActiveInvokes     []ActiveInvoke
+	InitializedData   []Identifier
 }
 
 // PendingSend describes one delayed <send> that has not yet fired or been
@@ -62,7 +63,7 @@ type Checkpoint struct {
 	Seq      uint64
 }
 
-const snapshotVersion = 4
+const snapshotVersion = 5
 
 // Snapshot captures this Instance's current state (safely, by running on
 // the interpreter's own goroutine), suitable for persisting and later
@@ -114,6 +115,11 @@ func (in *Instance) buildSnapshot() (Snapshot, error) {
 			ids[i] = s.id
 		}
 		snap.HistoryValue[hs.id] = ids
+	}
+	for _, s := range ip.chart.order {
+		if ip.initializedData[s] {
+			snap.InitializedData = append(snap.InitializedData, s.id)
+		}
 	}
 	pending := make([]*pendingSendRecord, 0, len(ip.pending))
 	for rec := range ip.pending {
@@ -277,6 +283,14 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 	}
 
 	ip.configuration = configuration
+	ip.initializedData = map[*compiledState]bool{}
+	for _, id := range snap.InitializedData {
+		s, ok := chart.byID[id]
+		if !ok {
+			return fmt.Errorf("statecharts: restore: chart has no initialized state %q", id)
+		}
+		ip.initializedData[s] = true
+	}
 	ip.historyValue = historyValue
 	ip.internalQueue = cloneEvents(snap.InternalQueue)
 	ip.externalQueue = cloneEvents(snap.ExternalQueue)
@@ -362,6 +376,7 @@ type snapshotWire struct {
 	DeliveryNamespace string                      `json:"delivery_namespace,omitempty"`
 	PendingSends      []pendingSendWire           `json:"pending_sends,omitempty"`
 	ActiveInvokes     []ActiveInvoke              `json:"active_invokes,omitempty"`
+	InitializedData   []Identifier                `json:"initialized_data,omitempty"`
 }
 
 type pendingSendWire struct {
@@ -387,6 +402,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 		DispatchSeq:       s.DispatchSeq,
 		DeliveryNamespace: s.DeliveryNamespace,
 		ActiveInvokes:     s.ActiveInvokes,
+		InitializedData:   s.InitializedData,
 	}
 	for _, ev := range s.InternalQueue {
 		enc, err := EncodeEvent(ev)
@@ -432,6 +448,7 @@ func (s *Snapshot) UnmarshalJSON(b []byte) error {
 	s.DispatchSeq = wire.DispatchSeq
 	s.DeliveryNamespace = wire.DeliveryNamespace
 	s.ActiveInvokes = wire.ActiveInvokes
+	s.InitializedData = wire.InitializedData
 
 	s.InternalQueue = nil
 	for _, enc := range wire.InternalQueue {

@@ -1,6 +1,9 @@
 package statecharts
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // ExecContext is passed to every ActionFunc, CondFunc, and DoneDataFunc. It
 // exposes the SCXML datamodel touchpoints (_event, the In() predicate) that
@@ -163,6 +166,32 @@ type compiledAction struct {
 	callback ActionFunc
 	model    CompiledExpression
 	useModel bool
+	op       *compiledOperation
+}
+
+type compiledOperation struct {
+	kind        ExecutableKind
+	expressions []CompiledExpression
+	static      []string
+	blocks      [][]actionBlock
+	bindings    IterationBindings
+	payload     *compiledPayload
+	delay       time.Duration
+}
+
+type compiledPayload struct {
+	params     []compiledParam
+	content    CompiledExpression
+	hasContent bool
+}
+type compiledParam struct {
+	name       Identifier
+	expression CompiledExpression
+}
+type compiledData struct {
+	location       CompiledExpression
+	initializer    CompiledExpression
+	hasInitializer bool
 }
 
 // actionBlock is one statechart block of executable content. An error skips

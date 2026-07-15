@@ -14,6 +14,19 @@ type Chart struct {
 	newDatamodel func() any
 	program      DatamodelProgram
 	version      string
+	definition   *Definition
+	data         []compiledData
+	dataBinding  DataBinding
+}
+
+// Definition returns an independently editable copy of the normalized
+// definition used to compile c. Callback-built charts have no definition.
+func (c *Chart) Definition() *Definition {
+	if c.definition == nil {
+		return nil
+	}
+	d := c.definition.Clone()
+	return &d
 }
 
 // BuildOption configures a Chart being built by Build.
@@ -95,6 +108,8 @@ type compiledState struct {
 	done         DoneDataFunc
 	modelDone    CompiledExpression
 	hasModelDone bool
+	modelPayload *compiledPayload
+	data         []compiledData
 	docOrder     int
 }
 
