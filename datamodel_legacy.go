@@ -15,6 +15,18 @@ type legacyDatamodelProgram struct {
 
 func (*legacyDatamodelProgram) Fingerprint() []byte { return []byte("legacy-go-json/v1") }
 
+func (*legacyDatamodelProgram) ResolveExpression(Expression) (CompiledExpression, error) {
+	return nil, fmt.Errorf("statecharts: legacy datamodel does not compile expressions")
+}
+
+func (*legacyDatamodelProgram) ResolveFunction(FunctionRef) (CompiledExpression, error) {
+	return nil, fmt.Errorf("statecharts: legacy datamodel does not compile function references")
+}
+
+func (*legacyDatamodelProgram) ResolveDataLocation(Identifier) (CompiledExpression, error) {
+	return nil, fmt.Errorf("statecharts: legacy datamodel does not compile data locations")
+}
+
 func (p *legacyDatamodelProgram) NewSession(SessionOptions) (DatamodelSession, error) {
 	if p == nil || p.factory == nil {
 		return nil, fmt.Errorf("statecharts: legacy chart has no datamodel factory")

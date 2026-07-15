@@ -34,6 +34,22 @@ type recordingProgram struct {
 
 func (p *recordingProgram) Fingerprint() []byte { return []byte("recording/v1") }
 
+func (*recordingProgram) ResolveExpression(expression Expression) (CompiledExpression, error) {
+	value, ok := expression.Data.AsString()
+	if !ok {
+		return nil, fmt.Errorf("recording expression is not a string")
+	}
+	return value, nil
+}
+
+func (*recordingProgram) ResolveFunction(function FunctionRef) (CompiledExpression, error) {
+	return string(function.Name), nil
+}
+
+func (*recordingProgram) ResolveDataLocation(id Identifier) (CompiledExpression, error) {
+	return string(id), nil
+}
+
 func (p *recordingProgram) NewSession(SessionOptions) (DatamodelSession, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -21,6 +21,18 @@ type actorTestDatamodelProgram struct {
 
 func (p actorTestDatamodelProgram) Fingerprint() []byte { return []byte("actor-test/v1") }
 
+func (actorTestDatamodelProgram) ResolveExpression(statecharts.Expression) (statecharts.CompiledExpression, error) {
+	return nil, errors.New("actor test program has no expressions")
+}
+
+func (actorTestDatamodelProgram) ResolveFunction(statecharts.FunctionRef) (statecharts.CompiledExpression, error) {
+	return nil, errors.New("actor test program has no function references")
+}
+
+func (actorTestDatamodelProgram) ResolveDataLocation(statecharts.Identifier) (statecharts.CompiledExpression, error) {
+	return nil, errors.New("actor test program has no data locations")
+}
+
 func (p actorTestDatamodelProgram) NewSession(statecharts.SessionOptions) (statecharts.DatamodelSession, error) {
 	p.created <- struct{}{}
 	return actorTestDatamodelSession{}, nil

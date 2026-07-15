@@ -14,6 +14,16 @@ type DatamodelProgram interface {
 	// Fingerprint returns deterministic implementation identity used as chart
 	// revision material. Callers must treat the returned bytes as immutable.
 	Fingerprint() []byte
+	// ResolveExpression returns the immutable handle compiled for expression.
+	// It rejects expressions that were not part of the compiled Definition.
+	ResolveExpression(Expression) (CompiledExpression, error)
+	// ResolveFunction returns the immutable executable handle compiled for a
+	// named host-function reference in the Definition.
+	ResolveFunction(FunctionRef) (CompiledExpression, error)
+	// ResolveDataLocation returns an assignable handle for a declared data ID.
+	// This lets the syntax-neutral chart compiler implement ordered early and
+	// late initialization and foreach bindings without knowing the model.
+	ResolveDataLocation(Identifier) (CompiledExpression, error)
 	// NewSession creates fresh mutable model state owned by one Instance.
 	NewSession(SessionOptions) (DatamodelSession, error)
 }
