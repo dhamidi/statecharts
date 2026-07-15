@@ -29,16 +29,18 @@ func Compile(definition Definition, model Datamodel) (*Chart, error) {
 	if len(fingerprint) == 0 {
 		return nil, fmt.Errorf("statecharts: datamodel %q returned an empty program fingerprint", model.Name())
 	}
-	revision, err := deriveRevision(d, model.Name(), fingerprint)
+	canonical, err := d.CanonicalBytes()
 	if err != nil {
-		return nil, fmt.Errorf("statecharts: derive chart revision: %w", err)
+		return nil, fmt.Errorf("statecharts: canonicalize chart definition: %w", err)
 	}
+	revision := deriveRevisionFromCanonical(canonical, model.Name(), fingerprint)
 	globalData, err := compileData(d.Data, program, "definition.data")
 	if err != nil {
 		return nil, err
 	}
 	c := &Chart{
 		byID: map[Identifier]*compiledState{}, name: d.Name, program: program,
+		programFingerprint: append([]byte(nil), fingerprint...), canonicalDefinition: append([]byte(nil), canonical...),
 		revision: revision, definition: d, data: globalData, dataBinding: d.DataBinding,
 		invokesByDefinitionID: map[Identifier]*compiledInvoke{},
 	}

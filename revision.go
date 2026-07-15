@@ -21,17 +21,13 @@ const (
 // Version 1 IDs are "sha256:" followed by 64 lowercase hexadecimal digits.
 type RevisionID string
 
-// deriveRevision hashes a versioned, length-prefixed envelope containing the
-// canonical Definition bytes, datamodel name, and deterministic program
-// fingerprint. Canonical definition bytes already contain the explicit
+// deriveRevisionFromCanonical hashes a versioned, length-prefixed envelope
+// containing the canonical Definition bytes, datamodel name, and deterministic
+// program fingerprint. Canonical definition bytes already contain the explicit
 // revision salt and every model expression/function reference, including Go
 // host-function names and versions. Runtime pointers, registration order,
 // clocks, process IDs, and compiled engine artifacts are therefore excluded.
-func deriveRevision(definition Definition, datamodel Identifier, fingerprint []byte) (RevisionID, error) {
-	canonical, err := definition.CanonicalBytes()
-	if err != nil {
-		return "", err
-	}
+func deriveRevisionFromCanonical(canonical []byte, datamodel Identifier, fingerprint []byte) RevisionID {
 	digest := sha256.New()
 	_, _ = digest.Write([]byte(RevisionEnvelopeMagic))
 	var version [4]byte
@@ -40,7 +36,7 @@ func deriveRevision(definition Definition, datamodel Identifier, fingerprint []b
 	writeRevisionField(digest, canonical)
 	writeRevisionField(digest, []byte(datamodel))
 	writeRevisionField(digest, fingerprint)
-	return RevisionID("sha256:" + hex.EncodeToString(digest.Sum(nil))), nil
+	return RevisionID("sha256:" + hex.EncodeToString(digest.Sum(nil)))
 }
 
 func writeRevisionField(destination hash.Hash, value []byte) {

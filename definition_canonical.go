@@ -1,8 +1,11 @@
 package statecharts
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"io"
 )
 
 const (
@@ -35,4 +38,42 @@ func (d Definition) CanonicalBytes() ([]byte, error) {
 	binary.BigEndian.PutUint32(result[len(DefinitionCanonicalMagic):], DefinitionCanonicalVersion)
 	copy(result[len(DefinitionCanonicalMagic)+4:], body)
 	return result, nil
+}
+
+func decodeCanonicalDefinition(data []byte) (Definition, error) {
+	headerSize := len(DefinitionCanonicalMagic) + 4
+	if len(data) < headerSize {
+		return Definition{}, fmt.Errorf("canonical definition is truncated")
+	}
+	if !bytes.Equal(data[:len(DefinitionCanonicalMagic)], []byte(DefinitionCanonicalMagic)) {
+		return Definition{}, fmt.Errorf("canonical definition has invalid magic")
+	}
+	version := binary.BigEndian.Uint32(data[len(DefinitionCanonicalMagic):headerSize])
+	if version != DefinitionCanonicalVersion {
+		return Definition{}, fmt.Errorf("canonical definition version %d is unsupported (want %d)", version, DefinitionCanonicalVersion)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data[headerSize:]))
+	decoder.DisallowUnknownFields()
+	var definition Definition
+	if err := decoder.Decode(&definition); err != nil {
+		return Definition{}, fmt.Errorf("decode canonical definition: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return Definition{}, fmt.Errorf("decode canonical definition: trailing JSON value")
+		}
+		return Definition{}, fmt.Errorf("decode canonical definition: trailing data: %w", err)
+	}
+	normalized, err := normalizeDefinition(definition)
+	if err != nil {
+		return Definition{}, err
+	}
+	canonical, err := normalized.CanonicalBytes()
+	if err != nil {
+		return Definition{}, err
+	}
+	if !bytes.Equal(canonical, data) {
+		return Definition{}, fmt.Errorf("definition bytes are not canonical")
+	}
+	return normalized, nil
 }

@@ -16,6 +16,9 @@
 // Compile derives Chart.Revision from a versioned canonical definition,
 // datamodel identity, and deterministic program fingerprint; snapshots and
 // durable outbound identities are scoped to that revision.
+// Chart.DefinitionArtifact, DefinitionStore, and ActorStore provide the
+// durable definition and actor-revision-pin contracts needed to resolve that
+// exact revision after process restart.
 // Other datamodels can implement Datamodel, DatamodelProgram, and
 // DatamodelSession without changing the interpreter.
 //

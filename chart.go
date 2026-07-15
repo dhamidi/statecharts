@@ -12,6 +12,8 @@ type Chart struct {
 	byID                  map[Identifier]*compiledState
 	order                 []*compiledState // document order (pre-order traversal of the state tree)
 	program               DatamodelProgram
+	programFingerprint    []byte
+	canonicalDefinition   []byte
 	revision              RevisionID
 	definition            Definition
 	data                  []compiledData
@@ -22,6 +24,20 @@ type Chart struct {
 // Definition returns an independently editable copy of the normalized
 // definition used to compile c.
 func (c *Chart) Definition() Definition { return c.definition.Clone() }
+
+// DefinitionArtifact returns an immutable-storage representation of c that
+// can be recompiled after a process restart. Returned byte slices are owned by
+// the caller.
+func (c *Chart) DefinitionArtifact() DefinitionArtifact {
+	return DefinitionArtifact{
+		Revision:                c.revision,
+		RevisionEnvelopeVersion: RevisionEnvelopeVersion,
+		ChartID:                 c.definition.ID,
+		Datamodel:               c.definition.Datamodel,
+		CanonicalDefinition:     append([]byte(nil), c.canonicalDefinition...),
+		ProgramFingerprint:      append([]byte(nil), c.programFingerprint...),
+	}
+}
 
 // BuildOption configures the mutable Definition assembled by Build before it
 // is validated and compiled. Options must store only definition data.

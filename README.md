@@ -357,6 +357,15 @@ the optional `WithRevisionSalt` value. Runtime pointers, registry insertion
 order, clocks, process IDs, and compiled engine artifacts are excluded. A
 datamodel must return a stable, non-empty `DatamodelProgram.Fingerprint`.
 
+`Chart.DefinitionArtifact()` packages the canonical definition, chart and
+datamodel identities, program fingerprint, envelope version, and revision
+integrity needed to recompile that exact revision after restart. The
+`DefinitionStore` and `ActorStore` contracts define immutable artifact storage,
+atomic durable actor pin plus session-start creation, terminal pin release,
+and atomic reference-checked deletion without exposing database concepts.
+`storagetest.Run` is a reusable conformance suite; `storagetest.MemoryStore`
+provides the same complete durable boundary for tests.
+
 `Chart.Rehydrate` reconstructs a session from its `Log`, optionally using a
 compatible snapshot to skip old entries. Replay suppresses real outbound
 effects, then reconciles durable outbound intents and active invocations when
