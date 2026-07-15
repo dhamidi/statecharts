@@ -33,7 +33,7 @@ type fanoutModel struct {
 	Subscribers map[protocol.ConversationID][]protocol.ConnectionID
 }
 
-var subscribeConnection = statecharts.Action(func(d *fanoutModel, ec statecharts.ExecContext) error {
+func subscribeConnection(d *fanoutModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	sub, ok := decodeFanoutSubscribe(ev.Data)
 	if !ok {
@@ -46,9 +46,9 @@ var subscribeConnection = statecharts.Action(func(d *fanoutModel, ec statecharts
 	}
 	d.Subscribers[sub.ConversationID] = append(d.Subscribers[sub.ConversationID], sub.Connection)
 	return nil
-})
+}
 
-var unsubscribeConnection = statecharts.Action(func(d *fanoutModel, ec statecharts.ExecContext) error {
+func unsubscribeConnection(d *fanoutModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	sub, ok := decodeFanoutSubscribe(ev.Data)
 	if !ok {
@@ -62,9 +62,9 @@ var unsubscribeConnection = statecharts.Action(func(d *fanoutModel, ec statechar
 		}
 	}
 	return nil
-})
+}
 
-var forwardBroadcast = statecharts.Action(func(d *fanoutModel, ec statecharts.ExecContext) error {
+func forwardBroadcast(d *fanoutModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	bc, ok := decodeFanoutBroadcast(ev.Data)
 	if !ok {
@@ -76,7 +76,7 @@ var forwardBroadcast = statecharts.Action(func(d *fanoutModel, ec statecharts.Ex
 		ec.Send("fanout_frame", statecharts.SendOptions{Target: statecharts.Identifier(conn), Data: encodeFanoutBroadcast(bc)})
 	}
 	return nil
-})
+}
 
 // FanoutKind is the chart kind name the singleton "fanout" actor is
 // Registered and Spawned under.
@@ -87,13 +87,29 @@ const FanoutKind statecharts.Identifier = "fanout"
 // every current subscriber of that conversation, verbatim -- it has no
 // idea tools exist, or what "message" vs "delta" even means beyond routing.
 func BuildFanoutChart() (*statecharts.Chart, error) {
-	return statecharts.Build(
+	model := statecharts.NewGoModel(func() *fanoutModel {
+		return &fanoutModel{Subscribers: map[protocol.ConversationID][]protocol.ConnectionID{}}
+	})
+	action := func(operation string, fn statecharts.GoAction[fanoutModel]) (statecharts.GoActionRef, error) {
+		return model.Action(statecharts.Identifier("ai-agent.server.fanout."+operation), "v1", fn)
+	}
+	subscribe, err := action("subscribe-connection", subscribeConnection)
+	if err != nil {
+		return nil, err
+	}
+	unsubscribe, err := action("unsubscribe-connection", unsubscribeConnection)
+	if err != nil {
+		return nil, err
+	}
+	forward, err := action("forward-broadcast", forwardBroadcast)
+	if err != nil {
+		return nil, err
+	}
+	return buildCanonicalChart(
 		statecharts.Atomic("fanout",
-			statecharts.On("subscribe", statecharts.Then(subscribeConnection)),
-			statecharts.On("unsubscribe", statecharts.Then(unsubscribeConnection)),
-			statecharts.On("broadcast", statecharts.Then(forwardBroadcast)),
+			statecharts.On("subscribe", statecharts.Then(subscribe.Do())),
+			statecharts.On("unsubscribe", statecharts.Then(unsubscribe.Do())),
+			statecharts.On("broadcast", statecharts.Then(forward.Do())),
 		),
-		statecharts.WithNewDatamodel(func() any {
-			return &fanoutModel{Subscribers: map[protocol.ConversationID][]protocol.ConnectionID{}}
-		}), statecharts.WithVersion("v1"))
+		model, statecharts.WithRevisionSalt("fanout-v1"))
 }

@@ -19,17 +19,17 @@ type userModel struct {
 	Conversations map[protocol.ConversationID]conversationSummary
 }
 
-func notAlreadyKnown(d *userModel, ec statecharts.ExecContext) bool {
+func notAlreadyKnown(d *userModel, ec statecharts.ExecContext, _ []statecharts.Value) (bool, error) {
 	ev, _ := ec.Event()
 	payload, ok := decodeRegister(ev.Data)
 	if !ok {
-		return false
+		return false, nil
 	}
 	_, known := d.Conversations[payload.ID]
-	return !known
+	return !known, nil
 }
 
-var addConversation = statecharts.Action(func(d *userModel, ec statecharts.ExecContext) error {
+func addConversation(d *userModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	payload, ok := decodeRegister(ev.Data)
 	if !ok {
@@ -37,19 +37,19 @@ var addConversation = statecharts.Action(func(d *userModel, ec statecharts.ExecC
 	}
 	d.Conversations[payload.ID] = conversationSummary{Title: payload.Title, State: protocol.ConversationIdle}
 	return nil
-})
+}
 
-func isKnownConversation(d *userModel, ec statecharts.ExecContext) bool {
+func isKnownConversation(d *userModel, ec statecharts.ExecContext, _ []statecharts.Value) (bool, error) {
 	ev, _ := ec.Event()
 	payload, ok := decodeConversationState(ev.Data)
 	if !ok {
-		return false
+		return false, nil
 	}
 	_, known := d.Conversations[payload.ID]
-	return known
+	return known, nil
 }
 
-var updateConversationState = statecharts.Action(func(d *userModel, ec statecharts.ExecContext) error {
+func updateConversationState(d *userModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	payload, ok := decodeConversationState(ev.Data)
 	if !ok {
@@ -59,7 +59,7 @@ var updateConversationState = statecharts.Action(func(d *userModel, ec statechar
 	summary.State = payload.State
 	d.Conversations[payload.ID] = summary
 	return nil
-})
+}
 
 func syncOne(ec statecharts.ExecContext, id protocol.ConversationID, summary conversationSummary) {
 	ec.Send("sync", statecharts.SendOptions{
@@ -73,7 +73,7 @@ func syncOne(ec statecharts.ExecContext, id protocol.ConversationID, summary con
 // actors are live. Not JSON-wrapped -- "directory" is non-durable, never
 // logged; during UserActor's own replay after a restart this Send is
 // correctly suppressed like any other real dispatch (see replayGate).
-var forwardSync = statecharts.Action(func(d *userModel, ec statecharts.ExecContext) error {
+func forwardSync(d *userModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	var id protocol.ConversationID
 	if payload, ok := decodeRegister(ev.Data); ok {
@@ -89,19 +89,19 @@ var forwardSync = statecharts.Action(func(d *userModel, ec statecharts.ExecConte
 	}
 	syncOne(ec, id, summary)
 	return nil
-})
+}
 
 // forwardSyncAll re-sends every known conversation to DirectoryActor, by
 // ordinary actor Send, exactly like forwardSync does for one -- used once,
 // at startup, to prime DirectoryActor's mirror from UserActor's own
 // already-rehydrated state (see cmd/ai-agent's startup wiring), rather than
 // DirectoryActor ever reading UserActor's Log directly.
-var forwardSyncAll = statecharts.Action(func(d *userModel, ec statecharts.ExecContext) error {
+func forwardSyncAll(d *userModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	for id, summary := range d.Conversations {
 		syncOne(ec, id, summary)
 	}
 	return nil
-})
+}
 
 // UserKind is the chart kind name the durable, singleton "user" actor is
 // Registered and Spawned under.
@@ -112,19 +112,50 @@ const UserKind statecharts.Identifier = "user"
 // last-known state, surviving a restart the same way any other durable
 // actor does.
 func BuildUserChart() (*statecharts.Chart, error) {
-	return statecharts.Build(
+	model := statecharts.NewGoModel(func() *userModel {
+		return &userModel{Conversations: map[protocol.ConversationID]conversationSummary{}}
+	})
+	condition := func(operation string, fn statecharts.GoCondition[userModel]) (statecharts.GoConditionRef, error) {
+		return model.Condition(statecharts.Identifier("ai-agent.server.user."+operation), "v1", fn)
+	}
+	action := func(operation string, fn statecharts.GoAction[userModel]) (statecharts.GoActionRef, error) {
+		return model.Action(statecharts.Identifier("ai-agent.server.user."+operation), "v1", fn)
+	}
+	notKnown, err := condition("not-already-known", notAlreadyKnown)
+	if err != nil {
+		return nil, err
+	}
+	known, err := condition("is-known-conversation", isKnownConversation)
+	if err != nil {
+		return nil, err
+	}
+	add, err := action("add-conversation", addConversation)
+	if err != nil {
+		return nil, err
+	}
+	update, err := action("update-conversation-state", updateConversationState)
+	if err != nil {
+		return nil, err
+	}
+	forward, err := action("forward-sync", forwardSync)
+	if err != nil {
+		return nil, err
+	}
+	forwardAll, err := action("forward-sync-all", forwardSyncAll)
+	if err != nil {
+		return nil, err
+	}
+	return buildCanonicalChart(
 		statecharts.Atomic("user",
 			statecharts.On("register",
-				statecharts.If(statecharts.Cond(notAlreadyKnown)),
-				statecharts.Then(addConversation, forwardSync),
+				statecharts.If(notKnown.If()),
+				statecharts.Then(add.Do(), forward.Do()),
 			),
 			statecharts.On("state_changed",
-				statecharts.If(statecharts.Cond(isKnownConversation)),
-				statecharts.Then(updateConversationState, forwardSync),
+				statecharts.If(known.If()),
+				statecharts.Then(update.Do(), forward.Do()),
 			),
-			statecharts.On("bootstrap_directory", statecharts.Then(forwardSyncAll)),
+			statecharts.On("bootstrap_directory", statecharts.Then(forwardAll.Do())),
 		),
-		statecharts.WithNewDatamodel(func() any {
-			return &userModel{Conversations: map[protocol.ConversationID]conversationSummary{}}
-		}), statecharts.WithVersion("v1"))
+		model, statecharts.WithRevisionSalt("user-v1"))
 }

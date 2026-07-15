@@ -21,6 +21,8 @@ type directoryLinkModel struct {
 	BackoffAttempt int
 }
 
+const directoryLinkInvokeType statecharts.Identifier = "ai-agent.client.directorylink.sse"
+
 // dialDirectoryEvents opens (or reopens, on reconnect) the server's single
 // GET /directory/events stream and delivers "directory_frame" for a "list"
 // event (the whole workspace, used once to (re)seed local state after every
@@ -97,15 +99,11 @@ func dialDirectoryEvents(ctx context.Context, params statecharts.Value, io state
 	return statecharts.NullValue(), fmt.Errorf("client: server closed the directory event stream")
 }
 
-func computeDirectoryInvokeParams(ec statecharts.ExecContext) statecharts.Value {
-	d, _ := ec.Datamodel().(*directoryLinkModel)
-	if d == nil {
-		return taggedMap(tagDirectoryParams, map[string]statecharts.Value{"server_addr": str("")})
-	}
-	return taggedMap(tagDirectoryParams, map[string]statecharts.Value{"server_addr": str(d.ServerAddr)})
+func computeDirectoryInvokeParams(d *directoryLinkModel, _ statecharts.ExecContext, _ []statecharts.Value) (statecharts.Value, error) {
+	return taggedMap(tagDirectoryParams, map[string]statecharts.Value{"server_addr": str(d.ServerAddr)}), nil
 }
 
-var forwardDirectorySnapshot = statecharts.Action(func(d *directoryLinkModel, ec statecharts.ExecContext) error {
+var forwardDirectorySnapshot = func(d *directoryLinkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	items, ok := decodeSummaries(ev.Data)
 	if !ok {
@@ -113,9 +111,9 @@ var forwardDirectorySnapshot = statecharts.Action(func(d *directoryLinkModel, ec
 	}
 	ec.Send("directory_snapshot", statecharts.SendOptions{Target: "ui", Data: summariesValue(items)})
 	return nil
-})
+}
 
-var forwardDirectoryUpsert = statecharts.Action(func(d *directoryLinkModel, ec statecharts.ExecContext) error {
+var forwardDirectoryUpsert = func(d *directoryLinkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	cs, ok := decodeSummary(ev.Data)
 	if !ok {
@@ -123,18 +121,18 @@ var forwardDirectoryUpsert = statecharts.Action(func(d *directoryLinkModel, ec s
 	}
 	ec.Send("directory_upsert", statecharts.SendOptions{Target: "ui", Data: summaryValue(cs)})
 	return nil
-})
+}
 
-var resetDirectoryBackoff = statecharts.Action(func(d *directoryLinkModel, ec statecharts.ExecContext) error {
+var resetDirectoryBackoff = func(d *directoryLinkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	d.BackoffAttempt = 0
 	return nil
-})
+}
 
-var scheduleDirectoryReconnect = statecharts.Action(func(d *directoryLinkModel, ec statecharts.ExecContext) error {
+var scheduleDirectoryReconnect = func(d *directoryLinkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Send("reconnect_timer", statecharts.SendOptions{Delay: backoffDelay(d.BackoffAttempt)})
 	d.BackoffAttempt++
 	return nil
-})
+}
 
 // DirectoryLinkKind is the chart kind name the client's singleton
 // "directorylink" actor is Registered and Spawned under.
@@ -149,21 +147,45 @@ const DirectoryLinkKind statecharts.Identifier = "directorylink"
 // switch: this connects the moment the client starts and stays connected
 // for its whole lifetime.
 func BuildDirectoryLinkChart(serverAddr string) (*statecharts.Chart, error) {
-	return statecharts.Build(
+	model := statecharts.NewGoModel(func() *directoryLinkModel { return &directoryLinkModel{ServerAddr: serverAddr} })
+	action := func(name string, fn statecharts.GoAction[directoryLinkModel]) (statecharts.GoActionRef, error) {
+		return model.Action(statecharts.Identifier("ai-agent.client.directorylink."+name), "v1", fn)
+	}
+	reset, err := action("reset-backoff", resetDirectoryBackoff)
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := action("forward-snapshot", forwardDirectorySnapshot)
+	if err != nil {
+		return nil, err
+	}
+	upsert, err := action("forward-upsert", forwardDirectoryUpsert)
+	if err != nil {
+		return nil, err
+	}
+	reconnect, err := action("schedule-reconnect", scheduleDirectoryReconnect)
+	if err != nil {
+		return nil, err
+	}
+	params, err := model.Value("ai-agent.client.directorylink.invoke-params", "v1", computeDirectoryInvokeParams)
+	if err != nil {
+		return nil, err
+	}
+	return buildCanonicalChart(
 		statecharts.Compound("directorylink", "connected",
 			statecharts.Children(
 				statecharts.Atomic("connected",
-					statecharts.Invoke(dialDirectoryEvents, statecharts.WithInvokeParams(computeDirectoryInvokeParams)),
-					statecharts.On("connected", statecharts.Then(resetDirectoryBackoff)),
-					statecharts.On("directory_frame", statecharts.Then(forwardDirectorySnapshot)),
-					statecharts.On("directory_upsert", statecharts.Then(forwardDirectoryUpsert)),
+					statecharts.Invoke(string(directoryLinkInvokeType), "directory-events", statecharts.WithInvokeContent(params.Get())),
+					statecharts.On("connected", statecharts.Then(reset.Do())),
+					statecharts.On("directory_frame", statecharts.Then(snapshot.Do())),
+					statecharts.On("directory_upsert", statecharts.Then(upsert.Do())),
 					statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("backoff")),
 				),
 				statecharts.Atomic("backoff",
-					statecharts.OnEntry(scheduleDirectoryReconnect),
+					statecharts.OnEntry(reconnect.Do()),
 					statecharts.On("reconnect_timer", statecharts.Target("connected")),
 				),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &directoryLinkModel{ServerAddr: serverAddr} }), statecharts.WithVersion("v1"))
+		model)
 }

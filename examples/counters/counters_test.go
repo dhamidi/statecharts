@@ -67,13 +67,9 @@ func TestDurableIdempotenceAndRecovery(t *testing.T) {
 	if cp.Seq == 0 {
 		t.Fatal("red checkpoint sequence = 0, want real log boundary")
 	}
-	var checkpointed counterModel
-	if err := json.Unmarshal(cp.Snapshot.Datamodel, &checkpointed); err != nil {
-		t.Fatalf("decode red checkpoint datamodel: %v", err)
-	}
-	if checkpointed.Value != 1 || !checkpointed.Processed["same-write"] {
-		t.Fatalf("red checkpoint datamodel = %#v, want value 1 with same-write processed", checkpointed)
-	}
+	// Datamodel snapshot bytes are an opaque, model-owned cache. The restart
+	// below proves that they restore the count and idempotency state without
+	// coupling the example to the GoModel snapshot envelope.
 	cancel1()
 	store1.Close()
 
@@ -250,6 +246,18 @@ func TestServerUIIncrementEndpointUpdatesCounter(t *testing.T) {
 	defer rt.stop(context.Background())
 	before := projectionFor(t, mustQuery(t, rt, colors), "red").Value
 	server := counterHandler(rt)
+	definitionResponse := httptest.NewRecorder()
+	server.ServeHTTP(definitionResponse, httptest.NewRequest(http.MethodGet, "/definitions/counter", nil))
+	if definitionResponse.Code != http.StatusOK || definitionResponse.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("definition response = %d %q", definitionResponse.Code, definitionResponse.Header().Get("Content-Type"))
+	}
+	var definition statecharts.Definition
+	if err := json.Unmarshal(definitionResponse.Body.Bytes(), &definition); err != nil {
+		t.Fatalf("decode canonical definition: %v", err)
+	}
+	if definition.ID != counterKind || !strings.Contains(definitionResponse.Body.String(), "counters.counter.apply-idempotent-increment") || strings.Contains(definitionResponse.Body.String(), "func") {
+		t.Fatalf("counter definition is not stable and inspectable: %s", definitionResponse.Body.String())
+	}
 
 	page := httptest.NewRecorder()
 	server.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))

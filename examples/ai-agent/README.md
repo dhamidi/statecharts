@@ -140,6 +140,18 @@ decides on its own when to call a tool.
 
 ## Why each actor is its own actor
 
+Every chart family owns a typed `GoModel[D]` registry. Actions, conditions,
+and value producers have stable `ai-agent.<side>.<family>.<operation>` names
+and explicit `v1` versions; chart definitions contain those references rather
+than closures. Each builder encodes its Go-built definition as JSON, decodes
+it, and recompiles it against the same registry before returning, so all normal
+tests and runtime behavior exercise the portable form.
+
+Network clients, HTTP servers, SSE channels, and reply channels are runtime
+capabilities, not model data. Handler factories own long-lived services, while
+instance-scoped request registries exchange canonical request IDs through
+events and resolve those IDs to channels outside snapshots.
+
 **Server** (`internal/server`):
 - `ConversationActor` (durable) -- one per conversation: `idle` /
   `thinking` / `awaiting_tool`, holding the full message history. Durable
@@ -148,10 +160,9 @@ decides on its own when to call a tool.
   multi-step lifecycle (thinking deltas, text deltas, then a result) and
   needs to deliver a variable, unbounded number of events to more than one
   place (live subscribers, and eventually the owning conversation) --
-  exactly what this codebase already means by "actor." `<invoke>` isn't
-  used for this because an invoke on a *durable* actor's state would
-  restart for real on every replay after a restart (see `Instance.startInvoke`);
-  spawning a dedicated, non-durable actor per turn sidesteps that entirely.
+  exactly what this codebase already means by "actor." Keeping provider work
+  in a dedicated ephemeral actor also keeps streaming transport lifecycle out
+  of the durable conversation's reducer and snapshot.
 - `LLMDispatchProcessor` (a `statecharts.IOProcessor`, installed via
   `actors.WithIOProcessor("llm", factory)`) -- the only way a chart action (which only ever
   gets an `ExecContext`, never a `*actors.System`) can spawn a new actor and
@@ -167,11 +178,11 @@ decides on its own when to call a tool.
   workspace: every conversation ever created, and its last-known state.
 - `DirectoryActor` (non-durable, singleton) -- a live mirror of
   `UserActor`'s conversation map, safe for `GET /conversations` to query
-  synchronously via a reply channel (a *durable* actor can't be queried
-  that way -- `system.deliver`'s write-ahead logging fails outright on a
-  channel-typed `Event.Data`). Primed at startup entirely by ordinary actor
-  `Send`s from `UserActor`'s own already-rehydrated state, never by reading
-  its Log directly. Also answers `GET /directory/events`: a long-lived SSE
+  through a canonical request ID whose reply channel stays in the server's
+  request registry, never in `Event.Data` or model state. Primed at startup
+  entirely by ordinary actor `Send`s from `UserActor`'s own already-rehydrated
+  state, never by reading its Log directly. Also answers
+  `GET /directory/events`: a long-lived SSE
   stream, one changed entry pushed per change (not the whole list
   re-serialized every time -- see the sidebar section above), so a client's
   own sidebar is push-driven rather than polled.
@@ -186,17 +197,16 @@ decides on its own when to call a tool.
   reconnecting with backoff, and switching conversations, each a real state
   the chart is in.
 - `DirectoryLinkActor` (singleton) -- structurally the same as `LinkActor`
-  (connect / reconnect-with-backoff over `<invoke>`), but for exactly one
+  (connect / reconnect-with-backoff over an invoked handler), but for exactly one
   thing: the server's single `GET /directory/events` stream, for this
   client process's whole lifetime, forwarding each changed entry to `ui` so
   the sidebar is push-driven. Its own connection is entirely independent of
   how many browser tabs are open, or which conversation any of them has
   selected.
-- `ToolActor` (singleton) -- runs one tool call at a time via `<invoke>`
-  (fine here: `ToolActor` is non-durable, so the replay-unsafety reason
-  `<invoke>` is avoided for server-side actors doesn't apply).
-- `UIServerActor` (singleton) -- the local browser UI, itself an `<invoke>`
-  running an HTTP server for as long as the actor is alive.
+- `ToolActor` (singleton) -- runs one tool call at a time through a declarative
+  invocation whose subprocess/HTTP capabilities come from its runtime handler.
+- `UIServerActor` (singleton) -- the local browser UI, with an invoked HTTP
+  server running for as long as the actor is alive.
 
 ## Known limitations
 

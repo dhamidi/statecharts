@@ -31,6 +31,14 @@ actors emit bytes through the custom `"sse"` IOProcessor type. HTTP handlers
 only attach and drain transport channels rather than reading shared actor
 state to manufacture updates.
 
+Every chart uses its own typed `GoModel[D]`. Application behavior is registered
+under explicit, versioned names and chart nodes contain only serializable
+references to those registrations; runtime transports, channels, callbacks,
+and log storage are not part of snapshot data. The running server also exposes
+the durable counter's current canonical definition as read-only JSON at
+`GET /definitions/counter`. This is inspection only; the example deliberately
+does not implement hot publication.
+
 Positional color names select the counters exercised by `writer` or observed
 by `reader`; omitting them selects all seven. The writer terminal shows
 per-color request rates, totals, retries, in-flight requests, and Unicode-block

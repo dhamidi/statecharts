@@ -44,7 +44,7 @@ type uiHTTP struct {
 // buildRunHTTPServer returns UIServerActor's own Invoke: a local HTTP
 // server on a random loopback port, printed to stdout, serving for as long
 // as "ui" is active.
-func buildRunHTTPServer(sys *actors.System, serverAddr string, requests *uiRequests) statecharts.InvokeFunc {
+func buildRunHTTPServer(sys *actors.System, serverAddr string, requests *uiRequests) statecharts.InvokeHandlerFactory {
 	h := &uiHTTP{sys: sys, serverAddr: serverAddr, requests: requests}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", h.handleIndex)
@@ -54,27 +54,29 @@ func buildRunHTTPServer(sys *actors.System, serverAddr string, requests *uiReque
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.Handle("GET /static/", http.FileServerFS(staticFiles))
 
-	return func(ctx context.Context, params statecharts.Value, io statecharts.InvokeIO) (statecharts.Value, error) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return statecharts.NullValue(), err
-		}
-		fmt.Printf("ai-agent UI: http://%s/\n", ln.Addr())
-
-		srv := &http.Server{Handler: mux}
-		errCh := make(chan error, 1)
-		go func() { errCh <- srv.Serve(ln) }()
-
-		select {
-		case <-ctx.Done():
-			_ = srv.Shutdown(context.Background())
-			return statecharts.NullValue(), nil
-		case err := <-errCh:
-			if err != nil && err != http.ErrServerClosed {
+	return func() statecharts.InvokeHandler {
+		return statecharts.InvokeHandlerFunc(func(ctx context.Context, _ statecharts.InvokeRequest, _ statecharts.InvokeIO) (statecharts.Value, error) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
 				return statecharts.NullValue(), err
 			}
-			return statecharts.NullValue(), nil
-		}
+			fmt.Printf("ai-agent UI: http://%s/\n", ln.Addr())
+
+			srv := &http.Server{Handler: mux}
+			errCh := make(chan error, 1)
+			go func() { errCh <- srv.Serve(ln) }()
+
+			select {
+			case <-ctx.Done():
+				_ = srv.Shutdown(context.Background())
+				return statecharts.NullValue(), nil
+			case err := <-errCh:
+				if err != nil && err != http.ErrServerClosed {
+					return statecharts.NullValue(), err
+				}
+				return statecharts.NullValue(), nil
+			}
+		})
 	}
 }
 

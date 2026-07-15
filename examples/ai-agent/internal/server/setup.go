@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/dhamidi/statecharts"
@@ -9,6 +10,31 @@ import (
 
 	"github.com/dhamidi/statecharts/examples/ai-agent/internal/llm"
 )
+
+// buildCanonicalChart follows the same transport path used by definition
+// inspection and deployment: build from Go, encode the canonical definition,
+// decode it, then recompile it against this chart family's scoped registry.
+// Callers therefore exercise the portable definition rather than the
+// in-memory builder result.
+func buildCanonicalChart(root statecharts.StateDefinition, model statecharts.Datamodel, opts ...statecharts.BuildOption) (*statecharts.Chart, error) {
+	chart, err := statecharts.Build(root, model, opts...)
+	if err != nil {
+		return nil, err
+	}
+	wire, err := json.Marshal(chart.Definition())
+	if err != nil {
+		return nil, fmt.Errorf("marshal canonical definition: %w", err)
+	}
+	var definition statecharts.Definition
+	if err := json.Unmarshal(wire, &definition); err != nil {
+		return nil, fmt.Errorf("unmarshal canonical definition: %w", err)
+	}
+	recompiled, err := statecharts.Compile(definition, model)
+	if err != nil {
+		return nil, fmt.Errorf("recompile canonical definition: %w", err)
+	}
+	return recompiled, nil
+}
 
 // NewSystem builds the actors.System every server-side actor lives in,
 // wiring LLMDispatchProcessor in as its explicit "llm" processor (see llmrequest.go's

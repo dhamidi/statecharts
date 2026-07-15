@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -72,6 +73,7 @@ type counterRuntime struct {
 	streams      *streamTransport
 	storage      *sqlite3.Storage
 	requests     *hubRequestRegistry
+	counterChart *statecharts.Chart
 }
 
 type hubRequest struct {
@@ -157,7 +159,7 @@ func setupCounters(ctx context.Context, store *sqlite3.Storage) (*counterRuntime
 			return fail(err)
 		}
 	}
-	rt := &counterRuntime{counters: counters, ui: ui, streams: transport, storage: store, requests: requests}
+	rt := &counterRuntime{counters: counters, ui: ui, streams: transport, storage: store, requests: requests, counterChart: chart}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		ps, e := rt.query(ctx, colors)
@@ -199,6 +201,14 @@ func counterHandler(rt *counterRuntime) http.Handler {
 	mux.HandleFunc("GET /", pageHandler(func() []projection { p, _ := rt.query(context.Background(), colors); return p }))
 	mux.HandleFunc("GET /datastar.js", datastarHandler)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	// This read-only endpoint demonstrates that the running chart exposes its
+	// canonical, portable definition independently of actor state.
+	mux.HandleFunc("GET /definitions/counter", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(rt.counterChart.Definition()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
 	mux.HandleFunc("GET /ui/events", rt.streamHandler("browser", func(*http.Request) ([]string, error) { return append([]string(nil), colors...), nil }))
 	mux.HandleFunc("GET /events", rt.streamHandler("terminal", eventStreamColors))
 	mux.HandleFunc("POST /counters/{color}/writes/{writeID}", func(w http.ResponseWriter, r *http.Request) {

@@ -55,8 +55,8 @@ type toolRegistryModel struct {
 	Leases map[protocol.ToolName]toolLease
 }
 
-func claimLease(clock statecharts.Clock) statecharts.ActionFunc {
-	return statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
+func claimLease(clock statecharts.Clock) statecharts.GoAction[toolRegistryModel] {
+	return func(d *toolRegistryModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		c, ok := decodeToolClaim(ev.Data)
 		if !ok {
@@ -73,10 +73,10 @@ func claimLease(clock statecharts.Clock) statecharts.ActionFunc {
 		}
 		d.Leases[c.Tool] = next
 		return nil
-	})
+	}
 }
 
-var releaseLease = statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
+var releaseLease statecharts.GoAction[toolRegistryModel] = func(d *toolRegistryModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	c, ok := decodeToolClaim(ev.Data)
 	if !ok {
@@ -86,7 +86,7 @@ var releaseLease = statecharts.Action(func(d *toolRegistryModel, ec statecharts.
 		delete(d.Leases, c.Tool)
 	}
 	return nil
-})
+}
 
 // offerToRegistry hands a pending call to whichever connection currently
 // holds the lease for its tool -- but only once per (tool, owner, CallID):
@@ -101,8 +101,8 @@ var releaseLease = statecharts.Action(func(d *toolRegistryModel, ec statecharts.
 // lease.DeliveredCallID distinguishes that ("already handed to the owner
 // that may be running it, don't resend") from "nobody has the lease yet, or
 // the owner changed" (worth (re)delivering).
-func offerToRegistry(clock statecharts.Clock) statecharts.ActionFunc {
-	return statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
+func offerToRegistry(clock statecharts.Clock) statecharts.GoAction[toolRegistryModel] {
+	return func(d *toolRegistryModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		offer, ok := decodeToolOffer(ev.Data)
 		if !ok {
@@ -124,11 +124,11 @@ func offerToRegistry(clock statecharts.Clock) statecharts.ActionFunc {
 			}),
 		})
 		return nil
-	})
+	}
 }
 
-func sweepExpiredLeases(clock statecharts.Clock) statecharts.ActionFunc {
-	return statecharts.Action(func(d *toolRegistryModel, ec statecharts.ExecContext) error {
+func sweepExpiredLeases(clock statecharts.Clock) statecharts.GoAction[toolRegistryModel] {
+	return func(d *toolRegistryModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		now := clock.Now()
 		for tool, lease := range d.Leases {
 			if now.After(lease.ExpiresAt) {
@@ -137,7 +137,7 @@ func sweepExpiredLeases(clock statecharts.Clock) statecharts.ActionFunc {
 		}
 		ec.Send("sweep", statecharts.SendOptions{Delay: sweepInterval})
 		return nil
-	})
+	}
 }
 
 // toolCallDelivery is "tool_call"'s payload -> a specific connection,
@@ -158,15 +158,31 @@ const ToolRegistryKind statecharts.Identifier = "toolregistry"
 // a name-keyed, leased, single-owner executor assignment per tool, with
 // TTL-based expiry so a hard client drop hands off automatically.
 func BuildToolRegistryChart(clock statecharts.Clock) (*statecharts.Chart, error) {
-	return statecharts.Build(
-		statecharts.Atomic("toolregistry",
-			statecharts.OnEntry(sweepExpiredLeases(clock)),
-			statecharts.On("claim", statecharts.Then(claimLease(clock))),
-			statecharts.On("release", statecharts.Then(releaseLease)),
-			statecharts.On("offer", statecharts.Then(offerToRegistry(clock))),
-			statecharts.On("sweep", statecharts.Then(sweepExpiredLeases(clock))),
-		),
-		statecharts.WithNewDatamodel(func() any {
-			return &toolRegistryModel{Leases: map[protocol.ToolName]toolLease{}}
-		}), statecharts.WithVersion("v1"))
+	model := statecharts.NewGoModel(func() *toolRegistryModel {
+		return &toolRegistryModel{Leases: map[protocol.ToolName]toolLease{}}
+	})
+	claim, err := model.Action("ai-agent.server.toolregistry.claim", "v1", claimLease(clock))
+	if err != nil {
+		return nil, err
+	}
+	release, err := model.Action("ai-agent.server.toolregistry.release", "v1", releaseLease)
+	if err != nil {
+		return nil, err
+	}
+	offer, err := model.Action("ai-agent.server.toolregistry.offer", "v1", offerToRegistry(clock))
+	if err != nil {
+		return nil, err
+	}
+	sweep, err := model.Action("ai-agent.server.toolregistry.sweep", "v1", sweepExpiredLeases(clock))
+	if err != nil {
+		return nil, err
+	}
+	root := statecharts.Atomic("toolregistry",
+		statecharts.OnEntry(sweep.Do()),
+		statecharts.On("claim", statecharts.Then(claim.Do())),
+		statecharts.On("release", statecharts.Then(release.Do())),
+		statecharts.On("offer", statecharts.Then(offer.Do())),
+		statecharts.On("sweep", statecharts.Then(sweep.Do())),
+	)
+	return buildCanonicalChart(root, model, statecharts.WithRevisionSalt("toolregistry-v1"))
 }

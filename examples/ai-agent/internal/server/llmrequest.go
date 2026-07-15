@@ -35,7 +35,7 @@ type llmRequestModel struct {
 	ToolArgs       protocol.ToolArgs
 }
 
-var recordRequestStart = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
+func recordRequestStart(d *llmRequestModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	payload, ok := decodeDispatch(ev.Data)
 	if !ok {
@@ -43,9 +43,9 @@ var recordRequestStart = statecharts.Action(func(d *llmRequestModel, ec statecha
 	}
 	d.ConversationID = payload.ConversationID
 	return nil
-})
+}
 
-var applyProviderChunk = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
+func applyProviderChunk(d *llmRequestModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	c, ok := decodeProviderChunk(ev.Data)
 	if !ok {
@@ -64,7 +64,7 @@ var applyProviderChunk = statecharts.Action(func(d *llmRequestModel, ec statecha
 		d.ToolArgs = protocol.NewToolArgs(c.ToolCall.Args)
 	}
 	return nil
-})
+}
 
 func broadcastDelta(ec statecharts.ExecContext, conversationID protocol.ConversationID, kind, text string) {
 	ec.Send("broadcast", statecharts.SendOptions{
@@ -85,7 +85,7 @@ type deltaFrame struct {
 	Text string
 }
 
-var sendFinalReply = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
+func sendFinalReply(d *llmRequestModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Send("llm_reply", statecharts.SendOptions{
 		Target: statecharts.Identifier(d.ConversationID),
 		Data: encodeLLMReply(LLMReplyData{
@@ -96,9 +96,9 @@ var sendFinalReply = statecharts.Action(func(d *llmRequestModel, ec statecharts.
 		}),
 	})
 	return nil
-})
+}
 
-var sendErrorReply = statecharts.Action(func(d *llmRequestModel, ec statecharts.ExecContext) error {
+func sendErrorReply(d *llmRequestModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	msg := "unknown error"
 	if _, detail, ok := statecharts.PlatformErrorDetails(ev.Data); ok {
@@ -109,7 +109,7 @@ var sendErrorReply = statecharts.Action(func(d *llmRequestModel, ec statecharts.
 		Data:   encodeLLMReply(LLMReplyData{Text: fmt.Sprintf("[error: %s]", msg)}),
 	})
 	return nil
-})
+}
 
 // LLMRequestKind is the chart kind name a per-turn llmrequest actor is
 // Registered and (by LLMDispatchProcessor) Spawned under.
@@ -121,19 +121,39 @@ const LLMRequestKind statecharts.Identifier = "llmrequest"
 // automatic eviction of actors in a final state) rather than it lingering
 // resident forever.
 func BuildLLMRequestChart() (*statecharts.Chart, error) {
-	return statecharts.Build(
+	model := statecharts.NewGoModel(func() *llmRequestModel { return &llmRequestModel{} })
+	action := func(operation string, fn statecharts.GoAction[llmRequestModel]) (statecharts.GoActionRef, error) {
+		return model.Action(statecharts.Identifier("ai-agent.server.llmrequest."+operation), "v1", fn)
+	}
+	record, err := action("record-request-start", recordRequestStart)
+	if err != nil {
+		return nil, err
+	}
+	apply, err := action("apply-provider-chunk", applyProviderChunk)
+	if err != nil {
+		return nil, err
+	}
+	finalReply, err := action("send-final-reply", sendFinalReply)
+	if err != nil {
+		return nil, err
+	}
+	errorReply, err := action("send-error-reply", sendErrorReply)
+	if err != nil {
+		return nil, err
+	}
+	return buildCanonicalChart(
 		statecharts.Compound("llmrequest", "active",
 			statecharts.Children(
 				statecharts.Atomic("active",
-					statecharts.On("start", statecharts.Then(recordRequestStart)),
-					statecharts.On("provider_chunk", statecharts.Then(applyProviderChunk)),
-					statecharts.On("provider_done", statecharts.Target("done"), statecharts.Then(sendFinalReply)),
-					statecharts.On("provider_error", statecharts.Target("done"), statecharts.Then(sendErrorReply)),
+					statecharts.On("start", statecharts.Then(record.Do())),
+					statecharts.On("provider_chunk", statecharts.Then(apply.Do())),
+					statecharts.On("provider_done", statecharts.Target("done"), statecharts.Then(finalReply.Do())),
+					statecharts.On("provider_error", statecharts.Target("done"), statecharts.Then(errorReply.Do())),
 				),
 				statecharts.Final("done"),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &llmRequestModel{} }), statecharts.WithVersion("v1"))
+		model, statecharts.WithRevisionSalt("llmrequest-v1"))
 }
 
 // LLMDispatchProcessor is the statecharts.IOProcessor installed via

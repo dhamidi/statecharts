@@ -395,6 +395,8 @@ type RequestRegistry struct {
 	watches     map[string]chan<- chan protocol.ConversationSummary
 	unwatches   map[string]chan protocol.ConversationSummary
 	connections map[string]chan<- chan sseFrame
+	directory   map[string][]chan protocol.ConversationSummary
+	frames      map[string]chan sseFrame
 }
 
 func NewRequestRegistry() *RequestRegistry {
@@ -403,6 +405,8 @@ func NewRequestRegistry() *RequestRegistry {
 		watches:     map[string]chan<- chan protocol.ConversationSummary{},
 		unwatches:   map[string]chan protocol.ConversationSummary{},
 		connections: map[string]chan<- chan sseFrame{},
+		directory:   map[string][]chan protocol.ConversationSummary{},
+		frames:      map[string]chan sseFrame{},
 	}
 }
 
@@ -473,6 +477,60 @@ func (r *RequestRegistry) takeConnection(id string) (chan<- chan sseFrame, bool)
 	v, ok := r.connections[id]
 	delete(r.connections, id)
 	return v, ok
+}
+
+func (r *RequestRegistry) addDirectoryWatcher(session string, ch chan protocol.ConversationSummary) {
+	r.mu.Lock()
+	r.directory[session] = append(r.directory[session], ch)
+	r.mu.Unlock()
+}
+
+func (r *RequestRegistry) removeDirectoryWatcher(session string, target chan protocol.ConversationSummary) {
+	r.mu.Lock()
+	watchers := r.directory[session]
+	for i, ch := range watchers {
+		if ch == target {
+			watchers = append(watchers[:i], watchers[i+1:]...)
+			break
+		}
+	}
+	if len(watchers) == 0 {
+		delete(r.directory, session)
+	} else {
+		r.directory[session] = watchers
+	}
+	r.mu.Unlock()
+}
+
+func (r *RequestRegistry) directoryWatchers(session string) []chan protocol.ConversationSummary {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]chan protocol.ConversationSummary(nil), r.directory[session]...)
+}
+
+func (r *RequestRegistry) openFrames(session string) chan sseFrame {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ch := make(chan sseFrame, 256)
+	r.frames[session] = ch
+	return ch
+}
+
+func (r *RequestRegistry) connectionFrames(session string) (chan sseFrame, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ch, ok := r.frames[session]
+	return ch, ok
+}
+
+func (r *RequestRegistry) closeFrames(session string) {
+	r.mu.Lock()
+	ch, ok := r.frames[session]
+	delete(r.frames, session)
+	r.mu.Unlock()
+	if ok {
+		close(ch)
+	}
 }
 
 func (r *RequestRegistry) remove(id string) {

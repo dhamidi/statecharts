@@ -105,6 +105,25 @@ func requiredString(fields map[string]statecharts.Value, name string) (string, e
 	}
 	return s, nil
 }
+
+// canonicalRoundTrip exercises the same definition transport path used by an
+// inspector or deployment store: JSON contains refs, while behavior remains
+// in the appropriately scoped model registry.
+func canonicalRoundTrip(chart *statecharts.Chart, model statecharts.Datamodel) (*statecharts.Chart, error) {
+	wire, err := json.Marshal(chart.Definition())
+	if err != nil {
+		return nil, fmt.Errorf("marshal canonical definition: %w", err)
+	}
+	var definition statecharts.Definition
+	if err := json.Unmarshal(wire, &definition); err != nil {
+		return nil, fmt.Errorf("unmarshal canonical definition: %w", err)
+	}
+	recompiled, err := statecharts.Compile(definition, model)
+	if err != nil {
+		return nil, fmt.Errorf("recompile canonical definition: %w", err)
+	}
+	return recompiled, nil
+}
 func encodeProjection(p projection) statecharts.Value {
 	return taggedMap(projectionValueTag, map[string]statecharts.Value{"name": stringValue(p.Name), "color": stringValue(p.Color), "value": statecharts.Int64Value(int64(p.Value)), "resident": statecharts.BoolValue(p.Resident), "actor_state": stringValue(p.ActorState)})
 }
@@ -196,11 +215,17 @@ const (
 )
 
 func buildCounterChart() (*statecharts.Chart, error) {
-	publish := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *counterModel {
+		return &counterModel{Processed: make(map[statecharts.Identifier]bool)}
+	})
+	publish, err := model.Action("counters.counter.publish-projection", "v1", func(d *counterModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ec.Send("projection", statecharts.SendOptions{Target: "hub@ui", Data: encodeProjection(projection{Name: ec.SessionID(), Color: ec.SessionID(), Value: d.Value})})
 		return nil
 	})
-	increment := statecharts.Action(func(d *counterModel, ec statecharts.ExecContext) error {
+	if err != nil {
+		return nil, err
+	}
+	increment, err := model.Action("counters.counter.apply-idempotent-increment", "v1", func(d *counterModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		fields, err := taggedFields(ev.Data, incrementValueTag)
 		if err != nil {
@@ -220,10 +245,16 @@ func buildCounterChart() (*statecharts.Chart, error) {
 		}
 		return nil
 	})
-	return statecharts.Build(statecharts.Atomic(counterKind,
-		statecharts.On("increment", statecharts.Then(increment, publish)),
-		statecharts.On("publish", statecharts.Then(publish))),
-		statecharts.WithNewDatamodel(func() any { return &counterModel{Processed: make(map[statecharts.Identifier]bool)} }), statecharts.WithVersion("v1"))
+	if err != nil {
+		return nil, err
+	}
+	chart, err := statecharts.Build(statecharts.Atomic(counterKind,
+		statecharts.On("increment", statecharts.Then(increment.Do(), publish.Do())),
+		statecharts.On("publish", statecharts.Then(publish.Do()))), model, statecharts.WithRevisionSalt("counter-v1"))
+	if err != nil {
+		return nil, err
+	}
+	return canonicalRoundTrip(chart, model)
 }
 
 const hubKind statecharts.Identifier = "projection-hub"
@@ -261,83 +292,108 @@ func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 			ec.Send("snapshot", statecharts.SendOptions{Target: target, Data: encodeProjections(hubSnapshot(d, selected))})
 		}
 	}
-	return statecharts.Build(statecharts.Atomic(hubKind,
-		statecharts.On("projection", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
-			ev, _ := ec.Event()
-			p, err := decodeProjection(ev.Data)
-			if err != nil {
-				return err
-			}
-			d.Values[p.Name] = p
-			notify(d, ec)
-			return nil
-		}))),
-		statecharts.On("residency", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
-			ev, _ := ec.Event()
-			fields, err := taggedFields(ev.Data, residencyValueTag)
-			if err != nil {
-				return err
-			}
-			actorID, err := requiredString(fields, "actor_id")
-			if err != nil {
-				return err
-			}
-			state, err := requiredString(fields, "state")
-			if err != nil {
-				return err
-			}
-			d.Residencies[actorID] = state
-			notify(d, ec)
-			return nil
-		}))),
-		statecharts.On("subscribe", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
-			ev, _ := ec.Event()
-			fields, err := taggedFields(ev.Data, subscriptionValueTag)
-			if err != nil {
-				return err
-			}
-			target, err := requiredString(fields, "target")
-			if err != nil {
-				return err
-			}
-			selected, err := decodeStrings(fields["colors"])
-			if err != nil {
-				return err
-			}
-			sub := hubSubscription{Target: statecharts.Identifier(target), Colors: selected}
-			d.Subscribers[sub.Target] = append([]string(nil), sub.Colors...)
-			ec.Send("snapshot", statecharts.SendOptions{Target: sub.Target, Data: encodeProjections(hubSnapshot(d, sub.Colors))})
-			return nil
-		}))),
-		statecharts.On("unsubscribe", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
-			ev, _ := ec.Event()
-			target, ok := ev.Data.AsString()
-			if !ok {
-				return fmt.Errorf("unsubscribe target is not a string")
-			}
-			delete(d.Subscribers, statecharts.Identifier(target))
-			return nil
-		}))),
-		statecharts.On("query", statecharts.Then(statecharts.Action(func(d *hubModel, ec statecharts.ExecContext) error {
-			ev, _ := ec.Event()
-			fields, err := taggedFields(ev.Data, hubQueryValueTag)
-			if err != nil {
-				return err
-			}
-			id, err := requiredString(fields, "request_id")
-			if err != nil {
-				return err
-			}
-			q, ok := requests.take(id)
-			if !ok {
-				return nil
-			}
-			q.reply <- hubSnapshot(d, q.colors)
-			return nil
-		}))),
-	), statecharts.WithNewDatamodel(func() any {
+	model := statecharts.NewGoModel(func() *hubModel {
 		return &hubModel{Values: map[string]projection{}, Residencies: map[string]string{}, Subscribers: map[statecharts.Identifier][]string{}}
-	}), statecharts.WithVersion("v1"))
+	})
+	projectionAction, err := model.Action("counters.hub.accept-projection", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		p, err := decodeProjection(ev.Data)
+		if err != nil {
+			return err
+		}
+		d.Values[p.Name] = p
+		notify(d, ec)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	residencyAction, err := model.Action("counters.hub.accept-residency", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		fields, err := taggedFields(ev.Data, residencyValueTag)
+		if err != nil {
+			return err
+		}
+		actorID, err := requiredString(fields, "actor_id")
+		if err != nil {
+			return err
+		}
+		state, err := requiredString(fields, "state")
+		if err != nil {
+			return err
+		}
+		d.Residencies[actorID] = state
+		notify(d, ec)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	subscribeAction, err := model.Action("counters.hub.subscribe-stream", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		fields, err := taggedFields(ev.Data, subscriptionValueTag)
+		if err != nil {
+			return err
+		}
+		target, err := requiredString(fields, "target")
+		if err != nil {
+			return err
+		}
+		selected, err := decodeStrings(fields["colors"])
+		if err != nil {
+			return err
+		}
+		sub := hubSubscription{Target: statecharts.Identifier(target), Colors: selected}
+		d.Subscribers[sub.Target] = append([]string(nil), sub.Colors...)
+		ec.Send("snapshot", statecharts.SendOptions{Target: sub.Target, Data: encodeProjections(hubSnapshot(d, sub.Colors))})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	unsubscribeAction, err := model.Action("counters.hub.unsubscribe-stream", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		target, ok := ev.Data.AsString()
+		if !ok {
+			return fmt.Errorf("unsubscribe target is not a string")
+		}
+		delete(d.Subscribers, statecharts.Identifier(target))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	queryAction, err := model.Action("counters.hub.answer-runtime-query", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		fields, err := taggedFields(ev.Data, hubQueryValueTag)
+		if err != nil {
+			return err
+		}
+		id, err := requiredString(fields, "request_id")
+		if err != nil {
+			return err
+		}
+		q, ok := requests.take(id)
+		if !ok {
+			return nil
+		}
+		q.reply <- hubSnapshot(d, q.colors)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	chart, err := statecharts.Build(statecharts.Atomic(hubKind,
+		statecharts.On("projection", statecharts.Then(projectionAction.Do())),
+		statecharts.On("residency", statecharts.Then(residencyAction.Do())),
+		statecharts.On("subscribe", statecharts.Then(subscribeAction.Do())),
+		statecharts.On("unsubscribe", statecharts.Then(unsubscribeAction.Do())),
+		statecharts.On("query", statecharts.Then(queryAction.Do())),
+	), model, statecharts.WithRevisionSalt("projection-hub-v1"))
+	if err != nil {
+		return nil, err
+	}
+	return canonicalRoundTrip(chart, model)
 }
 
 type streamStart struct {
@@ -353,7 +409,8 @@ type streamModel struct {
 }
 
 func buildStreamChart() (*statecharts.Chart, error) {
-	start := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
+	model := statecharts.NewGoModel(func() *streamModel { return &streamModel{} })
+	start, err := model.Action("counters.stream.start-subscription", "v1", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		fields, err := taggedFields(ev.Data, streamStartValueTag)
 		if err != nil {
@@ -377,7 +434,10 @@ func buildStreamChart() (*statecharts.Chart, error) {
 		ec.Send("keepalive", statecharts.SendOptions{Delay: 15 * time.Second})
 		return nil
 	})
-	emit := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
+	if err != nil {
+		return nil, err
+	}
+	emit, err := model.Action("counters.stream.emit-snapshot", "v1", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		ps, err := decodeProjections(ev.Data)
 		if err != nil {
@@ -397,18 +457,31 @@ func buildStreamChart() (*statecharts.Chart, error) {
 		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: stringValue(frame)})
 		return nil
 	})
-	keepalive := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
+	if err != nil {
+		return nil, err
+	}
+	keepalive, err := model.Action("counters.stream.emit-keepalive", "v1", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: stringValue(": keepalive\n\n")})
 		ec.Send("keepalive", statecharts.SendOptions{Delay: 15 * time.Second})
 		return nil
 	})
-	closeStream := statecharts.Action(func(d *streamModel, ec statecharts.ExecContext) error {
+	if err != nil {
+		return nil, err
+	}
+	closeStream, err := model.Action("counters.stream.close-subscription", "v1", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ec.Send("unsubscribe", statecharts.SendOptions{Target: "hub", Data: stringValue(ec.SessionID())})
 		return nil
 	})
-	return statecharts.Build(statecharts.Compound(streamKind, "open", statecharts.Children(
-		statecharts.Atomic("open", statecharts.On("start", statecharts.Then(start)), statecharts.On("snapshot", statecharts.Then(emit)), statecharts.On("keepalive", statecharts.Then(keepalive)), statecharts.On("close", statecharts.Target("closed"), statecharts.Then(closeStream))),
+	if err != nil {
+		return nil, err
+	}
+	chart, err := statecharts.Build(statecharts.Compound(streamKind, "open", statecharts.Children(
+		statecharts.Atomic("open", statecharts.On("start", statecharts.Then(start.Do())), statecharts.On("snapshot", statecharts.Then(emit.Do())), statecharts.On("keepalive", statecharts.Then(keepalive.Do())), statecharts.On("close", statecharts.Target("closed"), statecharts.Then(closeStream.Do()))),
 		statecharts.Final("closed"),
 	),
-	), statecharts.WithNewDatamodel(func() any { return &streamModel{} }), statecharts.WithVersion("v1"))
+	), model, statecharts.WithRevisionSalt("sse-stream-v1"))
+	if err != nil {
+		return nil, err
+	}
+	return canonicalRoundTrip(chart, model)
 }

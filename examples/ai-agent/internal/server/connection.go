@@ -40,12 +40,15 @@ type connectionStart struct {
 type connectionModel struct {
 	ConversationID protocol.ConversationID
 	Tools          []protocol.ToolName
-	Frames         chan sseFrame
 }
 
-func pushFrame(d *connectionModel, f sseFrame) {
+func pushFrame(requests *RequestRegistry, session string, f sseFrame) {
+	frames, ok := requests.connectionFrames(session)
+	if !ok {
+		return
+	}
 	select {
-	case d.Frames <- f:
+	case frames <- f:
 	default:
 		// The HTTP writer isn't keeping up (or is already gone and just
 		// hasn't been told yet) -- drop rather than block this actor's own
@@ -65,8 +68,8 @@ func connectionOwner(ec statecharts.ExecContext) protocol.ConnectionID {
 // order (see the package doc comment on why the order matters), then
 // claims a lease for every tool this connection advertises and arms its own
 // renewal timer.
-func startConnection(requests *RequestRegistry) statecharts.ActionFunc {
-	return statecharts.Action(func(d *connectionModel, ec statecharts.ExecContext) error {
+func startConnection(requests *RequestRegistry) statecharts.GoAction[connectionModel] {
+	return func(d *connectionModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		start, ok := decodeConnectionStart(ev.Data)
 		if !ok {
@@ -75,6 +78,7 @@ func startConnection(requests *RequestRegistry) statecharts.ActionFunc {
 		d.ConversationID = start.ConversationID
 		d.Tools = start.Tools
 		owner := connectionOwner(ec)
+		frames := requests.openFrames(ec.SessionID())
 
 		ec.Send("subscribe", statecharts.SendOptions{
 			Target: "fanout",
@@ -89,70 +93,78 @@ func startConnection(requests *RequestRegistry) statecharts.ActionFunc {
 		}
 		ec.Send("renew_lease", statecharts.SendOptions{Delay: leaseRenewInterval})
 		if reply, ok := requests.takeConnection(start.RequestID); ok {
-			reply <- d.Frames
+			reply <- frames
 		}
 		return nil
-	})
+	}
 }
 
-var renewLeases = statecharts.Action(func(d *connectionModel, ec statecharts.ExecContext) error {
+func renewConnectionLeases(d *connectionModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	owner := connectionOwner(ec)
 	for _, tool := range d.Tools {
 		ec.Send("claim", statecharts.SendOptions{Target: "toolregistry", Data: encodeToolClaim(toolClaim{Tool: tool, Owner: owner})})
 	}
 	ec.Send("renew_lease", statecharts.SendOptions{Delay: leaseRenewInterval})
 	return nil
-})
+}
 
-var forwardFanoutFrame = statecharts.Action(func(d *connectionModel, ec statecharts.ExecContext) error {
-	ev, _ := ec.Event()
-	bc, ok := decodeFanoutBroadcast(ev.Data)
-	if !ok {
+func forwardFanoutFrame(requests *RequestRegistry) statecharts.GoAction[connectionModel] {
+	return func(_ *connectionModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		bc, ok := decodeFanoutBroadcast(ev.Data)
+		if !ok {
+			return nil
+		}
+		switch bc.Kind {
+		case "message":
+			pushFrame(requests, ec.SessionID(), sseFrame{ID: strconv.Itoa(bc.Seq), Event: "message", Data: bc.Message})
+		case "delta":
+			pushFrame(requests, ec.SessionID(), sseFrame{Event: "delta", Data: bc.Delta})
+		}
 		return nil
 	}
-	switch bc.Kind {
-	case "message":
-		pushFrame(d, sseFrame{ID: strconv.Itoa(bc.Seq), Event: "message", Data: bc.Message})
-	case "delta":
-		pushFrame(d, sseFrame{Event: "delta", Data: bc.Delta})
-	}
-	return nil
-})
+}
 
-var forwardCatchupMessage = statecharts.Action(func(d *connectionModel, ec statecharts.ExecContext) error {
-	ev, _ := ec.Event()
-	m, ok := decodeCatchupMessage(ev.Data)
-	if !ok {
+func forwardCatchupMessage(requests *RequestRegistry) statecharts.GoAction[connectionModel] {
+	return func(_ *connectionModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		m, ok := decodeCatchupMessage(ev.Data)
+		if !ok {
+			return nil
+		}
+		pushFrame(requests, ec.SessionID(), sseFrame{ID: strconv.Itoa(m.Seq), Event: "message", Data: m.Frame})
 		return nil
 	}
-	pushFrame(d, sseFrame{ID: strconv.Itoa(m.Seq), Event: "message", Data: m.Frame})
-	return nil
-})
+}
 
-var forwardToolCall = statecharts.Action(func(d *connectionModel, ec statecharts.ExecContext) error {
-	ev, _ := ec.Event()
-	tc, ok := decodeToolCall(ev.Data)
-	if !ok {
+func forwardToolCall(requests *RequestRegistry) statecharts.GoAction[connectionModel] {
+	return func(_ *connectionModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		tc, ok := decodeToolCall(ev.Data)
+		if !ok {
+			return nil
+		}
+		pushFrame(requests, ec.SessionID(), sseFrame{Event: "tool_call", Data: protocol.ToolCallFrame{
+			ConversationID: tc.ConversationID, CallID: tc.CallID, Name: tc.Name, Args: tc.Args,
+		}})
 		return nil
 	}
-	pushFrame(d, sseFrame{Event: "tool_call", Data: protocol.ToolCallFrame{
-		ConversationID: tc.ConversationID, CallID: tc.CallID, Name: tc.Name, Args: tc.Args,
-	}})
-	return nil
-})
+}
 
-var teardownConnection = statecharts.Action(func(d *connectionModel, ec statecharts.ExecContext) error {
-	owner := connectionOwner(ec)
-	ec.Send("unsubscribe", statecharts.SendOptions{
-		Target: "fanout",
-		Data:   encodeFanoutSubscribe(fanoutSubscribe{ConversationID: d.ConversationID, Connection: owner}),
-	})
-	for _, tool := range d.Tools {
-		ec.Send("release", statecharts.SendOptions{Target: "toolregistry", Data: encodeToolClaim(toolClaim{Tool: tool, Owner: owner})})
+func teardownConnection(requests *RequestRegistry) statecharts.GoAction[connectionModel] {
+	return func(d *connectionModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		owner := connectionOwner(ec)
+		ec.Send("unsubscribe", statecharts.SendOptions{
+			Target: "fanout",
+			Data:   encodeFanoutSubscribe(fanoutSubscribe{ConversationID: d.ConversationID, Connection: owner}),
+		})
+		for _, tool := range d.Tools {
+			ec.Send("release", statecharts.SendOptions{Target: "toolregistry", Data: encodeToolClaim(toolClaim{Tool: tool, Owner: owner})})
+		}
+		requests.closeFrames(ec.SessionID())
+		return nil
 	}
-	close(d.Frames)
-	return nil
-})
+}
 
 // ConnectionKind is the chart kind name a per-SSE-request connection actor
 // is Registered and Spawned under.
@@ -165,19 +177,47 @@ const ConnectionKind statecharts.Identifier = "connection"
 // Final state, which the actor system now frees automatically since it's
 // both non-durable and finished (see actors' eviction of finished actors).
 func BuildConnectionChart(requests *RequestRegistry) (*statecharts.Chart, error) {
-	return statecharts.Build(
+	model := statecharts.NewGoModel(func() *connectionModel { return &connectionModel{} })
+	register := func(name string, action statecharts.GoAction[connectionModel]) (statecharts.GoActionRef, error) {
+		return model.Action(statecharts.Identifier("ai-agent.server.connection."+name), "v1", action)
+	}
+	start, err := register("start", startConnection(requests))
+	if err != nil {
+		return nil, err
+	}
+	renew, err := register("renew-leases", renewConnectionLeases)
+	if err != nil {
+		return nil, err
+	}
+	fanout, err := register("forward-fanout-frame", forwardFanoutFrame(requests))
+	if err != nil {
+		return nil, err
+	}
+	catchup, err := register("forward-catchup-message", forwardCatchupMessage(requests))
+	if err != nil {
+		return nil, err
+	}
+	toolCall, err := register("forward-tool-call", forwardToolCall(requests))
+	if err != nil {
+		return nil, err
+	}
+	teardown, err := register("teardown", teardownConnection(requests))
+	if err != nil {
+		return nil, err
+	}
+	return buildCanonicalChart(
 		statecharts.Compound("connection", "streaming",
 			statecharts.Children(
 				statecharts.Atomic("streaming",
-					statecharts.On("start", statecharts.Then(startConnection(requests))),
-					statecharts.On("renew_lease", statecharts.Then(renewLeases)),
-					statecharts.On("fanout_frame", statecharts.Then(forwardFanoutFrame)),
-					statecharts.On("catchup_message", statecharts.Then(forwardCatchupMessage)),
-					statecharts.On("tool_call", statecharts.Then(forwardToolCall)),
+					statecharts.On("start", statecharts.Then(start.Do())),
+					statecharts.On("renew_lease", statecharts.Then(renew.Do())),
+					statecharts.On("fanout_frame", statecharts.Then(fanout.Do())),
+					statecharts.On("catchup_message", statecharts.Then(catchup.Do())),
+					statecharts.On("tool_call", statecharts.Then(toolCall.Do())),
 					statecharts.On("disconnect", statecharts.Target("closed")),
 				),
-				statecharts.Final("closed", statecharts.OnEntry(teardownConnection)),
+				statecharts.Final("closed", statecharts.OnEntry(teardown.Do())),
 			),
 		),
-		statecharts.WithNewDatamodel(func() any { return &connectionModel{Frames: make(chan sseFrame, 256)} }), statecharts.WithVersion("v1"))
+		model, statecharts.WithRevisionSalt("v1"))
 }

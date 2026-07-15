@@ -83,18 +83,28 @@ func mapRole(r llm.Role) protocol.Role {
 	}
 }
 
-func reportState(state protocol.ConversationState) statecharts.ActionFunc {
-	return func(ec statecharts.ExecContext) error {
-		convID, err := protocol.NewConversationID(ec.SessionID())
-		if err != nil {
-			return err
-		}
-		ec.Send("state_changed", statecharts.SendOptions{
-			Target: "user",
-			Data:   encodeConversationState(ConversationStateData{ID: convID, State: state}),
-		})
-		return nil
+func reportState(state protocol.ConversationState, ec statecharts.ExecContext) error {
+	convID, err := protocol.NewConversationID(ec.SessionID())
+	if err != nil {
+		return err
 	}
+	ec.Send("state_changed", statecharts.SendOptions{
+		Target: "user",
+		Data:   encodeConversationState(ConversationStateData{ID: convID, State: state}),
+	})
+	return nil
+}
+
+func reportIdle(_ *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	return reportState(protocol.ConversationIdle, ec)
+}
+
+func reportThinking(_ *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	return reportState(protocol.ConversationThinking, ec)
+}
+
+func reportAwaitingTool(_ *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	return reportState(protocol.ConversationAwaitingTool, ec)
 }
 
 // broadcastLastMessage sends the just-appended History entry (assumed to
@@ -102,7 +112,7 @@ func reportState(state protocol.ConversationState) statecharts.ActionFunc {
 // to fanout as a durable "message" frame, numbered by its position in
 // History -- the same numbering replyWithCatchup uses for the same entry,
 // so live and catch-up delivery of the same entry always agree.
-var broadcastLastMessage = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func broadcastLastMessage(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	if len(d.History) == 0 {
 		return nil
 	}
@@ -121,18 +131,18 @@ var broadcastLastMessage = statecharts.Action(func(d *conversationModel, ec stat
 		}),
 	})
 	return nil
-})
+}
 
-var appendUserMessage = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func appendUserMessage(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	payload, ok := decodeUserMessage(ev.Data)
 	if ok {
 		d.History = append(d.History, llm.Message{Role: llm.RoleUser, Text: payload.Text})
 	}
 	return nil
-})
+}
 
-var startRequest = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func startRequest(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	d.TurnSeq++
 	reqName := statecharts.Identifier(fmt.Sprintf("%s-%d", ec.SessionID(), d.TurnSeq))
 	d.PendingRequest = reqName
@@ -154,7 +164,7 @@ var startRequest = statecharts.Action(func(d *conversationModel, ec statecharts.
 		}),
 	})
 	return nil
-})
+}
 
 func matchesPendingRequest(d *conversationModel, ec statecharts.ExecContext) bool {
 	ev, _ := ec.Event()
@@ -173,7 +183,15 @@ func isTextReply(d *conversationModel, ec statecharts.ExecContext) bool {
 	return ok && !payload.IsToolCall
 }
 
-var recordPendingToolCall = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func isPendingToolCallReply(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) (bool, error) {
+	return matchesPendingRequest(d, ec) && isToolCallReply(d, ec), nil
+}
+
+func isPendingTextReply(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) (bool, error) {
+	return matchesPendingRequest(d, ec) && isTextReply(d, ec), nil
+}
+
+func recordPendingToolCall(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	payload, ok := decodeLLMReply(ev.Data)
 	if !ok {
@@ -184,23 +202,23 @@ var recordPendingToolCall = statecharts.Action(func(d *conversationModel, ec sta
 	d.PendingCallID = protocol.CallID(d.PendingRequest) // one llmrequest per turn: reusing its name as the call id is unambiguous
 	d.PendingRetries = 0
 	return nil
-})
+}
 
-var appendAssistantMessage = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func appendAssistantMessage(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	payload, ok := decodeLLMReply(ev.Data)
 	if ok {
 		d.History = append(d.History, llm.Message{Role: llm.RoleAssistant, Text: payload.Text})
 	}
 	return nil
-})
+}
 
-var clearPendingRequest = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func clearPendingRequest(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	d.PendingRequest = ""
 	return nil
-})
+}
 
-var offerToolCall = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func offerToolCall(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	if d.PendingToolName == "" {
 		return nil
 	}
@@ -218,12 +236,12 @@ var offerToolCall = statecharts.Action(func(d *conversationModel, ec statecharts
 		}),
 	})
 	return nil
-})
+}
 
-var scheduleRetryTimer = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func scheduleRetryTimer(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Send("tool_offer_retry", statecharts.SendOptions{Delay: toolOfferRetryInterval, SendID: toolOfferRetrySendID})
 	return nil
-})
+}
 
 // cancelRetryTimer best-effort cancels the delayed "tool_offer_retry" send
 // currently armed under toolOfferRetrySendID, if any. It belongs in every
@@ -236,13 +254,13 @@ var scheduleRetryTimer = statecharts.Action(func(d *conversationModel, ec statec
 // unknown or already-fired SendID (see interpreter.go's doCancel), so
 // including this unconditionally is always safe, including the first time
 // awaiting_tool is ever left (nothing to cancel yet).
-var cancelRetryTimer = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func cancelRetryTimer(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Cancel(toolOfferRetrySendID)
 	return nil
-})
+}
 
-func retriesExhausted(d *conversationModel, ec statecharts.ExecContext) bool {
-	return d.PendingRetries >= toolOfferMaxRetries
+func retriesExhausted(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) (bool, error) {
+	return d.PendingRetries >= toolOfferMaxRetries, nil
 }
 
 // failPendingToolCall gives up on a pending tool call after
@@ -259,7 +277,7 @@ func retriesExhausted(d *conversationModel, ec statecharts.ExecContext) bool {
 // there is no armed timer to cancel here; the actual exit from
 // awaiting_tool happens once the synthetic "tool_result" it sends is
 // processed below, where cancelRetryTimer already runs.
-var failPendingToolCall = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func failPendingToolCall(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Send("tool_result", statecharts.SendOptions{
 		Target: statecharts.Identifier(ec.SessionID()),
 		Data: encodeToolResult(ToolResultData{
@@ -268,7 +286,7 @@ var failPendingToolCall = statecharts.Action(func(d *conversationModel, ec state
 		}),
 	})
 	return nil
-})
+}
 
 // retryOfferAndReschedule re-offers a still-pending tool call to
 // toolregistry (identical to offerToolCall) and arms the next retry tick --
@@ -289,22 +307,22 @@ var failPendingToolCall = statecharts.Action(func(d *conversationModel, ec state
 // PendingCallID was actually delivered/claimed, which is a new
 // cross-actor request/reply this actor doesn't have today -- left as a
 // follow-up rather than folded in here.
-var retryOfferAndReschedule = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func retryOfferAndReschedule(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	d.PendingRetries++
-	if err := offerToolCall(ec); err != nil {
+	if err := offerToolCall(d, ec, nil); err != nil {
 		return err
 	}
 	ec.Send("tool_offer_retry", statecharts.SendOptions{Delay: toolOfferRetryInterval, SendID: toolOfferRetrySendID})
 	return nil
-})
-
-func matchesPendingCallID(d *conversationModel, ec statecharts.ExecContext) bool {
-	ev, _ := ec.Event()
-	payload, ok := decodeToolResult(ev.Data)
-	return ok && d.PendingCallID != "" && payload.CallID == d.PendingCallID
 }
 
-var appendToolResultMessage = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func matchesPendingCallID(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) (bool, error) {
+	ev, _ := ec.Event()
+	payload, ok := decodeToolResult(ev.Data)
+	return ok && d.PendingCallID != "" && payload.CallID == d.PendingCallID, nil
+}
+
+func appendToolResultMessage(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	payload, ok := decodeToolResult(ev.Data)
 	if !ok {
@@ -316,22 +334,22 @@ var appendToolResultMessage = statecharts.Action(func(d *conversationModel, ec s
 	}
 	d.History = append(d.History, llm.Message{Role: llm.RoleTool, Text: text})
 	return nil
-})
+}
 
-var clearPendingToolCall = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func clearPendingToolCall(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	d.PendingToolName = ""
 	d.PendingArgs = nil
 	d.PendingCallID = ""
 	d.PendingRetries = 0
 	return nil
-})
+}
 
 // replyWithCatchup answers a "catchup" request entirely from this actor's
 // own already-rehydrated History -- ordinary actor communication, the same
 // in-memory state a live turn already uses, never a direct Log read. It is
 // attached to the outer "conversation" state as a targetless transition, so
 // it runs (and answers correctly) no matter which child state is current.
-var replyWithCatchup = statecharts.Action(func(d *conversationModel, ec statecharts.ExecContext) error {
+func replyWithCatchup(d *conversationModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	payload, ok := decodeCatchupRequest(ev.Data)
 	if !ok {
@@ -349,7 +367,7 @@ var replyWithCatchup = statecharts.Action(func(d *conversationModel, ec statecha
 		})
 	}
 	return nil
-})
+}
 
 // ConversationKind is the chart kind name conversations are Registered and
 // Spawned under.
@@ -363,48 +381,87 @@ const ConversationKind statecharts.Identifier = "conversation"
 // enough to actually run it, synthesizing a failure and giving the LLM a
 // turn to react to it rather than waiting forever.
 func BuildConversationChart() (*statecharts.Chart, error) {
-	return statecharts.Build(
+	model := statecharts.NewGoModel(func() *conversationModel { return &conversationModel{} })
+	actions := map[string]func(*conversationModel, statecharts.ExecContext, []statecharts.Value) error{
+		"report-idle":                reportIdle,
+		"report-thinking":            reportThinking,
+		"report-awaiting-tool":       reportAwaitingTool,
+		"broadcast-last-message":     broadcastLastMessage,
+		"append-user-message":        appendUserMessage,
+		"start-request":              startRequest,
+		"record-pending-tool-call":   recordPendingToolCall,
+		"append-assistant-message":   appendAssistantMessage,
+		"clear-pending-request":      clearPendingRequest,
+		"offer-tool-call":            offerToolCall,
+		"schedule-retry-timer":       scheduleRetryTimer,
+		"cancel-retry-timer":         cancelRetryTimer,
+		"fail-pending-tool-call":     failPendingToolCall,
+		"retry-offer-and-reschedule": retryOfferAndReschedule,
+		"append-tool-result-message": appendToolResultMessage,
+		"clear-pending-tool-call":    clearPendingToolCall,
+		"reply-with-catchup":         replyWithCatchup,
+	}
+	actionRefs := make(map[string]statecharts.GoActionRef, len(actions))
+	for operation, fn := range actions {
+		ref, err := model.Action(statecharts.Identifier("ai-agent.server.conversation."+operation), "v1", fn)
+		if err != nil {
+			return nil, err
+		}
+		actionRefs[operation] = ref
+	}
+	conditions := map[string]func(*conversationModel, statecharts.ExecContext, []statecharts.Value) (bool, error){
+		"is-pending-tool-call-reply": isPendingToolCallReply,
+		"is-pending-text-reply":      isPendingTextReply,
+		"retries-exhausted":          retriesExhausted,
+		"matches-pending-call-id":    matchesPendingCallID,
+	}
+	conditionRefs := make(map[string]statecharts.GoConditionRef, len(conditions))
+	for operation, fn := range conditions {
+		ref, err := model.Condition(statecharts.Identifier("ai-agent.server.conversation."+operation), "v1", fn)
+		if err != nil {
+			return nil, err
+		}
+		conditionRefs[operation] = ref
+	}
+
+	return buildCanonicalChart(
 		statecharts.Compound("conversation", "idle",
 			statecharts.Children(
 				statecharts.Atomic("idle",
-					statecharts.OnEntry(reportState(protocol.ConversationIdle)),
+					statecharts.OnEntry(actionRefs["report-idle"].Do()),
 					statecharts.On("user_message",
 						statecharts.Target("thinking"),
-						statecharts.Then(appendUserMessage, broadcastLastMessage),
+						statecharts.Then(actionRefs["append-user-message"].Do(), actionRefs["broadcast-last-message"].Do()),
 					),
 				),
 				statecharts.Atomic("thinking",
-					statecharts.OnEntry(reportState(protocol.ConversationThinking), startRequest),
+					statecharts.OnEntry(actionRefs["report-thinking"].Do(), actionRefs["start-request"].Do()),
 					statecharts.On("llm_reply",
 						statecharts.Target("awaiting_tool"),
-						statecharts.If(statecharts.Cond(func(d *conversationModel, ec statecharts.ExecContext) bool {
-							return matchesPendingRequest(d, ec) && isToolCallReply(d, ec)
-						})),
-						statecharts.Then(recordPendingToolCall),
+						statecharts.If(conditionRefs["is-pending-tool-call-reply"].If()),
+						statecharts.Then(actionRefs["record-pending-tool-call"].Do()),
 					),
 					statecharts.On("llm_reply",
 						statecharts.Target("idle"),
-						statecharts.If(statecharts.Cond(func(d *conversationModel, ec statecharts.ExecContext) bool {
-							return matchesPendingRequest(d, ec) && isTextReply(d, ec)
-						})),
-						statecharts.Then(appendAssistantMessage, broadcastLastMessage, clearPendingRequest),
+						statecharts.If(conditionRefs["is-pending-text-reply"].If()),
+						statecharts.Then(actionRefs["append-assistant-message"].Do(), actionRefs["broadcast-last-message"].Do(), actionRefs["clear-pending-request"].Do()),
 					),
 				),
 				statecharts.Atomic("awaiting_tool",
-					statecharts.OnEntry(reportState(protocol.ConversationAwaitingTool), offerToolCall, scheduleRetryTimer),
+					statecharts.OnEntry(actionRefs["report-awaiting-tool"].Do(), actionRefs["offer-tool-call"].Do(), actionRefs["schedule-retry-timer"].Do()),
 					statecharts.On("tool_offer_retry",
-						statecharts.If(statecharts.Cond(retriesExhausted)),
-						statecharts.Then(failPendingToolCall),
+						statecharts.If(conditionRefs["retries-exhausted"].If()),
+						statecharts.Then(actionRefs["fail-pending-tool-call"].Do()),
 					),
-					statecharts.On("tool_offer_retry", statecharts.Then(retryOfferAndReschedule)),
+					statecharts.On("tool_offer_retry", statecharts.Then(actionRefs["retry-offer-and-reschedule"].Do())),
 					statecharts.On("tool_result",
 						statecharts.Target("thinking"),
-						statecharts.If(statecharts.Cond(matchesPendingCallID)),
-						statecharts.Then(cancelRetryTimer, appendToolResultMessage, broadcastLastMessage, clearPendingToolCall),
+						statecharts.If(conditionRefs["matches-pending-call-id"].If()),
+						statecharts.Then(actionRefs["cancel-retry-timer"].Do(), actionRefs["append-tool-result-message"].Do(), actionRefs["broadcast-last-message"].Do(), actionRefs["clear-pending-tool-call"].Do()),
 					),
 				),
 			),
-			statecharts.On("catchup", statecharts.Then(replyWithCatchup)),
+			statecharts.On("catchup", statecharts.Then(actionRefs["reply-with-catchup"].Do())),
 		),
-		statecharts.WithNewDatamodel(func() any { return &conversationModel{} }), statecharts.WithVersion("v1"))
+		model, statecharts.WithRevisionSalt("conversation-v1"))
 }

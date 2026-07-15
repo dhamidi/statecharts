@@ -8,16 +8,13 @@ import (
 	"github.com/dhamidi/statecharts/examples/ai-agent/internal/protocol"
 )
 
-// directoryModel is DirectoryActor's (non-durable) datamodel: a live mirror
+// directoryModel is DirectoryActor's datamodel: a live mirror
 // of UserActor's own conversation map, safe to query synchronously from an
-// HTTP handler (a durable actor like UserActor cannot be -- see
-// system.deliver's unconditional write-ahead logging, which fails outright
-// on a channel-typed Event.Data). Watchers holds one channel per active
-// GET /directory/events request (see http.go's handleDirectoryEvents):
-// registered directly with this actor's own datamodel exactly like ui.go's
-// browser-subscriber channels, safe here for the same reason (non-durable,
-// never logged) -- no separate per-request actor needed. Each watcher's
-// channel only ever carries a single changed entry (see broadcastUpsert),
+// HTTP handler. RequestRegistry resolves canonical request IDs to one channel
+// per active GET /directory/events request (see http.go's
+// handleDirectoryEvents), keyed by this actor's session so capabilities never
+// enter Event.Data or model snapshots. Each watcher's channel only ever
+// carries a single changed entry (see broadcastUpsert),
 // not the whole map re-serialized -- a workspace with hundreds of
 // conversations shouldn't re-transmit hundreds of records because one of
 // them changed state. The one-time full list a fresh watcher needs is
@@ -25,8 +22,7 @@ import (
 // http.go's handleDirectoryEvents priming its stream before ever reading
 // from this channel).
 type directoryModel struct {
-	Items    map[protocol.ConversationID]protocol.ConversationSummary
-	Watchers []chan protocol.ConversationSummary
+	Items map[protocol.ConversationID]protocol.ConversationSummary
 }
 
 func snapshotList(d *directoryModel) []protocol.ConversationSummary {
@@ -38,8 +34,8 @@ func snapshotList(d *directoryModel) []protocol.ConversationSummary {
 	return items
 }
 
-func broadcastUpsert(d *directoryModel, cs protocol.ConversationSummary) {
-	for _, ch := range d.Watchers {
+func broadcastUpsert(requests *RequestRegistry, session string, cs protocol.ConversationSummary) {
+	for _, ch := range requests.directoryWatchers(session) {
 		select {
 		case ch <- cs:
 		default: // a slow/gone watcher never blocks this actor's own goroutine
@@ -47,20 +43,22 @@ func broadcastUpsert(d *directoryModel, cs protocol.ConversationSummary) {
 	}
 }
 
-var applySync = statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
-	ev, _ := ec.Event()
-	payload, ok := decodeSummary(ev.Data)
-	if !ok {
+func applyDirectorySync(requests *RequestRegistry) statecharts.GoAction[directoryModel] {
+	return func(d *directoryModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		ev, _ := ec.Event()
+		payload, ok := decodeSummary(ev.Data)
+		if !ok {
+			return nil
+		}
+		cs := payload
+		d.Items[cs.ID] = cs
+		broadcastUpsert(requests, ec.SessionID(), cs)
 		return nil
 	}
-	cs := payload
-	d.Items[cs.ID] = cs
-	broadcastUpsert(d, cs)
-	return nil
-})
+}
 
-func replyWithList(requests *RequestRegistry) statecharts.ActionFunc {
-	return statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
+func replyWithList(requests *RequestRegistry) statecharts.GoAction[directoryModel] {
+	return func(d *directoryModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		id, ok := decodeDirectoryRequest(ev.Data)
 		if !ok {
@@ -70,10 +68,10 @@ func replyWithList(requests *RequestRegistry) statecharts.ActionFunc {
 			reply <- snapshotList(d)
 		}
 		return nil
-	})
+	}
 }
-func watchDirectory(requests *RequestRegistry) statecharts.ActionFunc {
-	return statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
+func watchDirectory(requests *RequestRegistry) statecharts.GoAction[directoryModel] {
+	return func(d *directoryModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		id, ok := decodeDirectoryRequest(ev.Data)
 		if !ok {
@@ -84,13 +82,13 @@ func watchDirectory(requests *RequestRegistry) statecharts.ActionFunc {
 			return nil
 		}
 		ch := make(chan protocol.ConversationSummary, 8)
-		d.Watchers = append(d.Watchers, ch)
+		requests.addDirectoryWatcher(ec.SessionID(), ch)
 		reply <- ch
 		return nil
-	})
+	}
 }
-func unwatchDirectory(requests *RequestRegistry) statecharts.ActionFunc {
-	return statecharts.Action(func(d *directoryModel, ec statecharts.ExecContext) error {
+func unwatchDirectory(requests *RequestRegistry) statecharts.GoAction[directoryModel] {
+	return func(_ *directoryModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		id, ok := decodeDirectoryRequest(ev.Data)
 		if !ok {
@@ -100,14 +98,9 @@ func unwatchDirectory(requests *RequestRegistry) statecharts.ActionFunc {
 		if !ok {
 			return nil
 		}
-		for i, ch := range d.Watchers {
-			if ch == target {
-				d.Watchers = append(d.Watchers[:i], d.Watchers[i+1:]...)
-				break
-			}
-		}
+		requests.removeDirectoryWatcher(ec.SessionID(), target)
 		return nil
-	})
+	}
 }
 
 // DirectoryKind is the chart kind name the non-durable, singleton
@@ -124,14 +117,31 @@ const DirectoryKind statecharts.Identifier = "directory"
 // sidebar is push-driven, not polled (see http.go's handleDirectoryEvents
 // and internal/client's directorylink).
 func BuildDirectoryChart(requests *RequestRegistry) (*statecharts.Chart, error) {
-	return statecharts.Build(
+	model := statecharts.NewGoModel(func() *directoryModel {
+		return &directoryModel{Items: map[protocol.ConversationID]protocol.ConversationSummary{}}
+	})
+	applySync, err := model.Action("ai-agent.server.directory.apply-sync", "v1", applyDirectorySync(requests))
+	if err != nil {
+		return nil, err
+	}
+	replyList, err := model.Action("ai-agent.server.directory.reply-list", "v1", replyWithList(requests))
+	if err != nil {
+		return nil, err
+	}
+	watch, err := model.Action("ai-agent.server.directory.watch", "v1", watchDirectory(requests))
+	if err != nil {
+		return nil, err
+	}
+	unwatch, err := model.Action("ai-agent.server.directory.unwatch", "v1", unwatchDirectory(requests))
+	if err != nil {
+		return nil, err
+	}
+	return buildCanonicalChart(
 		statecharts.Atomic("directory",
-			statecharts.On("sync", statecharts.Then(applySync)),
-			statecharts.On("list", statecharts.Then(replyWithList(requests))),
-			statecharts.On("watch", statecharts.Then(watchDirectory(requests))),
-			statecharts.On("unwatch", statecharts.Then(unwatchDirectory(requests))),
+			statecharts.On("sync", statecharts.Then(applySync.Do())),
+			statecharts.On("list", statecharts.Then(replyList.Do())),
+			statecharts.On("watch", statecharts.Then(watch.Do())),
+			statecharts.On("unwatch", statecharts.Then(unwatch.Do())),
 		),
-		statecharts.WithNewDatamodel(func() any {
-			return &directoryModel{Items: map[protocol.ConversationID]protocol.ConversationSummary{}}
-		}), statecharts.WithVersion("v1"))
+		model, statecharts.WithRevisionSalt("v1"))
 }

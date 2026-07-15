@@ -159,8 +159,8 @@ func runConnect(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sys := client.NewSystem(statecharts.NewRealClock())
-	if err := client.Setup(ctx, sys, *serverAddr, parseTools(*tools), protocol.ConversationID(*conversation)); err != nil {
+	sys, err := client.Setup(ctx, statecharts.NewRealClock(), *serverAddr, parseTools(*tools), protocol.ConversationID(*conversation))
+	if err != nil {
 		return err
 	}
 
@@ -186,8 +186,8 @@ func runEmbedded(args []string) error {
 		return err
 	}
 
-	sys := client.NewSystem(statecharts.NewRealClock())
-	if err := client.Setup(ctx, sys, serverAddr, parseTools(*tools), ""); err != nil {
+	sys, err := client.Setup(ctx, statecharts.NewRealClock(), serverAddr, parseTools(*tools), "")
+	if err != nil {
 		return err
 	}
 

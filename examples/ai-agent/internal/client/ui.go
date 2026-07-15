@@ -45,9 +45,11 @@ type uiModel struct {
 	// SSE subscription (see directorylink.go) rather than this actor (or
 	// any browser tab) ever polling for it.
 	Conversations []protocol.ConversationSummary
-
-	Subscribers []chan string
 }
+
+type uiRuntime struct{ Subscribers []chan string }
+
+const uiInvokeType statecharts.Identifier = "ai-agent.client.ui.http-server"
 
 func newUIModel() *uiModel {
 	// LinkStatus starts "" (not "connecting"): link.go's LinkActor actually
@@ -125,20 +127,20 @@ func datastarPatch(elementHTML string) string {
 
 // pushMain re-renders the main pane from d's current state and pushes it
 // to every connected browser tab.
-func pushMain(d *uiModel) {
-	broadcast(d, datastarPatch(renderToString(renderMain(snapshotOf(d)))))
+func pushMain(d *uiModel, runtime *uiRuntime) {
+	broadcast(runtime, datastarPatch(renderToString(renderMain(snapshotOf(d)))))
 }
 
 // pushSidebar re-renders just the sidebar and pushes it to every connected
 // browser tab, over each tab's own already-open /events connection -- see
 // applyDirectorySnapshot below and directorylink.go's own doc comment on
 // why this is a push, not a poll, and why it costs no extra connection.
-func pushSidebar(d *uiModel) {
-	broadcast(d, datastarPatch(renderToString(renderSidebar(snapshotOf(d)))))
+func pushSidebar(d *uiModel, runtime *uiRuntime) {
+	broadcast(runtime, datastarPatch(renderToString(renderSidebar(snapshotOf(d)))))
 }
 
-func broadcast(d *uiModel, frame string) {
-	for _, ch := range d.Subscribers {
+func broadcast(runtime *uiRuntime, frame string) {
+	for _, ch := range runtime.Subscribers {
 		select {
 		case ch <- frame:
 		default: // a slow/gone tab never blocks this actor's own goroutine
@@ -146,7 +148,7 @@ func broadcast(d *uiModel, frame string) {
 	}
 }
 
-var appendMessage = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+var appendMessage = func(d *uiModel, ec statecharts.ExecContext, runtime *uiRuntime) error {
 	ev, _ := ec.Event()
 	m, ok := decodeMessageSeq(ev.Data)
 	if !ok {
@@ -159,11 +161,11 @@ var appendMessage = statecharts.Action(func(d *uiModel, ec statecharts.ExecConte
 	d.ThinkingDelta = ""
 	d.TextDelta = ""
 	d.PendingToolCall = nil
-	pushMain(d)
+	pushMain(d, runtime)
 	return nil
-})
+}
 
-var appendDelta = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+var appendDelta = func(d *uiModel, ec statecharts.ExecContext, runtime *uiRuntime) error {
 	ev, _ := ec.Event()
 	delta, ok := decodeDelta(ev.Data)
 	if !ok {
@@ -174,42 +176,42 @@ var appendDelta = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext
 	} else {
 		d.TextDelta += delta.Text
 	}
-	pushMain(d)
+	pushMain(d, runtime)
 	return nil
-})
+}
 
-var appendToolCall = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+var appendToolCall = func(d *uiModel, ec statecharts.ExecContext, runtime *uiRuntime) error {
 	ev, _ := ec.Event()
 	tc, ok := decodeToolCall(ev.Data)
 	if !ok {
 		return nil
 	}
 	d.PendingToolCall = &tc
-	pushMain(d)
+	pushMain(d, runtime)
 	return nil
-})
+}
 
-var recordLinkStatus = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+var recordLinkStatus = func(d *uiModel, ec statecharts.ExecContext, runtime *uiRuntime) error {
 	ev, _ := ec.Event()
 	status, ok := ev.Data.AsString()
 	if !ok {
 		return nil
 	}
 	d.LinkStatus = status
-	broadcast(d, datastarPatch(renderToString(renderLinkBanner(d.LinkStatus))))
+	broadcast(runtime, datastarPatch(renderToString(renderLinkBanner(d.LinkStatus))))
 	return nil
-})
+}
 
-var applyDirectorySnapshot = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+var applyDirectorySnapshot = func(d *uiModel, ec statecharts.ExecContext, runtime *uiRuntime) error {
 	ev, _ := ec.Event()
 	items, ok := decodeSummaries(ev.Data)
 	if !ok {
 		return nil
 	}
 	d.Conversations = items
-	pushSidebar(d)
+	pushSidebar(d, runtime)
 	return nil
-})
+}
 
 // applyDirectoryUpsert handles one changed conversation at a time (see
 // directorylink.go's forwardDirectoryUpsert, fed by the workspace server's
@@ -217,7 +219,7 @@ var applyDirectorySnapshot = statecharts.Action(func(d *uiModel, ec statecharts.
 // replacing or inserting just that entry and re-sorting by title, rather
 // than waiting for (or requesting) a fresh full list on every single
 // change, however many other conversations exist.
-var applyDirectoryUpsert = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+var applyDirectoryUpsert = func(d *uiModel, ec statecharts.ExecContext, runtime *uiRuntime) error {
 	ev, _ := ec.Event()
 	cs, ok := decodeSummary(ev.Data)
 	if !ok {
@@ -235,9 +237,9 @@ var applyDirectoryUpsert = statecharts.Action(func(d *uiModel, ec statecharts.Ex
 		d.Conversations = append(d.Conversations, cs)
 	}
 	sort.Slice(d.Conversations, func(i, j int) bool { return d.Conversations[i].Title < d.Conversations[j].Title })
-	pushSidebar(d)
+	pushSidebar(d, runtime)
 	return nil
-})
+}
 
 // resetForSwitch is the actual "switch conversations" state change: cleared
 // exactly once per real switch, shared by applySwitch (driven by
@@ -247,7 +249,7 @@ var applyDirectoryUpsert = statecharts.Action(func(d *uiModel, ec statecharts.Ex
 // there are two entry points into the same reset). Idempotent: a no-op
 // once d is already showing id, so whichever of the two callers gets there
 // first "wins" and the other is harmless.
-func resetForSwitch(d *uiModel, id protocol.ConversationID) bool {
+func resetForSwitch(d *uiModel, id protocol.ConversationID, runtime *uiRuntime) bool {
 	if id == "" || d.ConversationID == id {
 		return false
 	}
@@ -257,23 +259,23 @@ func resetForSwitch(d *uiModel, id protocol.ConversationID) bool {
 	d.ThinkingDelta = ""
 	d.TextDelta = ""
 	d.PendingToolCall = nil
-	pushMain(d)
-	pushSidebar(d) // the sidebar's own "active" highlight tracks d.ConversationID
+	pushMain(d, runtime)
+	pushSidebar(d, runtime) // the sidebar's own "active" highlight tracks d.ConversationID
 	return true
 }
 
-var applySwitch = statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+var applySwitch = func(d *uiModel, ec statecharts.ExecContext, runtime *uiRuntime) error {
 	ev, _ := ec.Event()
 	s, ok := ev.Data.AsString()
 	if !ok {
 		return nil
 	}
-	resetForSwitch(d, protocol.ConversationID(s)) // no-op if httpui.go's own switch_and_snapshot already applied this
+	resetForSwitch(d, protocol.ConversationID(s), runtime) // no-op if httpui.go's own switch_and_snapshot already applied this
 	return nil
-})
+}
 
-func replySnapshot(requests *uiRequests) statecharts.ActionFunc {
-	return statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+func replySnapshot(requests *uiRequests, _ *uiRuntime) statecharts.GoAction[uiModel] {
+	return func(d *uiModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		id, _, ok := decodeUIRequest(ev.Data)
 		if !ok {
@@ -287,7 +289,7 @@ func replySnapshot(requests *uiRequests) statecharts.ActionFunc {
 			reply <- snapshotOf(d)
 		}
 		return nil
-	})
+	}
 }
 
 // browserSubscribeRequest is "subscribe_browser"'s payload -> ui, from a
@@ -295,8 +297,8 @@ func replySnapshot(requests *uiRequests) statecharts.ActionFunc {
 // handleDatastarEvents). Reply carries back the channel that request's own
 // goroutine reads patch frames from -- the same request/reply-over-a-
 // channel idiom get_snapshot uses, safe here because "ui" is non-durable.
-func subscribeBrowser(requests *uiRequests) statecharts.ActionFunc {
-	return statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+func subscribeBrowser(requests *uiRequests, runtime *uiRuntime) statecharts.GoAction[uiModel] {
+	return func(d *uiModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		id, _, ok := decodeUIRequest(ev.Data)
 		if !ok {
@@ -310,17 +312,17 @@ func subscribeBrowser(requests *uiRequests) statecharts.ActionFunc {
 			return nil // the requesting HTTP context was canceled before dispatch
 		}
 		ch := make(chan string, 32)
-		d.Subscribers = append(d.Subscribers, ch)
+		runtime.Subscribers = append(runtime.Subscribers, ch)
 		reply <- ch
 		return nil
-	})
+	}
 }
 
 // browserUnsubscribeRequest is "unsubscribe_browser"'s payload -> ui, sent
 // when a browser tab's own /events request ends (tab closed, navigated
 // away, reloaded).
-func unsubscribeBrowser(requests *uiRequests) statecharts.ActionFunc {
-	return statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+func unsubscribeBrowser(requests *uiRequests, runtime *uiRuntime) statecharts.GoAction[uiModel] {
+	return func(d *uiModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		id, _, ok := decodeUIRequest(ev.Data)
 		if !ok {
@@ -330,14 +332,14 @@ func unsubscribeBrowser(requests *uiRequests) statecharts.ActionFunc {
 		channel := requests.unsubscribes[id]
 		delete(requests.unsubscribes, id)
 		requests.mu.Unlock()
-		for i, ch := range d.Subscribers {
+		for i, ch := range runtime.Subscribers {
 			if ch == channel {
-				d.Subscribers = append(d.Subscribers[:i], d.Subscribers[i+1:]...)
+				runtime.Subscribers = append(runtime.Subscribers[:i], runtime.Subscribers[i+1:]...)
 				break
 			}
 		}
 		return nil
-	})
+	}
 }
 
 func getUISnapshot(ctx context.Context, sys *actors.System, requests *uiRequests) (uiSnapshot, error) {
@@ -370,14 +372,14 @@ func getUISnapshot(ctx context.Context, sys *actors.System, requests *uiRequests
 // actually processes the "switch" this same request also Tells it -- see
 // applySwitch, which no-ops if switchAndReplySnapshot already got there
 // first).
-func switchAndReplySnapshot(requests *uiRequests) statecharts.ActionFunc {
-	return statecharts.Action(func(d *uiModel, ec statecharts.ExecContext) error {
+func switchAndReplySnapshot(requests *uiRequests, runtime *uiRuntime) statecharts.GoAction[uiModel] {
+	return func(d *uiModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		id, conversation, ok := decodeUIRequest(ev.Data)
 		if !ok {
 			return nil
 		}
-		resetForSwitch(d, conversation)
+		resetForSwitch(d, conversation, runtime)
 		requests.mu.Lock()
 		reply := requests.snapshots[id]
 		delete(requests.snapshots, id)
@@ -386,7 +388,7 @@ func switchAndReplySnapshot(requests *uiRequests) statecharts.ActionFunc {
 			reply <- snapshotOf(d)
 		}
 		return nil
-	})
+	}
 }
 
 // getUISnapshotForSwitch is switch_and_snapshot's own request/reply-over-a-
@@ -427,23 +429,55 @@ const UIKind statecharts.Identifier = "ui"
 // local HTTP server as its own long-running Invoke, and the handlers that
 // keep uiModel current as LinkActor forwards server traffic -- pushing a
 // live Datastar patch to every connected browser tab each time.
-func BuildUIChart(sys *actors.System, serverAddr string) (*statecharts.Chart, error) {
-	requests := newUIRequests()
-	runServer := buildRunHTTPServer(sys, serverAddr, requests)
-	return statecharts.Build(
+func BuildUIChart(runtime *uiRuntime, requests *uiRequests) (*statecharts.Chart, error) {
+	model := statecharts.NewGoModel(func() *uiModel { return newUIModel() })
+	action := func(name string, fn statecharts.GoAction[uiModel]) (statecharts.GoActionRef, error) {
+		return model.Action(statecharts.Identifier("ai-agent.client.ui."+name), "v1", fn)
+	}
+	wrap := func(fn func(*uiModel, statecharts.ExecContext, *uiRuntime) error) statecharts.GoAction[uiModel] {
+		return func(d *uiModel, ec statecharts.ExecContext, _ []statecharts.Value) error { return fn(d, ec, runtime) }
+	}
+	actions := []struct {
+		name string
+		fn   func(*uiModel, statecharts.ExecContext, *uiRuntime) error
+	}{
+		{"append-message", appendMessage}, {"append-delta", appendDelta}, {"append-tool-call", appendToolCall}, {"record-link-status", recordLinkStatus}, {"directory-snapshot", applyDirectorySnapshot}, {"directory-upsert", applyDirectoryUpsert}, {"apply-switch", applySwitch},
+	}
+	refs := map[string]statecharts.GoActionRef{}
+	for _, a := range actions {
+		ref, err := action(a.name, wrap(a.fn))
+		if err != nil {
+			return nil, err
+		}
+		refs[a.name] = ref
+	}
+	requestActions := []struct {
+		name string
+		fn   statecharts.GoAction[uiModel]
+	}{
+		{"reply-snapshot", replySnapshot(requests, runtime)}, {"switch-and-snapshot", switchAndReplySnapshot(requests, runtime)}, {"subscribe", subscribeBrowser(requests, runtime)}, {"unsubscribe", unsubscribeBrowser(requests, runtime)},
+	}
+	for _, a := range requestActions {
+		ref, err := action(a.name, a.fn)
+		if err != nil {
+			return nil, err
+		}
+		refs[a.name] = ref
+	}
+	return buildCanonicalChart(
 		statecharts.Atomic("ui",
-			statecharts.Invoke(runServer),
-			statecharts.On("append_message", statecharts.Then(appendMessage)),
-			statecharts.On("append_delta", statecharts.Then(appendDelta)),
-			statecharts.On("append_tool_call", statecharts.Then(appendToolCall)),
-			statecharts.On("link_status", statecharts.Then(recordLinkStatus)),
-			statecharts.On("directory_snapshot", statecharts.Then(applyDirectorySnapshot)),
-			statecharts.On("directory_upsert", statecharts.Then(applyDirectoryUpsert)),
-			statecharts.On("conversation_switched", statecharts.Then(applySwitch)),
-			statecharts.On("get_snapshot", statecharts.Then(replySnapshot(requests))),
-			statecharts.On("switch_and_snapshot", statecharts.Then(switchAndReplySnapshot(requests))),
-			statecharts.On("subscribe_browser", statecharts.Then(subscribeBrowser(requests))),
-			statecharts.On("unsubscribe_browser", statecharts.Then(unsubscribeBrowser(requests))),
+			statecharts.Invoke(string(uiInvokeType), "http-server"),
+			statecharts.On("append_message", statecharts.Then(refs["append-message"].Do())),
+			statecharts.On("append_delta", statecharts.Then(refs["append-delta"].Do())),
+			statecharts.On("append_tool_call", statecharts.Then(refs["append-tool-call"].Do())),
+			statecharts.On("link_status", statecharts.Then(refs["record-link-status"].Do())),
+			statecharts.On("directory_snapshot", statecharts.Then(refs["directory-snapshot"].Do())),
+			statecharts.On("directory_upsert", statecharts.Then(refs["directory-upsert"].Do())),
+			statecharts.On("conversation_switched", statecharts.Then(refs["apply-switch"].Do())),
+			statecharts.On("get_snapshot", statecharts.Then(refs["reply-snapshot"].Do())),
+			statecharts.On("switch_and_snapshot", statecharts.Then(refs["switch-and-snapshot"].Do())),
+			statecharts.On("subscribe_browser", statecharts.Then(refs["subscribe"].Do())),
+			statecharts.On("unsubscribe_browser", statecharts.Then(refs["unsubscribe"].Do())),
 		),
-		statecharts.WithNewDatamodel(func() any { return newUIModel() }), statecharts.WithVersion("v1"))
+		model)
 }

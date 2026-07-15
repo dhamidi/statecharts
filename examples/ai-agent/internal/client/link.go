@@ -29,6 +29,8 @@ type linkModel struct {
 	BackoffAttempt int
 }
 
+const linkInvokeType statecharts.Identifier = "ai-agent.client.link.sse"
+
 // switchRequest is "switch"'s payload -> link, from UIServerActor (or
 // main, for an initial --conversation).
 type switchRequest struct {
@@ -66,17 +68,13 @@ type linkParams struct {
 	LastSeq        int
 }
 
-func computeInvokeParams(ec statecharts.ExecContext) statecharts.Value {
-	d, _ := ec.Datamodel().(*linkModel)
-	if d == nil {
-		return encodeLinkParams(linkParams{})
-	}
+func computeInvokeParams(d *linkModel, _ statecharts.ExecContext, _ []statecharts.Value) (statecharts.Value, error) {
 	return encodeLinkParams(linkParams{
 		ServerAddr:     d.ServerAddr,
 		ConversationID: d.ConversationID,
 		Tools:          d.Tools,
 		LastSeq:        d.LastSeq,
-	})
+	}), nil
 }
 
 func encodeLinkParams(p linkParams) statecharts.Value {
@@ -201,36 +199,36 @@ func parseServerFrame(event, id, data string) serverFrame {
 	return f
 }
 
-var resetBackoff = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+var resetBackoff = func(d *linkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	d.BackoffAttempt = 0
 	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: str("connected")})
 	return nil
-})
+}
 
-var reportReconnecting = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+var reportReconnecting = func(d *linkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: str("reconnecting")})
 	return nil
-})
+}
 
 // reportIdle fires on entering "idle" -- the chart's actual initial state,
 // held until the first "switch" -- so "ui" learns promptly that nothing is
 // selected yet rather than sitting on whatever it guessed at startup (see
 // ui.go's newUIModel).
-var reportIdle = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+var reportIdle = func(d *linkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: str("idle")})
 	return nil
-})
+}
 
 // reportConnecting fires on entering "online.connecting" -- a dial is
 // actually in flight (see dialSSE) -- distinct from "idle" so the UI banner
 // can tell "nothing is happening yet" apart from "actively trying and not
 // there yet".
-var reportConnecting = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+var reportConnecting = func(d *linkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Send("link_status", statecharts.SendOptions{Target: "ui", Data: str("connecting")})
 	return nil
-})
+}
 
-var dispatchFrame = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+var dispatchFrame = func(d *linkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	f, ok := decodeServerFrame(ev.Data)
 	if !ok {
@@ -293,7 +291,7 @@ var dispatchFrame = statecharts.Action(func(d *linkModel, ec statecharts.ExecCon
 		}
 	}
 	return nil
-})
+}
 
 // backoffDelay grows 500ms, 1s, 2s, 4s, ... capped at 10s.
 func backoffDelay(attempt int) time.Duration {
@@ -307,13 +305,13 @@ func backoffDelay(attempt int) time.Duration {
 	return d
 }
 
-var scheduleReconnect = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+var scheduleReconnect = func(d *linkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ec.Send("reconnect_timer", statecharts.SendOptions{Delay: backoffDelay(d.BackoffAttempt)})
 	d.BackoffAttempt++
 	return nil
-})
+}
 
-var handleSwitch = statecharts.Action(func(d *linkModel, ec statecharts.ExecContext) error {
+var handleSwitch = func(d *linkModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 	ev, _ := ec.Event()
 	sw, ok := decodeSwitch(ev.Data)
 	if !ok {
@@ -324,7 +322,7 @@ var handleSwitch = statecharts.Action(func(d *linkModel, ec statecharts.ExecCont
 	d.BackoffAttempt = 0
 	ec.Send("conversation_switched", statecharts.SendOptions{Target: "ui", Data: str(sw.ConversationID.String())})
 	return nil
-})
+}
 
 // LinkKind is the chart kind name the client's singleton "link" actor is
 // Registered and Spawned under.
@@ -335,23 +333,59 @@ const LinkKind statecharts.Identifier = "link"
 // reconnect-with-backoff, or offline in "backoff" between attempts.
 // serverAddr and tools are fixed for this client process's whole lifetime.
 func BuildLinkChart(serverAddr string, tools []protocol.ToolName) (*statecharts.Chart, error) {
-	return statecharts.Build(
+	model := statecharts.NewGoModel(func() *linkModel { return &linkModel{ServerAddr: serverAddr, Tools: tools} })
+	action := func(name string, fn statecharts.GoAction[linkModel]) (statecharts.GoActionRef, error) {
+		return model.Action(statecharts.Identifier("ai-agent.client.link."+name), "v1", fn)
+	}
+	reportIdleRef, err := action("report-idle", reportIdle)
+	if err != nil {
+		return nil, err
+	}
+	reportConnectingRef, err := action("report-connecting", reportConnecting)
+	if err != nil {
+		return nil, err
+	}
+	resetBackoffRef, err := action("reset-backoff", resetBackoff)
+	if err != nil {
+		return nil, err
+	}
+	dispatchFrameRef, err := action("dispatch-frame", dispatchFrame)
+	if err != nil {
+		return nil, err
+	}
+	reportReconnectingRef, err := action("report-reconnecting", reportReconnecting)
+	if err != nil {
+		return nil, err
+	}
+	scheduleReconnectRef, err := action("schedule-reconnect", scheduleReconnect)
+	if err != nil {
+		return nil, err
+	}
+	handleSwitchRef, err := action("handle-switch", handleSwitch)
+	if err != nil {
+		return nil, err
+	}
+	paramsRef, err := model.Value("ai-agent.client.link.invoke-params", "v1", computeInvokeParams)
+	if err != nil {
+		return nil, err
+	}
+	return buildCanonicalChart(
 		statecharts.Compound("link", "idle",
 			statecharts.Children(
 				statecharts.Atomic("idle",
-					statecharts.OnEntry(reportIdle),
+					statecharts.OnEntry(reportIdleRef.Do()),
 				),
 				statecharts.Compound("online", "connecting",
 					statecharts.Children(
 						statecharts.Atomic("connecting",
-							statecharts.OnEntry(reportConnecting),
-							statecharts.On("connected", statecharts.Target("connected"), statecharts.Then(resetBackoff)),
+							statecharts.OnEntry(reportConnectingRef.Do()),
+							statecharts.On("connected", statecharts.Target("connected"), statecharts.Then(resetBackoffRef.Do())),
 						),
 						statecharts.Atomic("connected",
-							statecharts.On("server_frame", statecharts.Then(dispatchFrame)),
+							statecharts.On("server_frame", statecharts.Then(dispatchFrameRef.Do())),
 						),
 					),
-					statecharts.Invoke(dialSSE, statecharts.WithInvokeParams(computeInvokeParams)),
+					statecharts.Invoke(string(linkInvokeType), "conversation-events", statecharts.WithInvokeContent(paramsRef.Get())),
 					statecharts.On(string(statecharts.ErrEventCommunication), statecharts.Target("backoff")),
 					// dispatchFrame raises this when a "message" frame arrives with a
 					// gap before it in the seq space -- force the same
@@ -361,11 +395,11 @@ func BuildLinkChart(serverAddr string, tools []protocol.ToolName) (*statecharts.
 					statecharts.On("resync", statecharts.Target("backoff")),
 				),
 				statecharts.Atomic("backoff",
-					statecharts.OnEntry(reportReconnecting, scheduleReconnect),
+					statecharts.OnEntry(reportReconnectingRef.Do(), scheduleReconnectRef.Do()),
 					statecharts.On("reconnect_timer", statecharts.Target("online")),
 				),
 			),
-			statecharts.On("switch", statecharts.Target("online"), statecharts.Then(handleSwitch)),
+			statecharts.On("switch", statecharts.Target("online"), statecharts.Then(handleSwitchRef.Do())),
 		),
-		statecharts.WithNewDatamodel(func() any { return &linkModel{ServerAddr: serverAddr, Tools: tools} }), statecharts.WithVersion("v1"))
+		model)
 }
