@@ -412,6 +412,30 @@ if err := system.Tell(ctx, "invoice-42", statecharts.Event{
 }
 ```
 
+`Register` establishes the Go-built chart's stable identity, compiler, and
+first current revision. To hot-deploy a complete edited definition, publish it
+only after decoding the whole file:
+
+```go
+definition, revision, ok := system.CurrentDefinition(chart.ID())
+if !ok {
+	return fmt.Errorf("chart is not registered")
+}
+_ = revision // expose this in administrative output
+
+definition.RevisionSalt = "invoice-v2"
+newRevision, err := system.Publish(ctx, definition)
+if err != nil {
+	return err
+}
+```
+
+Publication compiles all expressions and handlers and stores the immutable
+artifact before one atomic current-pointer change. Actors already spawned stay
+on their pinned revision; only future actors select `newRevision`. Definitions
+returned by `CurrentDefinition` and `Definition` are independent editable
+copies.
+
 Actor IDs are hierarchical `Identifier` values. Routing locations use `@`:
 `billing.invoice-42@host-a`. The node name is routing metadata, not durable
 identity. Each system has an isolated storage boundary, so moving a system to

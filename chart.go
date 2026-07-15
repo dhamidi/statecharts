@@ -11,6 +11,7 @@ type Chart struct {
 	name                  string
 	byID                  map[Identifier]*compiledState
 	order                 []*compiledState // document order (pre-order traversal of the state tree)
+	datamodel             Datamodel
 	program               DatamodelProgram
 	programFingerprint    []byte
 	canonicalDefinition   []byte
@@ -69,12 +70,9 @@ func WithData(data ...DataDefinition) BuildOption {
 // datamodel program.
 func (c *Chart) Revision() RevisionID { return c.revision }
 
-// ID returns the chart's root state's ID, which identifies the chart itself
-// wherever a chart-level identity is needed. A Chart is otherwise
-// anonymous -- only its states have names.
-func (c *Chart) ID() Identifier {
-	return c.root.id
-}
+// ID returns the stable Definition identity used for publication and actor
+// kinds. It is independent of the root state's structural ID.
+func (c *Chart) ID() Identifier { return c.definition.ID }
 
 // Name returns the SCXML document's name attribute, or empty if omitted.
 func (c *Chart) Name() string { return c.name }
@@ -82,6 +80,11 @@ func (c *Chart) Name() string { return c.name }
 // DatamodelProgram returns the immutable model program shared by this chart's
 // instances.
 func (c *Chart) DatamodelProgram() DatamodelProgram { return c.program }
+
+// Datamodel returns the compiler used to build this chart. Actor registries
+// retain it to compile complete replacement definitions and resolve retained
+// artifacts without modifying an existing Chart.
+func (c *Chart) Datamodel() Datamodel { return c.datamodel }
 
 type compiledState struct {
 	id           Identifier

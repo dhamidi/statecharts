@@ -398,11 +398,12 @@ For example, in illustrative pseudocode (the final editing and codec APIs are
 not fixed by this decision):
 
 ```go
-// v1 was originally built using the Go builder.
-v1, err := system.Definition("counter")
-if err != nil {
-	return err
+// v1 was originally built using the Go builder and registered on this System.
+v1, revision, ok := system.CurrentDefinition("counter")
+if !ok {
+	return ErrChartNotRegistered
 }
+_ = revision
 
 if err := textcodec.EncodeFile("counter.chart", v1); err != nil {
 	return err
@@ -414,9 +415,9 @@ if err != nil {
 	return err
 }
 
-// PublishDefinition compiles and validates the complete candidate before
+// Publish compiles and validates the complete candidate before
 // atomically changing the revision selected by later spawns.
-if err := system.PublishDefinition(edited, models); err != nil {
+if _, err := system.Publish(ctx, edited); err != nil {
 	return err
 }
 ```

@@ -16,11 +16,13 @@ import (
 // Option configures a System built by NewSystem.
 type Option func(*systemConfig)
 
-// Storage is the durable boundary for one System. It stores both the event
-// log and checkpoint cache for every durable actor in that System.
+// Storage is the durable boundary for one System. It stores the event log,
+// checkpoint cache, and immutable chart definitions used by durable actors in
+// that System.
 type Storage interface {
 	statecharts.DurableLog
 	statecharts.SnapshotStore
+	statecharts.DefinitionStore
 }
 
 type systemConfig struct {
@@ -222,7 +224,7 @@ type System struct {
 	cfg systemConfig
 
 	chartsMu sync.Mutex
-	charts   map[statecharts.Identifier]*statecharts.Chart
+	charts   map[statecharts.Identifier]*chartRegistry
 
 	tableMu sync.Mutex
 	table   map[statecharts.Identifier]*actorEntry
@@ -248,13 +250,24 @@ type System struct {
 	dispatchDone    chan struct{}
 }
 
-// actorEntry is the system's record of one named actor, whether or not it
-// is currently resident. Only (name, kind, durable) survive a page-out;
-// instance and lastActive are meaningful only while resident.
+// chartRegistry owns one stable chart identity. Compiled revisions are
+// immutable; publication changes only current after a candidate has compiled
+// and, when configured, its artifact has been stored durably.
+type chartRegistry struct {
+	publishMu sync.Mutex
+	datamodel statecharts.Datamodel
+	current   statecharts.RevisionID
+	revisions map[statecharts.RevisionID]*statecharts.Chart
+}
+
+// actorEntry is the system's record of one named actor, whether or not it is
+// currently resident. Kind and revision are selected exactly once on first
+// Spawn; publication never changes an existing entry's pinned revision.
 type actorEntry struct {
-	name    statecharts.Identifier
-	kind    statecharts.Identifier
-	durable bool
+	name     statecharts.Identifier
+	kind     statecharts.Identifier
+	revision statecharts.RevisionID
+	durable  bool
 
 	// mu serializes activation (page-in) and eviction (page-out) for this
 	// one name, so at most one live Instance for it ever exists at a time
@@ -276,7 +289,7 @@ func NewSystem(opts ...Option) *System {
 	}
 	s := &System{
 		cfg:    cfg,
-		charts: map[statecharts.Identifier]*statecharts.Chart{},
+		charts: map[statecharts.Identifier]*chartRegistry{},
 		table:  map[statecharts.Identifier]*actorEntry{},
 	}
 	s.dispatchCond = sync.NewCond(&s.dispatchMu)
@@ -284,27 +297,89 @@ func NewSystem(opts ...Option) *System {
 	return s
 }
 
-// Register makes chart's kind (chart.ID()) available to Spawn. Every chart
-// a System will ever spawn must be registered before the first Spawn that
-// names it: paging an actor back in reconstructs its Instance from the
-// registered Chart, since the Go value itself is never persisted.
-//
-// Register fails if chart has no datamodel program -- it could never be paged
-// in without one -- or if a chart with the same ID is already registered.
+// Register establishes the first current revision and datamodel compiler for
+// a stable chart identity. Later complete definitions are installed with
+// Publish. Register stores the immutable artifact first when the System has
+// durable storage, and it never replaces an existing registry.
 func (s *System) Register(chart *statecharts.Chart) error {
-	if chart.DatamodelProgram() == nil {
+	if chart == nil {
+		return fmt.Errorf("actors: Register: nil chart")
+	}
+	if chart.Datamodel() == nil || chart.DatamodelProgram() == nil {
 		return fmt.Errorf("actors: Register: chart %q has no datamodel program", chart.ID())
 	}
 	if err := chart.Prepare(s.invokeHandlerOptions()...); err != nil {
 		return fmt.Errorf("actors: Register: chart %q: %w", chart.ID(), err)
+	}
+	artifact := chart.DefinitionArtifact()
+	if s.cfg.storage != nil {
+		if _, err := s.cfg.storage.PutDefinition(context.Background(), artifact); err != nil {
+			return fmt.Errorf("actors: Register: store chart %q revision %q: %w", chart.ID(), chart.Revision(), err)
+		}
 	}
 	s.chartsMu.Lock()
 	defer s.chartsMu.Unlock()
 	if _, exists := s.charts[chart.ID()]; exists {
 		return fmt.Errorf("actors: Register: chart %q is already registered", chart.ID())
 	}
-	s.charts[chart.ID()] = chart
+	s.charts[chart.ID()] = &chartRegistry{
+		datamodel: chart.Datamodel(),
+		current:   chart.Revision(),
+		revisions: map[statecharts.RevisionID]*statecharts.Chart{chart.Revision(): chart},
+	}
 	return nil
+}
+
+// Publish compiles and atomically installs a complete replacement Definition.
+// The chart identity must already be established by Register. Compilation,
+// runtime requirement validation, and durable artifact storage all finish
+// before current changes, so failed publication leaves existing and future
+// actor selection unchanged. Existing actors remain pinned to their original
+// revision.
+func (s *System) Publish(ctx context.Context, definition statecharts.Definition) (statecharts.RevisionID, error) {
+	if err := definition.Validate(); err != nil {
+		return "", fmt.Errorf("actors: Publish: %w", err)
+	}
+	kind := definition.ID
+	s.chartsMu.Lock()
+	registry, ok := s.charts[kind]
+	if !ok {
+		s.chartsMu.Unlock()
+		return "", fmt.Errorf("actors: Publish: chart %q was never Registered: %w", kind, ErrKindNotRegistered)
+	}
+	datamodel := registry.datamodel
+	s.chartsMu.Unlock()
+	registry.publishMu.Lock()
+	defer registry.publishMu.Unlock()
+
+	chart, err := statecharts.Compile(definition, datamodel)
+	if err != nil {
+		return "", fmt.Errorf("actors: Publish chart %q: %w", kind, err)
+	}
+	if err := chart.Prepare(s.invokeHandlerOptions()...); err != nil {
+		return "", fmt.Errorf("actors: Publish chart %q: %w", kind, err)
+	}
+	artifact := chart.DefinitionArtifact()
+	if s.cfg.storage != nil {
+		if _, err := s.cfg.storage.PutDefinition(ctx, artifact); err != nil {
+			return "", fmt.Errorf("actors: Publish: store chart %q revision %q: %w", kind, chart.Revision(), err)
+		}
+	}
+
+	s.chartsMu.Lock()
+	defer s.chartsMu.Unlock()
+	if s.charts[kind] != registry {
+		return "", fmt.Errorf("actors: Publish: chart %q registry changed", kind)
+	}
+	if retained, exists := registry.revisions[chart.Revision()]; exists {
+		if !retained.DefinitionArtifact().Equal(artifact) {
+			return "", statecharts.ErrDefinitionCollision
+		}
+	} else {
+		registry.revisions[chart.Revision()] = chart
+	}
+	registry.current = chart.Revision()
+	return chart.Revision(), nil
 }
 
 func (s *System) invokeHandlerOptions() []statecharts.Option {
@@ -318,8 +393,55 @@ func (s *System) invokeHandlerOptions() []statecharts.Option {
 func (s *System) chartFor(kind statecharts.Identifier) (*statecharts.Chart, bool) {
 	s.chartsMu.Lock()
 	defer s.chartsMu.Unlock()
-	c, ok := s.charts[kind]
-	return c, ok
+	registry, ok := s.charts[kind]
+	if !ok {
+		return nil, false
+	}
+	chart, ok := registry.revisions[registry.current]
+	return chart, ok
+}
+
+func (s *System) chartForRevision(kind statecharts.Identifier, revision statecharts.RevisionID) (*statecharts.Chart, bool) {
+	s.chartsMu.Lock()
+	defer s.chartsMu.Unlock()
+	registry, ok := s.charts[kind]
+	if !ok {
+		return nil, false
+	}
+	chart, ok := registry.revisions[revision]
+	return chart, ok
+}
+
+// CurrentDefinition returns an independently editable copy of kind's current
+// definition and its revision.
+func (s *System) CurrentDefinition(kind statecharts.Identifier) (statecharts.Definition, statecharts.RevisionID, bool) {
+	s.chartsMu.Lock()
+	defer s.chartsMu.Unlock()
+	registry, ok := s.charts[kind]
+	if !ok {
+		return statecharts.Definition{}, "", false
+	}
+	chart, ok := registry.revisions[registry.current]
+	if !ok {
+		return statecharts.Definition{}, "", false
+	}
+	return chart.Definition(), registry.current, true
+}
+
+// Definition returns an independently editable copy of one retained chart
+// revision.
+func (s *System) Definition(kind statecharts.Identifier, revision statecharts.RevisionID) (statecharts.Definition, bool) {
+	s.chartsMu.Lock()
+	defer s.chartsMu.Unlock()
+	registry, ok := s.charts[kind]
+	if !ok {
+		return statecharts.Definition{}, false
+	}
+	chart, ok := registry.revisions[revision]
+	if !ok {
+		return statecharts.Definition{}, false
+	}
+	return chart.Definition(), true
 }
 
 // SpawnOption configures a Spawn call.
@@ -406,12 +528,11 @@ var ErrUnknownActor = errors.New("actors: unknown actor")
 // SendOptions.Target.
 var ErrInvalidActorID = errors.New("actors: invalid actor ID")
 
-// Spawn gives an actor its stable ID within the system and
-// starts it running under the Chart registered for kind. Spawn is
-// idempotent for an ID that is already resident: calling it again for the
-// same ID, kind, and durability is a no-op. IDs are Identifiers and may be
-// hierarchical; routing locations such as "invoice-42@host-a" belong in
-// Tell or SendOptions.Target, not Spawn.
+// Spawn gives an actor its stable ID within the system and starts it under the
+// revision current for kind at first creation. Spawn is idempotent for an ID
+// that already exists: publication does not move that entry from its pinned
+// revision. IDs are Identifiers and may be hierarchical; routing locations
+// such as "invoice-42@host-a" belong in Tell or SendOptions.Target, not Spawn.
 //
 // Without Durable, Spawn behaves like statecharts.New plus Start: the actor
 // begins in kind's initial configuration and keeps no record of what it
@@ -436,14 +557,14 @@ func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Ident
 		opt(&cfg)
 	}
 
-	_, ok := s.chartFor(kind)
+	chart, ok := s.chartFor(kind)
 	if !ok {
 		return fmt.Errorf("actors: Spawn: kind %q was never Registered: %w", kind, ErrKindNotRegistered)
 	}
 	if cfg.durable && s.cfg.storage == nil {
 		return fmt.Errorf("actors: Spawn: %w", ErrDurabilityUnsupported)
 	}
-	entry, err := s.entryFor(name, kind, cfg.durable)
+	entry, err := s.entryFor(name, kind, chart.Revision(), cfg.durable)
 	if err != nil {
 		return err
 	}
@@ -453,9 +574,10 @@ func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Ident
 	return s.activateLocked(ctx, entry)
 }
 
-// entryFor returns the table entry for an actor ID, creating one on first
-// use. An ID's kind and durability are fixed by whichever call creates its
-// entry; a later Spawn naming a different kind or durability is an error.
+// entryFor returns the table entry for an actor ID, creating one on first use.
+// An ID's kind, revision, and durability are fixed by whichever call creates
+// its entry. A later Spawn for the same kind retains the stored revision even
+// if publication changed current in the meantime.
 //
 // The stopped check here, under the same tableMu Stop takes to snapshot the
 // table, is what closes the Spawn/Stop TOCTOU: Spawn's "is the system
@@ -463,7 +585,7 @@ func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Ident
 // snapshot the table" are each a single critical section on tableMu, so
 // there is no window in which entryFor inserts a name that Stop's snapshot
 // has already missed.
-func (s *System) entryFor(name, kind statecharts.Identifier, durable bool) (*actorEntry, error) {
+func (s *System) entryFor(name, kind statecharts.Identifier, revision statecharts.RevisionID, durable bool) (*actorEntry, error) {
 	s.tableMu.Lock()
 	defer s.tableMu.Unlock()
 	if s.stopped.Load() {
@@ -478,9 +600,21 @@ func (s *System) entryFor(name, kind statecharts.Identifier, durable bool) (*act
 		}
 		return e, nil
 	}
-	e := &actorEntry{name: name, kind: kind, durable: durable}
+	e := &actorEntry{name: name, kind: kind, revision: revision, durable: durable}
 	s.table[name] = e
 	return e, nil
+}
+
+// ActorRevision reports the immutable revision selected when actorID was
+// first spawned. It is observational and never activates an actor.
+func (s *System) ActorRevision(actorID ActorID) (statecharts.RevisionID, bool) {
+	s.tableMu.Lock()
+	defer s.tableMu.Unlock()
+	entry, ok := s.table[actorID]
+	if !ok {
+		return "", false
+	}
+	return entry.revision, true
 }
 
 // resolve reports whether an actor ID is known to s -- spawned at some point,
@@ -567,9 +701,9 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 		return err
 	}
 
-	chart, ok := s.chartFor(entry.kind)
+	chart, ok := s.chartForRevision(entry.kind, entry.revision)
 	if !ok {
-		return fmt.Errorf("actors: activate %q: kind %q is not registered: %w", entry.name, entry.kind, ErrKindNotRegistered)
+		return fmt.Errorf("actors: activate %q: kind %q revision %q is not retained: %w", entry.name, entry.kind, entry.revision, statecharts.ErrDefinitionNotFound)
 	}
 	invokeOpts := s.invokeHandlerOptions()
 	if err := chart.Prepare(invokeOpts...); err != nil {

@@ -39,7 +39,7 @@ func Compile(definition Definition, model Datamodel) (*Chart, error) {
 		return nil, err
 	}
 	c := &Chart{
-		byID: map[Identifier]*compiledState{}, name: d.Name, program: program,
+		byID: map[Identifier]*compiledState{}, name: d.Name, datamodel: model, program: program,
 		programFingerprint: append([]byte(nil), fingerprint...), canonicalDefinition: append([]byte(nil), canonical...),
 		revision: revision, definition: d, data: globalData, dataBinding: d.DataBinding,
 		invokesByDefinitionID: map[Identifier]*compiledInvoke{},

@@ -11,15 +11,15 @@
 // WithClock controls time. WithNodeName supplies the routing location without
 // changing stable actor IDs or their keys in the System's isolated Storage.
 //
-// Register every Chart a System will ever spawn, then Spawn actors by stable
-// ActorID under those charts' kinds (a chart's own ID, see
-// statecharts.Chart.ID). Actor IDs are Identifiers and may be hierarchical.
-// Spawn without Durable behaves like statecharts.New plus Start and keeps no
-// history -- if the process restarts, the actor is gone. Spawn with Durable
-// records every message to the system's Log before applying it, so the same
-// name can later be paged out and paged back in, even in a different
-// process against the same Log, landing in exactly the state it was in
-// before.
+// Register a Go-built Chart to establish its stable identity and first
+// revision, then Spawn actors by stable ActorID under that chart ID. Publish
+// validates and compiles a complete replacement Definition before atomically
+// making its revision current for future spawns; existing actors remain pinned
+// to the revision selected at their first Spawn. Actor IDs are Identifiers and
+// may be hierarchical. Spawn without Durable behaves like statecharts.New plus
+// Start and keeps no history -- if the process restarts, the actor is gone.
+// Spawn with Durable records every message to the system's Log before applying
+// it, so the same name can later be paged out and paged back in.
 //
 // Every actor a System spawns addresses its peers by actor ID or by an
 // "<actor-id>@<node>" routing key, through the same routing IOProcessor the

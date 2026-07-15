@@ -71,6 +71,23 @@ func TestBuildGoChartDefinitionIsolationAndRoundTrip(t *testing.T) {
 	}
 }
 
+func TestChartIdentityIsIndependentOfRootStateAndRetainsDatamodelCompiler(t *testing.T) {
+	model := NewGoModel(func() *struct{} { return &struct{}{} })
+	chart, err := Compile(Definition{
+		ID: "orders", Datamodel: model.Name(),
+		Root: StateDefinition{ID: StateDefinitionID{Value: "workflow-root"}, Kind: KindAtomic},
+	}, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chart.ID() != "orders" {
+		t.Fatalf("Chart.ID = %q, want definition ID %q", chart.ID(), "orders")
+	}
+	if chart.Datamodel() != model {
+		t.Fatal("Chart did not retain its datamodel compiler")
+	}
+}
+
 func TestBuildStateKindsAndDefaultInitials(t *testing.T) {
 	model := NewGoModel(func() *struct{} { return &struct{}{} })
 	chart, err := Build(Parallel("machine", Children(
