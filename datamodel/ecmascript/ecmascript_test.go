@@ -636,11 +636,11 @@ func TestSessionsIsolateGlobalsWhileSharingAProgram(t *testing.T) {
 
 func TestTextExpressionAndDefinitionRoundTripPreserveRevision(t *testing.T) {
 	codec := ecmascript.TextExpressionCodec{}
-	expression, err := codec.ParseExpression(ecmascript.SourceExpression, "value + 1\n")
+	expression, err := codec.ParseExpression(statecharts.TextExpressionValue, "value + 1\n")
 	if err != nil {
 		t.Fatalf("ParseExpression: %v", err)
 	}
-	formatted, err := codec.FormatExpression(ecmascript.SourceExpression, expression)
+	formatted, err := codec.FormatExpression(statecharts.TextExpressionValue, expression)
 	if err != nil {
 		t.Fatalf("FormatExpression: %v", err)
 	}

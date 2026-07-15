@@ -9,16 +9,6 @@ import (
 
 const expressionKind statecharts.Identifier = "ecmascript.source"
 
-// ExpressionKind identifies a textual ECMAScript expression form.
-type ExpressionKind string
-
-const (
-	// SourceExpression is ordinary ECMAScript source text. The definition
-	// location determines whether it is evaluated as a value, condition,
-	// assignable location, or script.
-	SourceExpression ExpressionKind = "source"
-)
-
 // Source returns a serializable ECMAScript source expression.
 func Source(text string) (statecharts.Expression, error) {
 	value, err := statecharts.StringValue(text)
@@ -29,22 +19,20 @@ func Source(text string) (statecharts.Expression, error) {
 }
 
 // TextExpressionCodec converts package-owned source expressions to and from
-// plain text. It is deliberately separate from Definition codecs.
+// plain text and implements statecharts.TextExpressionCodec. It is deliberately
+// separate from Definition codecs.
 type TextExpressionCodec struct{}
 
+// TextExpressionCodec returns this model's surface-syntax expression bridge.
+func (*Model) TextExpressionCodec() statecharts.TextExpressionCodec { return TextExpressionCodec{} }
+
 // ParseExpression wraps source text in a serializable expression.
-func (TextExpressionCodec) ParseExpression(kind ExpressionKind, text string) (statecharts.Expression, error) {
-	if kind != SourceExpression {
-		return statecharts.Expression{}, fmt.Errorf("ecmascript: unsupported text expression kind %q", kind)
-	}
+func (TextExpressionCodec) ParseExpression(_ statecharts.TextExpressionRole, text string) (statecharts.Expression, error) {
 	return Source(text)
 }
 
 // FormatExpression extracts source text without normalizing whitespace.
-func (TextExpressionCodec) FormatExpression(kind ExpressionKind, expression statecharts.Expression) (string, error) {
-	if kind != SourceExpression {
-		return "", fmt.Errorf("ecmascript: unsupported text expression kind %q", kind)
-	}
+func (TextExpressionCodec) FormatExpression(_ statecharts.TextExpressionRole, expression statecharts.Expression) (string, error) {
 	text, err := expressionSource(expression)
 	if err != nil {
 		return "", err

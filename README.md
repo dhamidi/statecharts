@@ -373,6 +373,33 @@ definition during startup. The ai-agent example performs an equivalent
 encode/decode/recompile path for every chart family before returning a chart,
 so its behavioral tests run against transported definitions.
 
+For standards-based interchange, the optional
+`github.com/dhamidi/statecharts/syntax/scxml` package maps the same complete
+`Definition` to and from SCXML. Expressions remain owned by the selected
+datamodel, so callers provide that model's text codec rather than asking the
+XML adapter to interpret program text:
+
+```go
+wire, err := scxml.MarshalIndent(
+	chart.Definition(),
+	"  ",
+	scxml.WithTextExpressionCodec(model.TextExpressionCodec()),
+)
+edited, err := scxml.Unmarshal(
+	wire,
+	scxml.WithTextExpressionCodec(model.TextExpressionCodec()),
+)
+nextChart, err := statecharts.Compile(edited, model)
+```
+
+`GoModel.TextExpressionCodec` stores stable function names, versions, and
+canonical arguments as editable expression text; it never serializes function
+pointers. The optional ECMAScript model's `TextExpressionCodec` preserves
+source text verbatim. Encoding fails at the exact definition path if the
+chosen codec cannot faithfully represent an expression. Unknown executable
+XML is rejected, while explicit `ExtensionDefinition` nodes preserve their
+namespace, name, and canonical payload.
+
 Compilation creates a new immutable chart; it never mutates an existing one.
 `actors.System.Publish` provides Erlang-style deployment: existing actors stay
 pinned to their old chart while newly spawned actors select the new current
