@@ -8,6 +8,24 @@ import (
 	"testing"
 )
 
+func mustStringValue(t *testing.T, value string) Value {
+	t.Helper()
+	result, err := StringValue(value)
+	if err != nil {
+		t.Fatalf("StringValue(%q): %v", value, err)
+	}
+	return result
+}
+
+func mustMapValue(t *testing.T, values map[string]Value) Value {
+	t.Helper()
+	result, err := MapValue(values)
+	if err != nil {
+		t.Fatalf("MapValue: %v", err)
+	}
+	return result
+}
+
 func TestValueScalarCanonicalEncodingRoundTrip(t *testing.T) {
 	number, err := NumberValue("-123.4500e+2")
 	if err != nil {
@@ -18,13 +36,13 @@ func TestValueScalarCanonicalEncodingRoundTrip(t *testing.T) {
 		NullValue(),
 		BoolValue(false),
 		BoolValue(true),
-		StringValue(""),
-		StringValue("hello, 世界"),
+		mustStringValue(t, ""),
+		mustStringValue(t, "hello, 世界"),
 		number,
 		Int64Value(math.MinInt64),
 		Uint64Value(math.MaxUint64),
 		ListValue(nil),
-		MapValue(nil),
+		mustMapValue(t, nil),
 	}
 
 	for _, want := range values {
@@ -60,10 +78,10 @@ func TestValueScalarCanonicalEncodingRoundTrip(t *testing.T) {
 
 func TestValueNestedAndTaggedRoundTrip(t *testing.T) {
 	count := Int64Value(3)
-	payload := MapValue(map[string]Value{
+	payload := mustMapValue(t, map[string]Value{
 		"enabled": BoolValue(true),
 		"items": ListValue([]Value{
-			StringValue("first"),
+			mustStringValue(t, "first"),
 			count,
 			NullValue(),
 		}),
@@ -137,15 +155,15 @@ func TestValueNumbersAreExactAndRejectUnsupportedForms(t *testing.T) {
 }
 
 func TestValueMapEncodingIsDeterministic(t *testing.T) {
-	left := MapValue(map[string]Value{
+	left := mustMapValue(t, map[string]Value{
 		"z": Int64Value(1),
-		"a": StringValue("first"),
+		"a": mustStringValue(t, "first"),
 		"m": BoolValue(true),
 	})
-	right := MapValue(map[string]Value{
+	right := mustMapValue(t, map[string]Value{
 		"m": BoolValue(true),
 		"z": Int64Value(1),
-		"a": StringValue("first"),
+		"a": mustStringValue(t, "first"),
 	})
 
 	leftBytes, err := left.MarshalBinary()
@@ -162,12 +180,12 @@ func TestValueMapEncodingIsDeterministic(t *testing.T) {
 }
 
 func TestValueConstructorsCloneAndAccessorsDoNotLeakAliases(t *testing.T) {
-	nestedMap := map[string]Value{"name": StringValue("before")}
-	mapValue := MapValue(nestedMap)
+	nestedMap := map[string]Value{"name": mustStringValue(t, "before")}
+	mapValue := mustMapValue(t, nestedMap)
 	items := []Value{mapValue}
 	original := ListValue(items)
 
-	nestedMap["name"] = StringValue("after")
+	nestedMap["name"] = mustStringValue(t, "after")
 	items[0] = NullValue()
 	gotItems, ok := original.AsList()
 	if !ok || len(gotItems) != 1 {
@@ -182,18 +200,28 @@ func TestValueConstructorsCloneAndAccessorsDoNotLeakAliases(t *testing.T) {
 	}
 
 	clone := original.Clone()
-	clone.list[0].object["name"] = StringValue("clone mutation")
+	clone.list[0].object["name"] = mustStringValue(t, "clone mutation")
 	originalItems, _ := original.AsList()
 	originalMap, _ := originalItems[0].AsMap()
 	if got, _ := originalMap["name"].AsString(); got != "before" {
 		t.Fatalf("original name after clone mutation = %q, want %q", got, "before")
 	}
 
-	gotMap["name"] = StringValue("accessor mutation")
+	gotMap["name"] = mustStringValue(t, "accessor mutation")
 	again, _ := original.AsList()
 	againMap, _ := again[0].AsMap()
 	if got, _ := againMap["name"].AsString(); got != "before" {
 		t.Fatalf("original name after accessor mutation = %q, want %q", got, "before")
+	}
+}
+
+func TestValueConstructorsRejectInvalidUTF8(t *testing.T) {
+	invalid := string([]byte{0xff})
+	if _, err := StringValue(invalid); err == nil {
+		t.Fatal("StringValue accepted invalid UTF-8, want construction error")
+	}
+	if _, err := MapValue(map[string]Value{invalid: NullValue()}); err == nil {
+		t.Fatal("MapValue accepted an invalid UTF-8 key, want construction error")
 	}
 }
 
@@ -231,7 +259,7 @@ func TestValueWireRejectsMalformedUnionsAndUnknownKinds(t *testing.T) {
 		t.Fatalf("ValueFromWire malformed union error = %v", err)
 	}
 
-	unchanged := StringValue("keep me")
+	unchanged := mustStringValue(t, "keep me")
 	if err := unchanged.UnmarshalText([]byte(`{"version":1,"kind":"future"}`)); err == nil {
 		t.Fatal("unknown wire kind succeeded, want error")
 	}
@@ -266,6 +294,14 @@ func TestValueJSONShapedConversionsAreIsolated(t *testing.T) {
 	}
 	if got := object["items"].([]any)[0]; got != "one" {
 		t.Fatalf("first item = %v, want isolated original", got)
+	}
+
+	integralJSON, err := Int64Value(10).JSONValue()
+	if err != nil {
+		t.Fatalf("integral JSONValue: %v", err)
+	}
+	if _, err := integralJSON.(json.Number).Int64(); err == nil {
+		t.Fatal("canonical exponent-form number unexpectedly parsed with json.Number.Int64")
 	}
 
 	tagged, err := TaggedValue("example", NullValue())

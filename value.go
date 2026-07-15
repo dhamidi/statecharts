@@ -65,11 +65,13 @@ func BoolValue(value bool) Value {
 	return Value{kind: ValueKindBool, bool: value}
 }
 
-// StringValue returns a canonical string Value. A string must contain valid
-// UTF-8 when encoded; MarshalBinary, MarshalText, MarshalJSON, and Wire report
-// an error for invalid UTF-8 rather than changing it.
-func StringValue(value string) Value {
-	return Value{kind: ValueKindString, text: value}
+// StringValue returns a canonical string Value. It rejects invalid UTF-8 at
+// construction rather than creating a Value that cannot be persisted.
+func StringValue(value string) (Value, error) {
+	if !utf8.ValidString(value) {
+		return Value{}, fmt.Errorf("statecharts: Value string is not valid UTF-8")
+	}
+	return Value{kind: ValueKindString, text: value}, nil
 }
 
 // NumberValue parses an RFC 8259 JSON number without converting it through a
@@ -121,14 +123,18 @@ func ListValue(values []Value) Value {
 	return Value{kind: ValueKindList, list: list}
 }
 
-// MapValue returns a string-keyed map and deeply copies values. Map order is
-// not semantically significant; canonical encodings sort keys.
-func MapValue(values map[string]Value) Value {
+// MapValue returns a string-keyed map and deeply copies values. It rejects
+// invalid UTF-8 keys. Map order is not semantically significant; canonical
+// encodings sort keys.
+func MapValue(values map[string]Value) (Value, error) {
 	object := make(map[string]Value, len(values))
 	for key, value := range values {
+		if !utf8.ValidString(key) {
+			return Value{}, fmt.Errorf("statecharts: Value map key is not valid UTF-8")
+		}
 		object[key] = value.Clone()
 	}
-	return Value{kind: ValueKindMap, object: object}
+	return Value{kind: ValueKindMap, object: object}, nil
 }
 
 // TaggedValue returns an application value identified by tag. A tag is a
@@ -226,13 +232,17 @@ func (v Value) Clone() Value {
 	case ValueKindBool:
 		return BoolValue(v.bool)
 	case ValueKindString:
-		return StringValue(v.text)
+		return Value{kind: ValueKindString, text: v.text}
 	case ValueKindNumber:
 		return Value{kind: ValueKindNumber, text: v.text}
 	case ValueKindList:
 		return ListValue(v.list)
 	case ValueKindMap:
-		return MapValue(v.object)
+		object := make(map[string]Value, len(v.object))
+		for key, value := range v.object {
+			object[key] = value.Clone()
+		}
+		return Value{kind: ValueKindMap, object: object}
 	case ValueKindTagged:
 		if v.tagged == nil {
 			return Value{kind: ValueKindTagged}
@@ -408,7 +418,7 @@ func ValueFromWire(wire ValueWire) (Value, error) {
 		if !utf8.ValidString(*wire.String) {
 			return Value{}, fmt.Errorf("statecharts: string wire value is not valid UTF-8")
 		}
-		return StringValue(*wire.String), nil
+		return StringValue(*wire.String)
 	case ValueKindNumber:
 		if wire.Number == nil || wireFieldCount(wire) != 1 {
 			return Value{}, fmt.Errorf("statecharts: number wire value requires number and no other union field")
@@ -595,7 +605,7 @@ func ValueFromJSON(input any) (Value, error) {
 		if !utf8.ValidString(value) {
 			return Value{}, fmt.Errorf("statecharts: JSON-shaped string is not valid UTF-8")
 		}
-		return StringValue(value), nil
+		return StringValue(value)
 	case json.Number:
 		return NumberValue(value.String())
 	case float64:
@@ -654,8 +664,10 @@ func ValueFromJSON(input any) (Value, error) {
 }
 
 // JSONValue converts v to an independent JSON-shaped Go value. Numbers are
-// returned as json.Number to retain precision. Tagged values are rejected
-// because an untagged JSON value cannot preserve their application tag.
+// returned as json.Number to retain precision. Their canonical spelling may
+// use exponent form even when mathematically integral, so json.Number.Int64
+// does not necessarily succeed. Tagged values are rejected because untagged
+// JSON cannot preserve their application tag.
 func (v Value) JSONValue() (any, error) {
 	switch v.Kind() {
 	case ValueKindNull:
