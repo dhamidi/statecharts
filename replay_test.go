@@ -647,6 +647,60 @@ func TestRehydrateReplaysExplicitSends(t *testing.T) {
 	}
 }
 
+func TestRehydratePreservesLoggedPlatformEventSemantics(t *testing.T) {
+	ctx := context.Background()
+	log := newMemLog()
+	store := newMemSnapshotStore()
+	sessionID := SessionID("logged-platform-event")
+	var observed Event
+	chart, err := Build(Atomic("ready",
+		On(string(ErrEventExecution), Then(func(ec ExecContext) error {
+			observed, _ = ec.Event()
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	logged := Event{
+		Name: ErrEventExecution,
+		Type: EventPlatform,
+		Data: PlatformErrorValue(ErrEventExecution, errors.New("historical execution failure")),
+	}
+	if _, err := log.Append(ctx, LogEntry{
+		SessionID: sessionID,
+		Kind:      KindExternalEvent,
+		Timestamp: time.Now().UTC(),
+		Event:     logged,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	ingressCalls := 0
+	in, err := Rehydrate(ctx, chart, nil, log, store, sessionID, NoopIOProcessor,
+		WithIngressHook(func(Event) error {
+			ingressCalls++
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	defer in.Stop(ctx)
+	if observed.Type != EventPlatform {
+		t.Fatalf("replayed event Type = %v, want platform", observed.Type)
+	}
+	if ingressCalls != 0 {
+		t.Fatalf("ingress hook calls during replay = %d, want 0", ingressCalls)
+	}
+	if err := in.Send(ctx, Event{Name: "live"}); err != nil {
+		t.Fatalf("live Send: %v", err)
+	}
+	if ingressCalls != 1 {
+		t.Fatalf("ingress hook calls after live Send = %d, want 1", ingressCalls)
+	}
+}
+
 func TestRehydrateUsesCheckpointToSkipReplay(t *testing.T) {
 	ctx := context.Background()
 	log := newMemLog()

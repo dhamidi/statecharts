@@ -205,7 +205,7 @@ func Rehydrate(ctx context.Context, chart *Chart, datamodel any, log Log, snapsh
 		case KindSessionStarted:
 			return nil
 		case KindExternalEvent:
-			return in.Send(ctx, entry.Event)
+			return in.send(ctx, entry.Event)
 		case KindTimerFired:
 			req := actorRequest{kind: reqReplayTimerFired, entry: entry, reply: make(chan error, 1)}
 			if err := in.submit(ctx, req); err != nil {

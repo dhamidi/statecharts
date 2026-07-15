@@ -130,7 +130,8 @@ func (p *durableProcessor) complete(req statecharts.SendRequest, err error, sync
 	r := statecharts.OutboundResult{Synchronous: synchronous}
 	if err != nil {
 		r.Error = err.Error()
-		_, r.Execution = err.(statecharts.SendExecutionError)
+		var executionError statecharts.SendExecutionError
+		r.Execution = errors.As(err, &executionError)
 	}
 	if resolveErr := p.storage.ResolveOutbound(context.Background(), p.sid, req.DeliveryID, r); resolveErr != nil {
 		return

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -828,6 +829,71 @@ type failingProcessor struct{ err error }
 func (*failingProcessor) Attach(statecharts.Dispatcher) {}
 
 func (p *failingProcessor) Send(context.Context, statecharts.SendRequest) error { return p.err }
+
+type wrappedExecutionFailure struct{}
+
+func (wrappedExecutionFailure) Error() string       { return "invalid send request" }
+func (wrappedExecutionFailure) SendExecutionError() {}
+
+type recordingDispatcher struct {
+	events []statecharts.Event
+}
+
+func (d *recordingDispatcher) Deliver(_ context.Context, event statecharts.Event) error {
+	d.events = append(d.events, event)
+	return nil
+}
+
+func TestDurableProcessorClassifiesWrappedSendExecutionError(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	reports := &recordingDispatcher{}
+	wrapped := fmt.Errorf("processor rejected request: %w", wrappedExecutionFailure{})
+	processor := newDurableProcessor(
+		storage,
+		"wrapped-execution",
+		"custom",
+		&failingProcessor{err: wrapped},
+		reports,
+		newDurableRecovery(nil),
+	)
+	request := statecharts.SendRequest{
+		DeliveryID: "wrapped-execution:v1:1",
+		SendID:     "send-1",
+		Target:     "worker",
+		Type:       "custom",
+		Event:      "work",
+	}
+	if err := processor.Send(ctx, request); err == nil {
+		t.Fatal("Send returned nil, want wrapped execution error")
+	}
+
+	messages, err := storage.Outbounds(ctx, "wrapped-execution")
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("Outbounds = %d, want 1", len(messages))
+	}
+	if !messages[0].Result.Execution {
+		t.Fatalf("recorded result = %+v, want Execution=true", messages[0].Result)
+	}
+	replayErr := processor.ReplaySend(ctx, request)
+	var executionError statecharts.SendExecutionError
+	if !errors.As(replayErr, &executionError) {
+		t.Fatalf("ReplaySend error = %v, want SendExecutionError", replayErr)
+	}
+
+	processor.report(request, messages[0].Result)
+	if len(reports.events) != 1 {
+		t.Fatalf("reported events = %d, want 1", len(reports.events))
+	}
+	reported := reports.events[0]
+	classification, _, ok := statecharts.PlatformErrorDetails(reported.Data)
+	if reported.Name != statecharts.ErrEventExecution || !ok || classification != statecharts.ErrEventExecution {
+		t.Fatalf("reported event = %+v classification=%q ok=%v, want error.execution", reported, classification, ok)
+	}
+}
 
 func buildVersionedSenderChart(version string) *statecharts.Chart {
 	chart, err := statecharts.Build(
