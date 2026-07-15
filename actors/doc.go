@@ -18,8 +18,10 @@
 // to the revision selected at their first Spawn. Actor IDs are Identifiers and
 // may be hierarchical. Spawn without Durable behaves like statecharts.New plus
 // Start and keeps no history -- if the process restarts, the actor is gone.
-// Spawn with Durable records every message to the system's Log before applying
-// it, so the same name can later be paged out and paged back in.
+// Spawn with Durable atomically records the actor's chart/revision pin and
+// session-start before initial behavior, then records every message before
+// applying it. Paging and process restart resolve the stored revision rather
+// than whichever revision is currently published.
 //
 // Every actor a System spawns addresses its peers by actor ID or by an
 // "<actor-id>@<node>" routing key, through the same routing IOProcessor the

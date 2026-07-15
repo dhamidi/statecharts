@@ -436,6 +436,13 @@ on their pinned revision; only future actors select `newRevision`. Definitions
 returned by `CurrentDefinition` and `Definition` are independent editable
 copies.
 
+For durable actors, first spawn atomically stores the actor identity, chart ID,
+revision, session ID, and session-start entry before initial behavior runs.
+Page-in and process restart load that recorded revision—even when a newer one
+is current—and fail before replay if its definition, datamodel implementation,
+named function version, invoke handler, or pending outbox processor is missing.
+Snapshots are only same-revision caches; a mismatch falls back to replay.
+
 Actor IDs are hierarchical `Identifier` values. Routing locations use `@`:
 `billing.invoice-42@host-a`. The node name is routing metadata, not durable
 identity. Each system has an isolated storage boundary, so moving a system to

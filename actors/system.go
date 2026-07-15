@@ -23,6 +23,7 @@ type Storage interface {
 	statecharts.DurableLog
 	statecharts.SnapshotStore
 	statecharts.DefinitionStore
+	statecharts.ActorStore
 }
 
 type systemConfig struct {
@@ -88,8 +89,10 @@ func WithNodeName(name string) Option {
 }
 
 // WithStorage supplies the single durable storage boundary for this System.
-// Spawn without Durable never touches it. A System's node name is only a
-// routing location and does not partition storage.
+// It atomically stores durable actor revision pins and session-start records
+// alongside definitions, events, outbound intents, and snapshot caches. Spawn
+// without Durable never touches it. A System's node name is only a routing
+// location and does not partition storage.
 func WithStorage(storage Storage) Option {
 	return func(c *systemConfig) { c.storage = storage }
 }
@@ -264,16 +267,21 @@ type chartRegistry struct {
 // currently resident. Kind and revision are selected exactly once on first
 // Spawn; publication never changes an existing entry's pinned revision.
 type actorEntry struct {
-	name     statecharts.Identifier
-	kind     statecharts.Identifier
-	revision statecharts.RevisionID
-	durable  bool
+	name        statecharts.Identifier
+	kind        statecharts.Identifier
+	revision    statecharts.RevisionID
+	sessionID   statecharts.SessionID
+	durable     bool
+	initialized bool
 
 	// mu serializes activation (page-in) and eviction (page-out) for this
 	// one name, so at most one live Instance for it ever exists at a time
 	// -- Log.Append's gapless-Seq promise assumes exactly one writer per
 	// session.
 	mu sync.Mutex
+	// startLive is protected by mu. It is true only for the one activation
+	// attempt immediately following a successful atomic ActorStarted commit.
+	startLive bool
 
 	instance   atomic.Pointer[statecharts.Instance]
 	lastActive atomic.Int64 // UnixNano
@@ -412,6 +420,59 @@ func (s *System) chartForRevision(kind statecharts.Identifier, revision statecha
 	return chart, ok
 }
 
+func (s *System) resolveRevision(ctx context.Context, kind statecharts.Identifier, revision statecharts.RevisionID) (*statecharts.Chart, error) {
+	s.chartsMu.Lock()
+	registry, ok := s.charts[kind]
+	if !ok {
+		s.chartsMu.Unlock()
+		return nil, fmt.Errorf("actors: chart %q was never Registered: %w", kind, ErrKindNotRegistered)
+	}
+	if chart, exists := registry.revisions[revision]; exists {
+		s.chartsMu.Unlock()
+		return chart, nil
+	}
+	s.chartsMu.Unlock()
+
+	registry.publishMu.Lock()
+	defer registry.publishMu.Unlock()
+	s.chartsMu.Lock()
+	if chart, exists := registry.revisions[revision]; exists {
+		s.chartsMu.Unlock()
+		return chart, nil
+	}
+	s.chartsMu.Unlock()
+	if s.cfg.storage == nil {
+		return nil, statecharts.ErrDefinitionNotFound
+	}
+	artifact, found, err := s.cfg.storage.GetDefinition(ctx, revision)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, statecharts.ErrDefinitionNotFound
+	}
+	if artifact.ChartID != kind {
+		return nil, fmt.Errorf("%w: actor chart %q does not match revision chart %q", statecharts.ErrInvalidActorMetadata, kind, artifact.ChartID)
+	}
+	chart, err := artifact.Compile(registry.datamodel)
+	if err != nil {
+		return nil, err
+	}
+	if err := chart.Prepare(s.invokeHandlerOptions()...); err != nil {
+		return nil, err
+	}
+	s.chartsMu.Lock()
+	defer s.chartsMu.Unlock()
+	if retained, exists := registry.revisions[revision]; exists {
+		if !retained.DefinitionArtifact().Equal(artifact) {
+			return nil, statecharts.ErrDefinitionCollision
+		}
+		return retained, nil
+	}
+	registry.revisions[revision] = chart
+	return chart, nil
+}
+
 // CurrentDefinition returns an independently editable copy of kind's current
 // definition and its revision.
 func (s *System) CurrentDefinition(kind statecharts.Identifier) (statecharts.Definition, statecharts.RevisionID, bool) {
@@ -536,10 +597,11 @@ var ErrInvalidActorID = errors.New("actors: invalid actor ID")
 //
 // Without Durable, Spawn behaves like statecharts.New plus Start: the actor
 // begins in kind's initial configuration and keeps no record of what it
-// does. With Durable, Spawn also resumes an actor that already has Log
-// history under name, loading its latest checkpoint and replaying whatever
-// came after -- one call handles both "start fresh" and "resume", since a
-// name with no prior history simply starts fresh.
+// does. With Durable, ActorStore metadata—not log or snapshot emptiness—is the
+// creation authority. First spawn atomically records kind, revision, session,
+// and the sole session-start entry before initial behavior. Every later Spawn
+// resolves that exact revision, optionally restores a matching checkpoint,
+// and replays subsequent events.
 func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Identifier, opts ...SpawnOption) error {
 	// Fast, unsynchronized fail-fast path only -- avoids the chart lookup
 	// below for the common case of calling Spawn well after Stop. The
@@ -571,13 +633,126 @@ func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Ident
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	if cfg.durable {
+		if err := s.prepareDurableEntry(entry, kind); err != nil {
+			return err
+		}
+		metadata, startLive, err := s.selectDurableActor(ctx, name, kind, chart)
+		if err != nil {
+			return fmt.Errorf("actors: Spawn %q: %w", name, err)
+		}
+		if err := s.pinDurableEntry(entry, metadata, startLive); err != nil {
+			return fmt.Errorf("actors: Spawn %q: %w", name, err)
+		}
+	}
 	return s.activateLocked(ctx, entry)
 }
 
+func (s *System) prepareDurableEntry(entry *actorEntry, kind statecharts.Identifier) error {
+	s.tableMu.Lock()
+	defer s.tableMu.Unlock()
+	if entry.initialized {
+		if entry.kind != kind {
+			return fmt.Errorf("actors: %q was spawned as kind %q, not %q: %w", entry.name, entry.kind, kind, ErrKindMismatch)
+		}
+		return nil
+	}
+	entry.kind = kind
+	return nil
+}
+
+func (s *System) selectDurableActor(ctx context.Context, name, kind statecharts.Identifier, current *statecharts.Chart) (statecharts.ActorMetadata, bool, error) {
+	metadata, found, err := s.cfg.storage.GetActor(ctx, name)
+	if err != nil {
+		return statecharts.ActorMetadata{}, false, err
+	}
+	if found {
+		if err := validateSpawnMetadata(metadata, name, kind); err != nil {
+			return statecharts.ActorMetadata{}, false, err
+		}
+		if _, err := s.resolveRevision(ctx, kind, metadata.Revision); err != nil {
+			return statecharts.ActorMetadata{}, false, err
+		}
+		return metadata, false, nil
+	}
+
+	artifact := current.DefinitionArtifact()
+	if _, err := s.cfg.storage.PutDefinition(ctx, artifact); err != nil {
+		return statecharts.ActorMetadata{}, false, err
+	}
+	candidate := statecharts.ActorMetadata{
+		ActorID: name, ChartID: kind, Revision: current.Revision(),
+		SessionID: statecharts.SessionID(name), Durable: true,
+		Lifecycle: statecharts.ActorLifecycleActive,
+		StartedAt: s.cfg.clock.Now().UTC(),
+	}
+	stored, result, err := s.cfg.storage.BeginActor(ctx, candidate)
+	if err != nil {
+		if !errors.Is(err, statecharts.ErrActorCollision) {
+			return statecharts.ActorMetadata{}, false, err
+		}
+		stored, found, err = s.cfg.storage.GetActor(ctx, name)
+		if err != nil {
+			return statecharts.ActorMetadata{}, false, err
+		}
+		if !found {
+			return statecharts.ActorMetadata{}, false, statecharts.ErrActorCollision
+		}
+		result = statecharts.ActorAlreadyActive
+	}
+	if err := validateSpawnMetadata(stored, name, kind); err != nil {
+		return statecharts.ActorMetadata{}, false, err
+	}
+	if _, err := s.resolveRevision(ctx, kind, stored.Revision); err != nil {
+		return statecharts.ActorMetadata{}, false, err
+	}
+	switch result {
+	case statecharts.ActorStarted:
+		return stored, true, nil
+	case statecharts.ActorAlreadyActive:
+		return stored, false, nil
+	default:
+		return statecharts.ActorMetadata{}, false, fmt.Errorf("actors: BeginActor returned unknown result %d", result)
+	}
+}
+
+func validateSpawnMetadata(metadata statecharts.ActorMetadata, name, kind statecharts.Identifier) error {
+	if metadata.ActorID != name {
+		return fmt.Errorf("%w: storage returned actor ID %q for %q", statecharts.ErrInvalidActorMetadata, metadata.ActorID, name)
+	}
+	if metadata.ChartID != kind {
+		return fmt.Errorf("actors: %q was spawned as kind %q, not %q: %w", name, metadata.ChartID, kind, ErrKindMismatch)
+	}
+	if !metadata.Durable {
+		return ErrDurabilityMismatch
+	}
+	if metadata.Lifecycle == statecharts.ActorLifecycleTerminal {
+		return statecharts.ErrActorTerminal
+	}
+	return metadata.Validate()
+}
+
+func (s *System) pinDurableEntry(entry *actorEntry, metadata statecharts.ActorMetadata, startLive bool) error {
+	s.tableMu.Lock()
+	defer s.tableMu.Unlock()
+	if entry.initialized {
+		if entry.revision != metadata.Revision || entry.sessionID != metadata.SessionID {
+			return statecharts.ErrActorCollision
+		}
+		entry.startLive = false
+		return nil
+	}
+	entry.revision = metadata.Revision
+	entry.sessionID = metadata.SessionID
+	entry.initialized = true
+	entry.startLive = startLive
+	return nil
+}
+
 // entryFor returns the table entry for an actor ID, creating one on first use.
-// An ID's kind, revision, and durability are fixed by whichever call creates
-// its entry. A later Spawn for the same kind retains the stored revision even
-// if publication changed current in the meantime.
+// Ephemeral entries immediately pin current. A durable entry remains
+// uninitialized until selectDurableActor reads or atomically creates its
+// authoritative storage metadata while holding entry.mu.
 //
 // The stopped check here, under the same tableMu Stop takes to snapshot the
 // table, is what closes the Spawn/Stop TOCTOU: Spawn's "is the system
@@ -592,6 +767,12 @@ func (s *System) entryFor(name, kind statecharts.Identifier, revision statechart
 		return nil, fmt.Errorf("actors: Spawn: %w", ErrSystemStopped)
 	}
 	if e, ok := s.table[name]; ok {
+		if !e.initialized {
+			if e.durable != durable {
+				return nil, fmt.Errorf("actors: %q durability is fixed at its first Spawn (durable=%v): %w", name, e.durable, ErrDurabilityMismatch)
+			}
+			return e, nil
+		}
 		if e.kind != kind {
 			return nil, fmt.Errorf("actors: %q was spawned as kind %q, not %q: %w", name, e.kind, kind, ErrKindMismatch)
 		}
@@ -600,7 +781,12 @@ func (s *System) entryFor(name, kind statecharts.Identifier, revision statechart
 		}
 		return e, nil
 	}
-	e := &actorEntry{name: name, kind: kind, revision: revision, durable: durable}
+	e := &actorEntry{name: name, kind: kind, durable: durable}
+	if !durable {
+		e.revision = revision
+		e.sessionID = statecharts.SessionID(name)
+		e.initialized = true
+	}
 	s.table[name] = e
 	return e, nil
 }
@@ -611,7 +797,7 @@ func (s *System) ActorRevision(actorID ActorID) (statecharts.RevisionID, bool) {
 	s.tableMu.Lock()
 	defer s.tableMu.Unlock()
 	entry, ok := s.table[actorID]
-	if !ok {
+	if !ok || !entry.initialized {
 		return "", false
 	}
 	return entry.revision, true
@@ -625,7 +811,7 @@ func (s *System) resolve(name statecharts.Identifier) (*actorEntry, bool) {
 	s.tableMu.Lock()
 	defer s.tableMu.Unlock()
 	e, ok := s.table[name]
-	return e, ok
+	return e, ok && e.initialized
 }
 
 func (s *System) address(name statecharts.Identifier) statecharts.Identifier {
@@ -691,6 +877,8 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 	if s.stopped.Load() {
 		return fmt.Errorf("actors: activate %q: %w", entry.name, ErrSystemStopped)
 	}
+	startLive := entry.startLive
+	entry.startLive = false
 	s.notifyResidency(entry, ResidencyHydrating)
 	defer func() {
 		if err != nil {
@@ -710,7 +898,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 		return fmt.Errorf("actors: activate %q: %w", entry.name, err)
 	}
 	address := s.address(entry.name)
-	sessionID := statecharts.SessionID(entry.name)
+	sessionID := entry.sessionID
 	deliveryNamespace := fmt.Sprintf("%d:%s:%s", len(sessionID), sessionID, chart.Revision())
 	proc := newRoutingProcessor(s, address)
 	processorOpts := make([]statecharts.Option, 0, 1+len(s.cfg.processors))
@@ -789,30 +977,10 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.storage, sessionID, s.cfg.clock)),
 			statecharts.WithDeliveryNamespace(deliveryNamespace),
 		)
-		hasLogEntries := false
-		for _, readErr := range s.cfg.storage.Read(ctx, sessionID, 1) {
-			if readErr != nil {
-				return fmt.Errorf("actors: inspect log for %q: %w", entry.name, readErr)
-			}
-			hasLogEntries = true
-			break
-		}
-		_, hasCheckpoint, loadErr := s.cfg.storage.Load(ctx, sessionID)
-		if loadErr != nil {
-			return fmt.Errorf("actors: inspect checkpoint for %q: %w", entry.name, loadErr)
-		}
-		if !hasLogEntries && !hasCheckpoint {
-			// This is a genuinely new actor, not a reconstruction. Starting it
-			// live is what lets initial <invoke> content run. Persist the start
-			// boundary first so a crash before the first ordinary message cannot
-			// make a later process mistake the actor for new and invoke twice.
-			if _, err := s.cfg.storage.Append(ctx, statecharts.LogEntry{
-				SessionID: sessionID,
-				Kind:      statecharts.KindSessionStarted,
-				Timestamp: s.cfg.clock.Now().UTC(),
-			}); err != nil {
-				return fmt.Errorf("actors: record session start for %q: %w", entry.name, err)
-			}
+		if startLive {
+			// BeginActor already committed the authoritative pin and sole
+			// session-start boundary. Only the caller that observed ActorStarted
+			// may run initial behavior live; every retry rehydrates that boundary.
 			liveOpts := append(instanceOpts, processorOpts...)
 			liveOpts = append(liveOpts,
 				statecharts.WithSessionID(sessionID),
@@ -1012,7 +1180,7 @@ func (s *System) evictLocked(ctx context.Context, entry *actorEntry) error {
 		return nil
 	}
 	err := inst.Checkpoint(ctx, func(snap statecharts.Snapshot) error {
-		sessionID := statecharts.SessionID(entry.name)
+		sessionID := entry.sessionID
 		seq, err := s.cfg.storage.LastSeq(ctx, sessionID)
 		if err != nil {
 			return fmt.Errorf("actors: last seq %q: %w", entry.name, err)
@@ -1077,7 +1245,7 @@ func (s *System) deliver(ctx context.Context, name statecharts.Identifier, ev st
 	}
 	if entry.durable && ev.DeliveryID != "" {
 		_, appended, appendErr := s.cfg.storage.AppendIngress(ctx, statecharts.LogEntry{
-			SessionID: statecharts.SessionID(entry.name), Kind: statecharts.KindExternalEvent,
+			SessionID: entry.sessionID, Kind: statecharts.KindExternalEvent,
 			Timestamp: s.cfg.clock.Now().UTC(), Event: ev,
 		}, ev.DeliveryID)
 		if appendErr != nil {

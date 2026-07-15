@@ -937,11 +937,9 @@ func buildRevisionSenderChart(salt string) *statecharts.Chart {
 	return chart
 }
 
-// Outbound result identities are scoped to the chart revision. Otherwise a
-// full replay after a revision change can apply an old synchronous processor
-// failure to a different send that merely reused the same dispatch ordinal
-// in the new chart definition.
-func TestChartRevisionScopesDurableOutboundReplay(t *testing.T) {
+// A durable actor's recorded revision remains authoritative after a newer
+// revision becomes current, including its resolved outbound outcomes.
+func TestPinnedRevisionReplaysRecordedOutboundFailure(t *testing.T) {
 	ctx := context.Background()
 	storage := openTestLog(t)
 	v1 := buildRevisionSenderChart("v1")
@@ -971,14 +969,17 @@ func TestChartRevisionScopesDurableOutboundReplay(t *testing.T) {
 		t.Fatalf("Register v2: %v", err)
 	}
 	if err := recovered.Spawn(ctx, "versioned", v2.ID(), Durable()); err != nil {
-		t.Fatalf("Spawn v2: %v", err)
+		t.Fatalf("recover pinned v1: %v", err)
 	}
-	if inst := testInstanceFor(recovered, "versioned"); inst == nil || !hasStateID(inst.Configuration(), "ready") {
+	if revision, ok := recovered.ActorRevision("versioned"); !ok || revision != v1.Revision() {
+		t.Fatalf("recovered revision = %q, %v; want pinned v1 %q", revision, ok, v1.Revision())
+	}
+	if inst := testInstanceFor(recovered, "versioned"); inst == nil || !hasStateID(inst.Configuration(), "failed") {
 		var configuration []statecharts.Identifier
 		if inst != nil {
 			configuration = inst.Configuration()
 		}
-		t.Fatalf("v2 configuration = %v, want ready; v1's send failure leaked across chart revisions", configuration)
+		t.Fatalf("pinned v1 configuration = %v, want failed", configuration)
 	}
 
 	if err := first.Stop(ctx); err != nil {
@@ -989,7 +990,7 @@ func TestChartRevisionScopesDurableOutboundReplay(t *testing.T) {
 	}
 }
 
-func TestOldRevisionPendingOutboxIsNotRedispatched(t *testing.T) {
+func TestPinnedRevisionPendingOutboxIsRedispatched(t *testing.T) {
 	ctx := context.Background()
 	storage := openTestLog(t)
 	firstProcessor := &holdingAckProcessor{}
@@ -1017,10 +1018,13 @@ func TestOldRevisionPendingOutboxIsNotRedispatched(t *testing.T) {
 		t.Fatalf("Register v2: %v", err)
 	}
 	if err := recovered.Spawn(ctx, "pending-revision", v2.ID(), Durable()); err != nil {
-		t.Fatalf("Spawn v2: %v", err)
+		t.Fatalf("recover pinned v1: %v", err)
 	}
-	if got := secondProcessor.requestCount(); got != 0 {
-		t.Fatalf("v2 recovery redispatched %d pending request(s) from v1", got)
+	if revision, ok := recovered.ActorRevision("pending-revision"); !ok || revision != v1.Revision() {
+		t.Fatalf("recovered revision = %q, %v; want pinned v1 %q", revision, ok, v1.Revision())
+	}
+	if got := secondProcessor.requestCount(); got != 1 {
+		t.Fatalf("pinned v1 recovery redispatched %d pending request(s), want 1", got)
 	}
 
 	if err := first.Stop(ctx); err != nil {
