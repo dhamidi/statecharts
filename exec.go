@@ -19,6 +19,7 @@ type ExecContext struct {
 	send              func(name Identifier, opts SendOptions)
 	cancel            func(sendID Identifier)
 	log               func(label string, data any)
+	reportError       func(error)
 	ioProcessors      func() []IOProcessorInfo
 }
 
@@ -149,10 +150,10 @@ func (ec ExecContext) Log(label string, data any) {
 // (SCXML's own error model), not returned to the caller as a Go error.
 type ActionFunc func(ExecContext) error
 
-// CondFunc is a transition guard (the "cond" attribute). Evaluation errors
-// have no Go representation here -- write the guard so it cannot panic or
-// signal failure; a guard that must be able to fail should be expressed as
-// state plus a preceding action instead.
+// CondFunc is a transition guard (the "cond" attribute). A panic is treated
+// as false and reported to the chart as error.execution, per SCXML 5.9.1.
+// Conditions that need ordinary, expected failure handling should still
+// express it as state plus a preceding action instead.
 type CondFunc func(ExecContext) bool
 
 // DoneDataFunc produces the payload for a final state's done event.
@@ -180,12 +181,16 @@ func Action[D any](fn func(*D, ExecContext) error) ActionFunc {
 }
 
 // Cond adapts a typed guard callback into a CondFunc. A datamodel type
-// mismatch evaluates to false rather than panicking, consistent with
-// CondFunc's "cannot signal failure" contract.
+// mismatch is an expression-evaluation error: it evaluates to false and
+// reports error.execution when run by an interpreter.
 func Cond[D any](fn func(*D, ExecContext) bool) CondFunc {
 	return func(ec ExecContext) bool {
 		d, ok := ec.datamodel.(*D)
 		if !ok {
+			if ec.reportError != nil {
+				var zero D
+				ec.reportError(fmt.Errorf("statecharts: Cond[%T]: datamodel is %T, not *%T", zero, ec.datamodel, zero))
+			}
 			return false
 		}
 		return fn(d, ec)

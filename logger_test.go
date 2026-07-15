@@ -24,6 +24,51 @@ func (l *recordingLogger) Log(label string, data any) {
 	l.calls = append(l.calls, recordedLogCall{label: label, data: data})
 }
 
+type panicLogger struct{}
+
+func (panicLogger) Log(string, any) { panic("logger failed") }
+
+func TestLoggerPanicDoesNotAffectInterpretation(t *testing.T) {
+	var actions []string
+	chart, err := Build(
+		Compound("root", "active",
+			Children(
+				Atomic("active",
+					On("go", Target("target"), Then(
+						func(ec ExecContext) error {
+							ec.Log("diagnostic", 42)
+							actions = append(actions, "after-log")
+							return nil
+						},
+						func(ExecContext) error {
+							actions = append(actions, "next-action")
+							return nil
+						},
+					)),
+				),
+				Atomic("target", On(string(ErrEventExecution), Target("wrong"))),
+				Atomic("wrong"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, nil)
+	ip.logger = panicLogger{}
+	ip.start()
+	ip.enqueue(Event{Name: "go", Type: EventExternal})
+	ip.processNextExternal()
+
+	if got, want := strings.Join(actions, ","), "after-log,next-action"; got != want {
+		t.Fatalf("actions after logger panic = %q, want %q", got, want)
+	}
+	if !hasState(ip.activeStates(), "target") {
+		t.Fatalf("configuration = %v, want target; logger panic must not produce error.execution", ip.activeStates())
+	}
+}
+
 func TestExecContextLogCallsConfiguredLogger(t *testing.T) {
 	logOnEntry := Action(func(d *Door, ec ExecContext) error {
 		ec.Log("entered", "open")

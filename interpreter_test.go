@@ -697,11 +697,19 @@ func TestInterpreterActionPanicBecomesExecutionError(t *testing.T) {
 }
 
 func TestInterpreterConditionPanicBecomesExecutionError(t *testing.T) {
+	fallbackEntered := false
 	chart, err := Build(
 		Compound("root", "active",
 			Children(
 				Atomic("active",
 					On("go", If(func(ExecContext) bool { panic("boom") }), Target("wrong")),
+					On("go", Target("fallback")),
+				),
+				Atomic("fallback",
+					OnEntry(func(ExecContext) error {
+						fallbackEntered = true
+						return nil
+					}),
 					On(string(ErrEventExecution), Target("recovered")),
 				),
 				Atomic("wrong"),
@@ -717,8 +725,51 @@ func TestInterpreterConditionPanicBecomesExecutionError(t *testing.T) {
 	ip.start()
 	ip.enqueue(Event{Name: "go", Type: EventExternal})
 	ip.processNextExternal()
+	if !fallbackEntered {
+		t.Fatal("condition error prevented the later matching transition from being selected")
+	}
 	if !hasState(ip.activeStates(), "recovered") {
 		t.Fatalf("configuration = %v, want recovered after condition panic", ip.activeStates())
+	}
+}
+
+func TestTypedConditionDatamodelMismatchBecomesExecutionError(t *testing.T) {
+	type expectedModel struct{}
+	type actualModel struct{}
+
+	fallbackEntered := false
+	chart, err := Build(
+		Compound("root", "active",
+			Children(
+				Atomic("active",
+					On("go", If(Cond(func(*expectedModel, ExecContext) bool { return true })), Target("wrong")),
+					On("go", Target("fallback")),
+				),
+				Atomic("fallback",
+					OnEntry(func(ExecContext) error {
+						fallbackEntered = true
+						return nil
+					}),
+					On(string(ErrEventExecution), Target("recovered")),
+				),
+				Atomic("wrong"),
+				Atomic("recovered"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	ip := newInterpretation(chart, &actualModel{})
+	ip.start()
+	ip.enqueue(Event{Name: "go", Type: EventExternal})
+	ip.processNextExternal()
+	if !fallbackEntered {
+		t.Fatal("condition error prevented the later matching transition from being selected")
+	}
+	if !hasState(ip.activeStates(), "recovered") {
+		t.Fatalf("configuration = %v, want recovered after condition datamodel mismatch", ip.activeStates())
 	}
 }
 
