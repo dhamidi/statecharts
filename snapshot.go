@@ -20,7 +20,7 @@ import (
 // every time (see Checkpoint, Rehydrate in replay.go).
 type Snapshot struct {
 	Version           int
-	ChartVersion      string
+	Revision          RevisionID
 	Datamodel         []byte
 	ID                SessionID // SCXML 5.10's _sessionid for this session; Restore preserves it unless WithSessionID overrides it
 	Configuration     []Identifier
@@ -65,7 +65,7 @@ type Checkpoint struct {
 	Seq      uint64
 }
 
-const snapshotVersion = 6
+const snapshotVersion = 7
 
 // Snapshot captures this Instance's current state (safely, by running on
 // the interpreter's own goroutine), suitable for persisting and later
@@ -98,7 +98,7 @@ func (in *Instance) buildSnapshot() (Snapshot, error) {
 	}
 	snap := Snapshot{
 		Version:           snapshotVersion,
-		ChartVersion:      in.chart.version,
+		Revision:          in.chart.revision,
 		Datamodel:         datamodel,
 		ID:                ip.sessionID,
 		Configuration:     ip.activeStates(),
@@ -195,8 +195,8 @@ func validateSnapshotHeader(chart *Chart, snap Snapshot) error {
 	if snap.Version != snapshotVersion {
 		return fmt.Errorf("%w: unsupported snapshot version %d (want %d)", ErrInvalidSnapshot, snap.Version, snapshotVersion)
 	}
-	if snap.ChartVersion != chart.version {
-		return fmt.Errorf("%w: chart version mismatch", ErrInvalidSnapshot)
+	if snap.Revision != chart.revision {
+		return fmt.Errorf("%w: chart revision mismatch", ErrInvalidSnapshot)
 	}
 	return nil
 }
@@ -370,7 +370,7 @@ func (ip *interpretation) restoreFrom(chart *Chart, snap Snapshot) error {
 
 type snapshotWire struct {
 	Version           int                         `json:"version"`
-	ChartVersion      string                      `json:"chart_version"`
+	Revision          RevisionID                  `json:"revision"`
 	Datamodel         []byte                      `json:"datamodel"`
 	ID                SessionID                   `json:"id,omitempty"`
 	Configuration     []Identifier                `json:"configuration"`
@@ -399,7 +399,7 @@ type pendingSendWire struct {
 func (s Snapshot) MarshalJSON() ([]byte, error) {
 	wire := snapshotWire{
 		Version:           s.Version,
-		ChartVersion:      s.ChartVersion,
+		Revision:          s.Revision,
 		Datamodel:         s.Datamodel,
 		ID:                s.ID,
 		Configuration:     s.Configuration,
@@ -445,7 +445,7 @@ func (s *Snapshot) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	s.Version = wire.Version
-	s.ChartVersion = wire.ChartVersion
+	s.Revision = wire.Revision
 	s.Datamodel = wire.Datamodel
 	s.ID = wire.ID
 	s.Configuration = wire.Configuration

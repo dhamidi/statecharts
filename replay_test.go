@@ -416,7 +416,7 @@ func TestRestoreRejectsActiveInvokeNotInConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = chart.Restore(Snapshot{
-		Version: snapshotVersion, ChartVersion: chart.Version(), Running: true,
+		Version: snapshotVersion, Revision: chart.Revision(), Running: true,
 		Configuration: []Identifier{"idle"},
 		ActiveInvokes: []ActiveInvoke{{State: "running", DefinitionID: "worker-definition", ID: "worker-1", Type: "worker", Source: "jobs"}},
 	}, WithInvokeHandler("worker", func() InvokeHandler {
@@ -435,7 +435,7 @@ func TestRestoreRejectsUnsupportedSnapshotVersionAndRevision(t *testing.T) {
 	if _, err := chart.Restore(Snapshot{Version: snapshotVersion + 1}); !errors.Is(err, ErrInvalidSnapshot) {
 		t.Fatalf("unsupported version error = %v", err)
 	}
-	if _, err := chart.Restore(Snapshot{Version: snapshotVersion, ChartVersion: "other"}); !errors.Is(err, ErrInvalidSnapshot) {
+	if _, err := chart.Restore(Snapshot{Version: snapshotVersion, Revision: RevisionID("sha256:other")}); !errors.Is(err, ErrInvalidSnapshot) {
 		t.Fatalf("revision mismatch error = %v", err)
 	}
 }
@@ -525,7 +525,7 @@ func TestRehydrateRejectedSnapshotDecodeCannotMutateReplaySession(t *testing.T) 
 		t.Fatal(err)
 	}
 	store.cp[sessionID] = Checkpoint{Seq: seq, Snapshot: Snapshot{
-		Version: snapshotVersion, ChartVersion: chart.Version(), Datamodel: badModel,
+		Version: snapshotVersion, Revision: chart.Revision(), Datamodel: badModel,
 		Configuration: []Identifier{"ready"}, Running: true,
 	}}
 	instance, err := chart.Rehydrate(ctx, log, store, sessionID, NoopIOProcessor)

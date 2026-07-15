@@ -121,6 +121,27 @@ func TestDurableSpawnPersistsAndResumesViaLogWithoutDoubleApplying(t *testing.T)
 	}
 }
 
+func TestDurableSpawnUsesDerivedRevisionWithoutExplicitSalt(t *testing.T) {
+	ctx := context.Background()
+	chart, err := statecharts.Build(
+		statecharts.Atomic("derived-revision"),
+		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	system := NewSystem(WithStorage(openTestLog(t)))
+	if err := system.Register(chart); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := system.Spawn(ctx, "derived-revision", chart.ID(), Durable()); err != nil {
+		t.Fatalf("durable Spawn without explicit revision salt: %v", err)
+	}
+	if err := system.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 // TestDurableActorSurvivesCrashWithoutGracefulStop is the reviewer's
 // throwaway probe that found finding #1 (Tell/deliverAsync never
 // write-ahead-logging a durable actor's messages), turned into a
@@ -896,7 +917,7 @@ func TestDurableProcessorClassifiesWrappedSendExecutionError(t *testing.T) {
 	}
 }
 
-func buildVersionedSenderChart(version string) *statecharts.Chart {
+func buildRevisionSenderChart(salt string) *statecharts.Chart {
 	chart, err := statecharts.Build(
 		statecharts.Compound("versioned-sender", "ready",
 			statecharts.Children(
@@ -908,7 +929,7 @@ func buildVersionedSenderChart(version string) *statecharts.Chart {
 			),
 		),
 		statecharts.NewGoModel(func() *struct{} { return &struct{}{} }),
-		statecharts.WithRevisionSalt(version),
+		statecharts.WithRevisionSalt(salt),
 	)
 	if err != nil {
 		panic(err)
@@ -916,14 +937,14 @@ func buildVersionedSenderChart(version string) *statecharts.Chart {
 	return chart
 }
 
-// Outbound result identities are scoped to the chart version. Otherwise a
-// full replay after a version bump can apply an old synchronous processor
+// Outbound result identities are scoped to the chart revision. Otherwise a
+// full replay after a revision change can apply an old synchronous processor
 // failure to a different send that merely reused the same dispatch ordinal
 // in the new chart definition.
-func TestChartVersionScopesDurableOutboundReplay(t *testing.T) {
+func TestChartRevisionScopesDurableOutboundReplay(t *testing.T) {
 	ctx := context.Background()
 	storage := openTestLog(t)
-	v1 := buildVersionedSenderChart("v1")
+	v1 := buildRevisionSenderChart("v1")
 	first := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor {
 		return &failingProcessor{err: errors.New("v1 transport failure")}
 	}))
@@ -942,7 +963,7 @@ func TestChartVersionScopesDurableOutboundReplay(t *testing.T) {
 	}
 	entry.instance.Store(nil)
 
-	v2 := buildVersionedSenderChart("v2")
+	v2 := buildRevisionSenderChart("v2")
 	recovered := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor {
 		return &registeredIOProcessor{}
 	}))
@@ -957,7 +978,49 @@ func TestChartVersionScopesDurableOutboundReplay(t *testing.T) {
 		if inst != nil {
 			configuration = inst.Configuration()
 		}
-		t.Fatalf("v2 configuration = %v, want ready; v1's send failure leaked across chart versions", configuration)
+		t.Fatalf("v2 configuration = %v, want ready; v1's send failure leaked across chart revisions", configuration)
+	}
+
+	if err := first.Stop(ctx); err != nil {
+		t.Fatalf("Stop first: %v", err)
+	}
+	if err := recovered.Stop(ctx); err != nil {
+		t.Fatalf("Stop recovered: %v", err)
+	}
+}
+
+func TestOldRevisionPendingOutboxIsNotRedispatched(t *testing.T) {
+	ctx := context.Background()
+	storage := openTestLog(t)
+	firstProcessor := &holdingAckProcessor{}
+	v1 := buildRevisionSenderChart("v1-pending")
+	first := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor { return firstProcessor }))
+	if err := first.Register(v1); err != nil {
+		t.Fatalf("Register v1: %v", err)
+	}
+	if err := first.Spawn(ctx, "pending-revision", v1.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn v1: %v", err)
+	}
+	if got := firstProcessor.requestCount(); got != 1 {
+		t.Fatalf("v1 requests = %d, want 1 pending request", got)
+	}
+	entry, _ := first.resolve("pending-revision")
+	if err := entry.instance.Load().Stop(ctx); err != nil {
+		t.Fatalf("stop crashed v1 instance: %v", err)
+	}
+	entry.instance.Store(nil)
+
+	secondProcessor := &holdingAckProcessor{}
+	v2 := buildRevisionSenderChart("v2-pending")
+	recovered := NewSystem(WithStorage(storage), WithIOProcessor("custom", func() statecharts.IOProcessor { return secondProcessor }))
+	if err := recovered.Register(v2); err != nil {
+		t.Fatalf("Register v2: %v", err)
+	}
+	if err := recovered.Spawn(ctx, "pending-revision", v2.ID(), Durable()); err != nil {
+		t.Fatalf("Spawn v2: %v", err)
+	}
+	if got := secondProcessor.requestCount(); got != 0 {
+		t.Fatalf("v2 recovery redispatched %d pending request(s) from v1", got)
 	}
 
 	if err := first.Stop(ctx); err != nil {

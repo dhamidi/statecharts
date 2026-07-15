@@ -402,7 +402,7 @@ func TestInvokeChartHandlerRunsADeclarativelyInvokedChild(t *testing.T) {
 	_ = instance.Stop(ctx)
 }
 
-func TestActiveInvokeSnapshotsResolveStableDefinitionIDAfterReorder(t *testing.T) {
+func TestActiveInvokeSnapshotsResolveStableDefinitionIDAfterDefinitionRoundTrip(t *testing.T) {
 	model := NewGoModel(func() *compileTestModel { return &compileTestModel{} })
 	first := InvokeDefinition{DefinitionID: "first-definition", ID: "first-runtime", Type: "first"}
 	second := InvokeDefinition{DefinitionID: "second-definition", ID: "second-runtime", Type: "second"}
@@ -410,7 +410,6 @@ func TestActiveInvokeSnapshotsResolveStableDefinitionIDAfterReorder(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	chart.version = "stable-invokes-v1"
 	requests := make(chan InvokeRequest, 2)
 	options := []Option{
 		WithInvokeHandler("first", func() InvokeHandler { return &recordingInvokeHandler{requests: requests} }),
@@ -436,16 +435,26 @@ func TestActiveInvokeSnapshotsResolveStableDefinitionIDAfterReorder(t *testing.T
 		t.Fatalf("snapshot definition IDs = %v", got)
 	}
 
-	reordered, err := Compile(invokeTestDefinition(second, first), model)
+	wire, err := json.Marshal(chart.Definition())
 	if err != nil {
 		t.Fatal(err)
 	}
-	reordered.version = chart.version
+	var definition Definition
+	if err := json.Unmarshal(wire, &definition); err != nil {
+		t.Fatal(err)
+	}
+	recompiled, err := Compile(definition, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recompiled.Revision() != chart.Revision() {
+		t.Fatalf("recompiled revision = %q, want %q", recompiled.Revision(), chart.Revision())
+	}
 	store := newMemSnapshotStore()
 	if err := store.Save(ctx, "stable-invokes", Checkpoint{Snapshot: snapshot}); err != nil {
 		t.Fatal(err)
 	}
-	restored, err := reordered.Rehydrate(ctx, newMemLog(), store, "stable-invokes", NoopIOProcessor, options...)
+	restored, err := recompiled.Rehydrate(ctx, newMemLog(), store, "stable-invokes", NoopIOProcessor, options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +503,6 @@ func TestResumeKeepsEvaluatedDynamicTypeAndSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	chart.version = "dynamic-binding-v1"
 	requests := make(chan InvokeRequest, 2)
 	options := []Option{
 		WithInvokeHandler("first", func() InvokeHandler { return &recordingInvokeHandler{requests: requests} }),

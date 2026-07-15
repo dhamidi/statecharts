@@ -12,7 +12,7 @@ type Chart struct {
 	byID                  map[Identifier]*compiledState
 	order                 []*compiledState // document order (pre-order traversal of the state tree)
 	program               DatamodelProgram
-	version               string
+	revision              RevisionID
 	definition            Definition
 	data                  []compiledData
 	dataBinding           DataBinding
@@ -33,8 +33,7 @@ func WithName(name string) BuildOption { return func(d *Definition) { d.Name = n
 
 // WithRevisionSalt adds explicit application-controlled revision material.
 // Change it when registered behavior changes without a corresponding function
-// version change. Until Chart revision IDs replace Version, it also provides
-// the snapshot/outbox compatibility version.
+// version change.
 func WithRevisionSalt(salt string) BuildOption {
 	return func(d *Definition) { d.RevisionSalt = salt }
 }
@@ -50,8 +49,9 @@ func WithData(data ...DataDefinition) BuildOption {
 	return func(d *Definition) { d.Data = append(d.Data, cloneDataDefinitions(owned)...) }
 }
 
-// Version returns the chart's opaque application version.
-func (c *Chart) Version() string { return c.version }
+// Revision returns the deterministic identity of this compiled definition and
+// datamodel program.
+func (c *Chart) Revision() RevisionID { return c.revision }
 
 // ID returns the chart's root state's ID, which identifies the chart itself
 // wherever a chart-level identity is needed. A Chart is otherwise

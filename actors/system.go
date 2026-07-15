@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -361,10 +362,6 @@ var ErrKindNotRegistered = errors.New("actors: kind is not registered")
 // that a retry could change.
 var ErrDurabilityUnsupported = errors.New("actors: durable spawn requires WithStorage")
 
-// ErrDurableChartUnversioned is returned because durable snapshot caches
-// require an explicit application compatibility version.
-var ErrDurableChartUnversioned = errors.New("actors: durable spawn requires a nonempty chart version")
-
 // ErrDurableIOProcessorUnavailable is returned while recovering an actor
 // whose outbox contains unresolved work for a processor type that is no
 // longer registered. Register that exact processor type before retrying;
@@ -439,17 +436,13 @@ func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Ident
 		opt(&cfg)
 	}
 
-	chart, ok := s.chartFor(kind)
+	_, ok := s.chartFor(kind)
 	if !ok {
 		return fmt.Errorf("actors: Spawn: kind %q was never Registered: %w", kind, ErrKindNotRegistered)
 	}
 	if cfg.durable && s.cfg.storage == nil {
 		return fmt.Errorf("actors: Spawn: %w", ErrDurabilityUnsupported)
 	}
-	if cfg.durable && chart.Version() == "" {
-		return fmt.Errorf("actors: Spawn: chart %q: %w", kind, ErrDurableChartUnversioned)
-	}
-
 	entry, err := s.entryFor(name, kind, cfg.durable)
 	if err != nil {
 		return err
@@ -584,6 +577,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 	}
 	address := s.address(entry.name)
 	sessionID := statecharts.SessionID(entry.name)
+	deliveryNamespace := fmt.Sprintf("%d:%s:%s", len(sessionID), sessionID, chart.Revision())
 	proc := newRoutingProcessor(s, address)
 	processorOpts := make([]statecharts.Option, 0, 1+len(s.cfg.processors))
 	processorValues := make([]statecharts.IOProcessor, 0, 1+len(s.cfg.processors))
@@ -592,9 +586,14 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 	var recovery *durableRecovery
 	if entry.durable {
 		var loadErr error
-		outbounds, loadErr = s.cfg.storage.Outbounds(ctx, sessionID)
+		storedOutbounds, loadErr := s.cfg.storage.Outbounds(ctx, sessionID)
 		if loadErr != nil {
 			return fmt.Errorf("actors: load outbox for %q: %w", entry.name, loadErr)
+		}
+		for _, message := range storedOutbounds {
+			if strings.HasPrefix(string(message.DeliveryID), deliveryNamespace+":") {
+				outbounds = append(outbounds, message)
+			}
 		}
 		available := make(map[statecharts.Identifier]bool, len(processors))
 		for _, registered := range processors {
@@ -654,7 +653,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			statecharts.WithLogger(s.cfg.logger),
 			statecharts.WithIngressHook(ingressHook),
 			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.storage, sessionID, s.cfg.clock)),
-			statecharts.WithDeliveryNamespace(fmt.Sprintf("%d:%s:%s", len(sessionID), sessionID, chart.Version())),
+			statecharts.WithDeliveryNamespace(deliveryNamespace),
 		)
 		hasLogEntries := false
 		for _, readErr := range s.cfg.storage.Read(ctx, sessionID, 1) {

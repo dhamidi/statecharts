@@ -13,6 +13,9 @@
 // versions. Builder nodes store those stable references rather than Go
 // function values, making the complete definition deterministic and
 // inspectable while each running Instance still owns ordinary typed Go data.
+// Compile derives Chart.Revision from a versioned canonical definition,
+// datamodel identity, and deterministic program fingerprint; snapshots and
+// durable outbound identities are scoped to that revision.
 // Other datamodels can implement Datamodel, DatamodelProgram, and
 // DatamodelSession without changing the interpreter.
 //

@@ -114,17 +114,15 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 	var cp Checkpoint
 	hasCheckpoint := false
 	cacheMiss := false
-	if chart.version != "" {
-		var err error
-		cp, hasCheckpoint, err = snapshots.Load(ctx, sessionID)
-		if errors.Is(err, ErrInvalidSnapshot) {
-			hasCheckpoint = false
-			cacheMiss = true
-		} else if err != nil {
-			return nil, fmt.Errorf("statecharts: Rehydrate: load checkpoint: %w", err)
-		}
-		cacheMiss = !hasCheckpoint
+	var err error
+	cp, hasCheckpoint, err = snapshots.Load(ctx, sessionID)
+	if errors.Is(err, ErrInvalidSnapshot) {
+		hasCheckpoint = false
+		cacheMiss = true
+	} else if err != nil {
+		return nil, fmt.Errorf("statecharts: Rehydrate: load checkpoint: %w", err)
 	}
+	cacheMiss = !hasCheckpoint
 	// Checkpoints are a disposable replay optimization. If their format is
 	// from another version, ignore them and rebuild from the authoritative
 	// log rather than either interpreting an incompatible snapshot or making
@@ -133,7 +131,7 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 	if err != nil {
 		return nil, fmt.Errorf("statecharts: Rehydrate: last sequence: %w", err)
 	}
-	if hasCheckpoint && (cp.Snapshot.Version != snapshotVersion || cp.Snapshot.ChartVersion != chart.version || cp.Seq > lastSeq) {
+	if hasCheckpoint && (cp.Snapshot.Version != snapshotVersion || cp.Snapshot.Revision != chart.revision || cp.Seq > lastSeq) {
 		hasCheckpoint = false
 		cacheMiss = true
 	}
@@ -263,7 +261,7 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 
 	// A cache is disposable: refresh a rejected or absent one best-effort at
 	// the exact final log boundary, while replay side effects remain gated.
-	if cacheMiss && chart.version != "" {
+	if cacheMiss {
 		if snap, snapErr := in.Snapshot(ctx); snapErr == nil {
 			_ = snapshots.Save(ctx, sessionID, Checkpoint{Snapshot: snap, Seq: lastSeq})
 		}

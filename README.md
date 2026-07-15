@@ -349,6 +349,14 @@ versions. When the revision no longer matches, rehydration ignores the stale
 snapshot and replays the event reducer from the log. Applications should not
 write snapshot migration code.
 
+`Chart.Revision()` returns that identity as `sha256:<64 lowercase hex digits>`.
+Revision envelope version 1 hashes length-prefixed canonical definition bytes,
+the datamodel name, and the datamodel program's deterministic fingerprint.
+Canonical definition bytes include every expression/function reference and
+the optional `WithRevisionSalt` value. Runtime pointers, registry insertion
+order, clocks, process IDs, and compiled engine artifacts are excluded. A
+datamodel must return a stable, non-empty `DatamodelProgram.Fingerprint`.
+
 `Chart.Rehydrate` reconstructs a session from its `Log`, optionally using a
 compatible snapshot to skip old entries. Replay suppresses real outbound
 effects, then reconciles durable outbound intents and active invocations when

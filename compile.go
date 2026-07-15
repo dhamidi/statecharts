@@ -25,13 +25,21 @@ func Compile(definition Definition, model Datamodel) (*Chart, error) {
 	if program == nil {
 		return nil, fmt.Errorf("statecharts: datamodel %q returned a nil program", model.Name())
 	}
+	fingerprint := program.Fingerprint()
+	if len(fingerprint) == 0 {
+		return nil, fmt.Errorf("statecharts: datamodel %q returned an empty program fingerprint", model.Name())
+	}
+	revision, err := deriveRevision(d, model.Name(), fingerprint)
+	if err != nil {
+		return nil, fmt.Errorf("statecharts: derive chart revision: %w", err)
+	}
 	globalData, err := compileData(d.Data, program, "definition.data")
 	if err != nil {
 		return nil, err
 	}
 	c := &Chart{
 		byID: map[Identifier]*compiledState{}, name: d.Name, program: program,
-		version: d.RevisionSalt, definition: d, data: globalData, dataBinding: d.DataBinding,
+		revision: revision, definition: d, data: globalData, dataBinding: d.DataBinding,
 		invokesByDefinitionID: map[Identifier]*compiledInvoke{},
 	}
 	order := 0

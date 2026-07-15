@@ -12,7 +12,8 @@ type Datamodel interface {
 // instance of one chart revision.
 type DatamodelProgram interface {
 	// Fingerprint returns deterministic implementation identity used as chart
-	// revision material. Callers must treat the returned bytes as immutable.
+	// revision material. It must be non-empty and restart-stable for equivalent
+	// programs. Callers must treat the returned bytes as immutable.
 	Fingerprint() []byte
 	// ResolveExpression returns the immutable handle compiled for expression.
 	// It rejects expressions that were not part of the compiled Definition.

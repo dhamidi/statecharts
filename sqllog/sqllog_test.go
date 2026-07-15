@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -314,6 +315,24 @@ func TestNewRejectsNonCurrentSchemaBeforeMutation(t *testing.T) {
 	}
 	if hasValueData != 0 {
 		t.Fatal("New mutated the rejected legacy table")
+	}
+}
+
+func TestNewRejectsPreRevisionOutboxSchema(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
+	if _, err := sqllog.New(db, sqllog.SQLite); err != nil {
+		t.Fatalf("create current schema: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE statechart_schema SET version = 1`); err != nil {
+		t.Fatalf("mark schema as pre-revision: %v", err)
+	}
+	if _, err := sqllog.New(db, sqllog.SQLite); err == nil || !strings.Contains(err.Error(), "want 2") {
+		t.Fatalf("New pre-revision schema error = %v, want current version 2 rejection", err)
 	}
 }
 
