@@ -96,7 +96,10 @@ func WithInvokeParams(fn func(ExecContext) any) InvokeOption {
 // WithFinalize attaches executable content run whenever an event carrying
 // this invocation's InvokeID is processed, immediately before transitions
 // are selected for it (SCXML 6.5): the mechanism for normalizing data an
-// invoked service returns before any transition's guard inspects it.
+// invoked service returns before any transition's guard inspects it. Send,
+// Raise, and Cancel are rejected with error.execution in this content.
+// Since actions are arbitrary Go, applications are responsible for not doing
+// direct external I/O from a finalize callback.
 func WithFinalize(actions ...ActionFunc) InvokeOption {
 	return func(s *InvokeSpec) {
 		s.Finalize = append(s.Finalize, actions...)

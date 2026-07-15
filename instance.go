@@ -412,6 +412,12 @@ func (in *Instance) runInvokeGoroutine(id Identifier, run func(context.Context, 
 			if ctx.Err() != nil {
 				return
 			}
+			data, err := clonePayload(ev.Data)
+			if err != nil {
+				ev = Event{Name: ErrEventExecution, Type: EventPlatform, Data: err}
+			} else {
+				ev.Data = data
+			}
 			ev.InvokeID = id
 			ev.Type = EventExternal
 			_ = in.Deliver(ctx, ev)
@@ -439,9 +445,12 @@ func (in *Instance) runInvokeGoroutine(id Identifier, run func(context.Context, 
 			})
 			return
 		}
-		_ = in.Deliver(context.Background(), Event{
-			Name: Identifier("done.invoke." + string(id)), Type: EventExternal, InvokeID: id, Data: data,
-		})
+		data, cloneErr := clonePayload(data)
+		if cloneErr != nil {
+			_ = in.Deliver(context.Background(), Event{Name: ErrEventExecution, Type: EventPlatform, InvokeID: id, Data: cloneErr})
+			return
+		}
+		_ = in.Deliver(context.Background(), Event{Name: Identifier("done.invoke." + string(id)), Type: EventExternal, InvokeID: id, Data: data})
 	}()
 
 	return cancelFn, inbound
@@ -620,6 +629,12 @@ func (in *Instance) run() {
 		case reqStop:
 			in.ip.running = false
 		case reqSend:
+			// Revalidate invocation ownership on the actor. Deliver may have
+			// passed its optimistic ctx check and then waited here while the
+			// invoking state's onexit cancelled and removed the invocation.
+			if req.event.InvokeID != "" && in.ip.invokesByID[req.event.InvokeID] == nil {
+				break
+			}
 			if in.ingressHook != nil {
 				reqErr = in.ingressHook(req.event)
 			}

@@ -486,6 +486,29 @@ func (ip *interpretation) runActionBlocks(blocks []actionBlock) {
 	}
 }
 
+// finalizeExecContext preserves the Go datamodel access available to
+// finalize content while rejecting the executable effects SCXML 6.5 bans.
+// Direct external I/O performed by arbitrary Go callbacks cannot be
+// intercepted; avoiding it in finalize callbacks is a responsibility of
+// the Go datamodel profile.
+func (ip *interpretation) finalizeExecContext() ExecContext {
+	ec := ip.execContext()
+	forbidden := func(operation string) {
+		ip.reportError(fmt.Errorf("statecharts: %s is not permitted in finalize", operation))
+	}
+	ec.send = func(Identifier, SendOptions) { forbidden("send") }
+	ec.raise = func(Event) { forbidden("raise") }
+	ec.cancel = func(Identifier) { forbidden("cancel") }
+	return ec
+}
+
+func (ip *interpretation) runFinalizeBlocks(blocks []actionBlock) {
+	ec := ip.finalizeExecContext()
+	for _, block := range blocks {
+		ip.runActionsWithContext(block, ec)
+	}
+}
+
 func callAction(action ActionFunc, ec ExecContext) (err error) {
 	defer func() {
 		if value := recover(); value != nil {
@@ -887,11 +910,18 @@ func (ip *interpretation) applyInvokeSideEffects(ev Event) {
 	for _, id := range sortedInvokeIDs(ip.invokesByID) {
 		ri := ip.invokesByID[id]
 		if ev.InvokeID != "" && ri.id == ev.InvokeID {
-			ip.runActionBlocks(ri.finalize)
+			ip.runFinalizeBlocks(ri.finalize)
 		}
 		if ri.autoForward && ri.incoming != nil {
+			forwarded := ev
+			data, err := clonePayload(ev.Data)
+			if err != nil {
+				ip.reportError(fmt.Errorf("statecharts: clone autoforward payload: %w", err))
+				continue
+			}
+			forwarded.Data = data
 			select {
-			case ri.incoming <- ev:
+			case ri.incoming <- forwarded:
 			default:
 				ip.reportCommError(fmt.Errorf("statecharts: invoke %q cannot accept an autoforwarded event", ri.id))
 			}

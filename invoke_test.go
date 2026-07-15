@@ -154,6 +154,74 @@ func TestInvokeCancelledOnStateExitAndSuppressesDoneInvoke(t *testing.T) {
 	}
 }
 
+func TestInvokeEventQueuedDuringFinalOnExitIsDroppedAfterCancellation(t *testing.T) {
+	deliverReady := make(chan func(Event), 1)
+	exitStarted := make(chan struct{})
+	finishExit := make(chan struct{})
+	chart, err := Build(
+		Compound("m", "a",
+			Children(
+				Atomic("a",
+					Invoke(func(ctx context.Context, _ any, io InvokeIO) (any, error) {
+						deliverReady <- io.Deliver
+						<-ctx.Done()
+						return nil, nil
+					}, WithInvokeID("service")),
+					OnExit(func(ExecContext) error {
+						close(exitStarted)
+						<-finishExit
+						return nil
+					}),
+					On("leave", Target("b")),
+				),
+				Atomic("b", On("late", Target("wrong"))),
+				Atomic("wrong"),
+			),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	var ingressed []Identifier
+	in := New(chart, nil, WithIngressHook(func(ev Event) error {
+		ingressed = append(ingressed, ev.Name)
+		return nil
+	}))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	deliver := <-deliverReady
+
+	leaveDone := make(chan error, 1)
+	go func() { leaveDone <- in.Send(ctx, Event{Name: "leave"}) }()
+	<-exitStarted
+
+	// Deliver passes its optimistic context check while the final onexit is
+	// still running, then waits in the Instance inbox. Cancellation is the
+	// last onexit operation, so the actor must revalidate the InvokeID once
+	// it reaches this request rather than accepting a now-orphaned event.
+	deliverDone := make(chan struct{})
+	go func() {
+		deliver(Event{Name: "late"})
+		close(deliverDone)
+	}()
+	close(finishExit)
+	if err := <-leaveDone; err != nil {
+		t.Fatalf("Send leave: %v", err)
+	}
+	<-deliverDone
+
+	if !hasState(in.Configuration(), "b") || hasState(in.Configuration(), "wrong") {
+		t.Fatalf("configuration = %v, want b; late cancelled-invoke event must be dropped", in.Configuration())
+	}
+	if len(ingressed) != 1 || ingressed[0] != "leave" {
+		t.Fatalf("ingress events = %v, want only leave; late invoke event must not become durable ingress", ingressed)
+	}
+}
+
 func TestInvokeErrorBecomesCommunicationError(t *testing.T) {
 	boom := errors.New("boom")
 	gotErr := make(chan Event, 1)
@@ -437,6 +505,135 @@ func TestInvokeClockDoneEventOnFeedClose(t *testing.T) {
 	}
 }
 
+func TestInvokeFinalizeRejectsExternalEffects(t *testing.T) {
+	type model struct {
+		executionErrors int
+		forbiddenEvents int
+		timerFired      bool
+	}
+	clock := NewManualClock(time.Unix(0, 0))
+	deliverReady := make(chan func(Event), 1)
+	chart, err := Build(
+		Atomic("active",
+			OnEntry(SendEvent("timer-fired", SendOptions{SendID: "keep", Delay: time.Hour})),
+			Invoke(func(ctx context.Context, _ any, io InvokeIO) (any, error) {
+				deliverReady <- io.Deliver
+				<-ctx.Done()
+				return nil, nil
+			}, WithInvokeID("service"), WithFinalize(func(ec ExecContext) error {
+				ec.Send("forbidden-send", SendOptions{})
+				ec.Raise(Event{Name: "forbidden-raise"})
+				ec.Cancel("keep")
+				return nil
+			})),
+			On(string(ErrEventExecution), Then(Action(func(d *model, _ ExecContext) error {
+				d.executionErrors++
+				return nil
+			}))),
+			On("forbidden-send forbidden-raise", Then(Action(func(d *model, _ ExecContext) error {
+				d.forbiddenEvents++
+				return nil
+			}))),
+			On("timer-fired", Then(Action(func(d *model, _ ExecContext) error {
+				d.timerFired = true
+				return nil
+			}))),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	dm := &model{}
+	in := New(chart, dm, WithClock(clock))
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	(<-deliverReady)(Event{Name: "reply"})
+
+	if dm.executionErrors != 3 || dm.forbiddenEvents != 0 {
+		t.Fatalf("after finalize: %+v, want three error.execution events and no send/raise effects", dm)
+	}
+
+	// Cancel is forbidden too, so the delayed send must remain pending.
+	clock.Advance(time.Hour)
+	if err := in.Send(ctx, Event{Name: "sync"}); err != nil {
+		t.Fatalf("Send sync: %v", err)
+	}
+	if !dm.timerFired {
+		t.Fatal("finalize cancelled a delayed send; cancel is an external effect")
+	}
+}
+
+func TestInvokeDeliverCopiesPayloadAtServiceBoundary(t *testing.T) {
+	type model struct{ received map[string][]int }
+	deliverReady := make(chan func(Event), 1)
+	chart, err := Build(Atomic("active",
+		Invoke(func(ctx context.Context, _ any, io InvokeIO) (any, error) {
+			deliverReady <- io.Deliver
+			<-ctx.Done()
+			return nil, nil
+		}),
+		On("reply", Then(Action(func(d *model, ec ExecContext) error {
+			ev, _ := ec.Event()
+			d.received = ev.Data.(map[string][]int)
+			return nil
+		}))),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	dm := &model{}
+	in := New(chart, dm)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	original := map[string][]int{"values": {1}}
+	(<-deliverReady)(Event{Name: "reply", Data: original})
+	original["values"][0] = 9
+	if dm.received["values"][0] != 1 {
+		t.Fatalf("received payload = %v after service mutation, want an isolated copy", dm.received)
+	}
+}
+
+func TestInvokeCompletionCopiesPayloadAtServiceBoundary(t *testing.T) {
+	result := map[string][]int{"values": {1}}
+	received := make(chan map[string][]int, 1)
+	chart, err := Build(Atomic("active",
+		Invoke(func(context.Context, any, InvokeIO) (any, error) { return result, nil }, WithInvokeID("service")),
+		On("done.invoke.service", Then(func(ec ExecContext) error {
+			ev, _ := ec.Event()
+			received <- ev.Data.(map[string][]int)
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	var copied map[string][]int
+	select {
+	case copied = <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("done.invoke.service was not processed")
+	}
+	result["values"][0] = 9
+	if copied["values"][0] != 1 {
+		t.Fatalf("completion payload = %v after service mutation, want an isolated copy", copied)
+	}
+}
+
 // --- Completing <invoke>: autoforward (SCXML 6.4.1) and "#_parent"
 // (Appendix C.1), including a real child SCXML session via InvokeChart. --
 
@@ -562,6 +759,44 @@ func TestInvokeAutoForwardStopsAfterCancellation(t *testing.T) {
 		case <-drainDeadline:
 			return
 		}
+	}
+}
+
+func TestInvokeAutoForwardCopiesMutablePayload(t *testing.T) {
+	mutated := make(chan struct{})
+	chart, err := Build(Atomic("active",
+		Invoke(func(ctx context.Context, _ any, io InvokeIO) (any, error) {
+			select {
+			case ev := <-io.Incoming:
+				ev.Data.(map[string][]int)["values"][0] = 9
+				close(mutated)
+			case <-ctx.Done():
+			}
+			<-ctx.Done()
+			return nil, nil
+		}, WithAutoForward()),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	in := New(chart, nil)
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	original := map[string][]int{"values": {1}}
+	if err := in.Send(ctx, Event{Name: "load", Data: original}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	select {
+	case <-mutated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("invoke did not receive autoforwarded event")
+	}
+	if original["values"][0] != 1 {
+		t.Fatalf("source payload = %v after invoked service mutation, want an isolated forwarded copy", original)
 	}
 }
 
