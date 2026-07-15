@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"strings"
 )
 
 // Chart is an immutable, validated, indexed chart definition produced by
@@ -328,12 +327,8 @@ func reconcileActionBlocks(actions []ActionFunc, recorded []actionBlock) ([]acti
 }
 
 func validateStateID(id Identifier) error {
-	if _, err := NewIdentifier(string(id)); err != nil {
+	if err := validatePlainIdentifier(id); err != nil {
 		return fmt.Errorf("statecharts: invalid state ID %q: %w", id, err)
-	}
-	s := string(id)
-	if strings.HasPrefix(s, "#") || s == "*" || strings.HasSuffix(s, ".") || strings.HasSuffix(s, ".*") {
-		return fmt.Errorf("statecharts: invalid state ID %q", id)
 	}
 	return nil
 }
