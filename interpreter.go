@@ -19,19 +19,20 @@ import (
 // same reason it owns delayed-send timers: spawning goroutines is an actor
 // concern, not a core-interpreter one.
 type interpretation struct {
-	chart         *Chart
-	datamodel     any
-	sessionID     SessionID  // SCXML 5.10's _sessionid, bound for this session's lifetime
-	name          Identifier // SCXML 5.10's _name, bound to chart.ID() for this session's lifetime
-	configuration map[*compiledState]bool
-	historyValue  map[*compiledState][]*compiledState
-	internalQueue []Event
-	externalQueue []Event
-	running       bool
-	result        any
-	completed     bool
-	lastEvent     Event
-	hasLastEvent  bool
+	chart             *Chart
+	datamodel         any
+	sessionID         SessionID // SCXML 5.10's _sessionid, bound for this session's lifetime
+	name              string    // SCXML 5.10's _name
+	platformVariables map[string]any
+	configuration     map[*compiledState]bool
+	historyValue      map[*compiledState][]*compiledState
+	internalQueue     []Event
+	externalQueue     []Event
+	running           bool
+	result            any
+	completed         bool
+	lastEvent         Event
+	hasLastEvent      bool
 
 	ioProcessorsByType map[Identifier]IOProcessor
 	ioProcessorOrder   []Identifier
@@ -213,18 +214,30 @@ func (ip *interpretation) reportSendError(sendID Identifier, err error) {
 
 // SendOptions configures a scheduled event, mirroring <send>'s attributes.
 type SendOptions struct {
-	SendID Identifier // author-visible ID; empty uses an unexposed execution ID
-	Target Identifier // "" = own external queue (default); "#_internal"; or an external target
-	Type   Identifier // IOProcessor selector, meaningful for external targets only
-	Data   any
-	Delay  time.Duration // 0 = dispatch immediately
+	SendID     Identifier     // author-visible ID; empty uses an unexposed execution ID
+	IDLocation IDLocationFunc // assigns a generated, author-visible ID; mutually exclusive with SendID
+	Target     Identifier     // "" = own external queue (default); "#_internal"; or an external target
+	Type       Identifier     // IOProcessor selector, meaningful for external targets only
+	Data       any
+	Delay      time.Duration // 0 = dispatch immediately
 }
 
 func (ip *interpretation) doSend(name Identifier, opts SendOptions) {
+	if opts.SendID != "" && opts.IDLocation != nil {
+		ip.reportSendError(opts.SendID, sendIDLocationError{fmt.Errorf("statecharts: send id and idlocation are mutually exclusive")})
+		return
+	}
 	sendID := opts.SendID
 	if sendID == "" {
 		ip.sendSeq++
 		sendID = Identifier(fmt.Sprintf("send.%d", ip.sendSeq))
+	}
+	if opts.IDLocation != nil {
+		if err := ip.assignIDLocation(opts.IDLocation, sendID, "send"); err != nil {
+			ip.reportSendError(sendID, sendIDLocationError{err})
+			return
+		}
+		opts.SendID = sendID
 	}
 	opts.Type = canonicalIOProcessorType(opts.Type)
 	data := opts.Data
@@ -318,6 +331,10 @@ func (ip *interpretation) dispatchToProcessor(sendID, target, typ Identifier, ev
 type sendPayloadCopyError struct{ error }
 
 func (sendPayloadCopyError) SendExecutionError() {}
+
+type sendIDLocationError struct{ error }
+
+func (sendIDLocationError) SendExecutionError() {}
 
 // handleTimerFire is what a pending send's timer actually schedules. It
 // must only ever run on the goroutine that owns this interpretation (for a
@@ -447,11 +464,12 @@ func (ip *interpretation) ioProcessors() []IOProcessorInfo {
 
 func (ip *interpretation) execContext() ExecContext {
 	return ExecContext{
-		event:     ip.lastEvent,
-		hasEvent:  ip.hasLastEvent,
-		datamodel: ip.datamodel,
-		sessionID: string(ip.sessionID),
-		name:      ip.name,
+		event:             ip.lastEvent,
+		hasEvent:          ip.hasLastEvent,
+		datamodel:         ip.datamodel,
+		sessionID:         string(ip.sessionID),
+		name:              ip.name,
+		platformVariables: ip.platformVariables,
 		active: func(id Identifier) bool {
 			s := ip.chart.byID[id]
 			return s != nil && ip.configuration[s]
@@ -462,6 +480,18 @@ func (ip *interpretation) execContext() ExecContext {
 		log:          ip.doLog,
 		ioProcessors: ip.ioProcessors,
 	}
+}
+
+func (ip *interpretation) assignIDLocation(fn IDLocationFunc, id Identifier, kind string) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = fmt.Errorf("statecharts: %s idlocation panicked: %v", kind, v)
+		}
+	}()
+	if err := fn(ip.execContext(), id); err != nil {
+		return fmt.Errorf("statecharts: %s idlocation: %w", kind, err)
+	}
+	return nil
 }
 
 func (ip *interpretation) runActions(actions actionBlock) {
@@ -865,6 +895,12 @@ func (ip *interpretation) beginInvoke(s *compiledState, specIndex int, spec *com
 			if !ip.invokeIDReserved(id) {
 				break
 			}
+		}
+	}
+	if spec.idLocation != nil {
+		if err := ip.assignIDLocation(spec.idLocation, id, "invoke"); err != nil {
+			ip.reportError(err)
+			return
 		}
 	}
 	var params any

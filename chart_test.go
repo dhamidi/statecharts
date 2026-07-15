@@ -2,6 +2,7 @@ package statecharts
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -485,5 +486,58 @@ func TestChartWithoutNewDatamodelReportsNotOK(t *testing.T) {
 	}
 	if _, ok := chart.NewDatamodel(); ok {
 		t.Fatalf("NewDatamodel() ok = true, want false (no WithNewDatamodel given)")
+	}
+}
+
+func TestBuildAssignsDeterministicCollisionFreeStateIDs(t *testing.T) {
+	spec := Compound("", "", Children(Atomic("state.1"), Atomic(""), Final("")))
+	a, err := Build(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Build(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Identifier{"state.2", "state.1", "state.3", "state.4"}
+	if !reflect.DeepEqual(a.States(), want) {
+		t.Fatalf("States = %v, want %v", a.States(), want)
+	}
+	if !reflect.DeepEqual(a.States(), b.States()) {
+		t.Fatalf("rebuild IDs differ: %v / %v", a.States(), b.States())
+	}
+	if a.ID() == "" {
+		t.Fatal("Chart.ID is empty")
+	}
+	if spec.ID != "" || spec.Children[1].ID != "" || spec.Children[2].ID != "" {
+		t.Fatalf("Build mutated its input StateSpec: root=%q children=%q/%q", spec.ID, spec.Children[1].ID, spec.Children[2].ID)
+	}
+}
+
+func TestChartNameIsIndependentOfRootID(t *testing.T) {
+	c, err := Build(Atomic("root"), WithName("document"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ID() != "root" || c.Name() != "document" {
+		t.Fatalf("ID/Name = %q/%q", c.ID(), c.Name())
+	}
+	unnamed, err := Build(Atomic("root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unnamed.Name() != "" {
+		t.Fatalf("default Name = %q", unnamed.Name())
+	}
+}
+
+func TestBuildRejectsInvokeIDWithIDLocation(t *testing.T) {
+	service := func(context.Context, any, InvokeIO) (any, error) { return nil, nil }
+	_, err := Build(Atomic("root", Invoke(service,
+		WithInvokeID("service"),
+		WithInvokeIDLocation(func(ExecContext, Identifier) error { return nil }),
+	)))
+	if err == nil {
+		t.Fatal("Build accepted invoke id together with idlocation")
 	}
 }

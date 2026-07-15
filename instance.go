@@ -92,6 +92,20 @@ type instanceConfig struct {
 	idGen                    IDGenerator
 	sessionID                SessionID
 	deliveryNamespace        string
+	platformVariables        map[string]any
+}
+
+// WithPlatformVariables supplies the opaque capabilities exposed through
+// SCXML's protected _x system-variable root. The binding map is copied;
+// callers must provide the option again to Restore or Rehydrate because
+// platform capabilities are runtime configuration, not snapshot data.
+func WithPlatformVariables(values map[string]any) Option {
+	return func(c *instanceConfig) {
+		c.platformVariables = make(map[string]any, len(values))
+		for k, v := range values {
+			c.platformVariables[k] = v
+		}
+	}
 }
 
 var incarnationSeq atomic.Uint64
@@ -269,7 +283,11 @@ func newInstance(chart *Chart, ip *interpretation, cfg instanceConfig, id Sessio
 	ip.timerFiredHook = cfg.timerFiredHook
 	ip.startInvoke = in.startInvoke
 	ip.sessionID = id
-	ip.name = chart.ID()
+	ip.name = chart.Name()
+	ip.platformVariables = make(map[string]any, len(cfg.platformVariables))
+	for k, v := range cfg.platformVariables {
+		ip.platformVariables[k] = v
+	}
 	in.ip = ip
 
 	for _, registered := range cfg.processors {

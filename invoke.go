@@ -73,6 +73,7 @@ type InvokeSpec struct {
 	Finalize       []ActionFunc
 	AutoForward    bool
 	Resume         InvokeResumeFunc
+	IDLocation     IDLocationFunc
 	finalizeBlocks []actionBlock
 }
 
@@ -84,6 +85,14 @@ type InvokeOption func(*InvokeSpec)
 // session is generated when the invocation actually starts.
 func WithInvokeID(id Identifier) InvokeOption {
 	return func(s *InvokeSpec) { s.ID = id }
+}
+
+// WithInvokeIDLocation assigns the generated invoke ID synchronously when the
+// invocation is evaluated, before params and Start. It is mutually exclusive
+// with WithInvokeID; an assignment error or panic produces error.execution
+// and aborts the invocation.
+func WithInvokeIDLocation(fn IDLocationFunc) InvokeOption {
+	return func(s *InvokeSpec) { s.IDLocation = fn }
 }
 
 // WithInvokeParams sets the callback that computes the data passed to
@@ -148,6 +157,7 @@ type compiledInvoke struct {
 	finalize    []actionBlock
 	autoForward bool
 	resume      InvokeResumeFunc
+	idLocation  IDLocationFunc
 }
 
 // runningInvoke is the interpreter-core bookkeeping for one active

@@ -327,6 +327,7 @@ func TestExecContextSessionIDAndNameInsideActionAndGuard(t *testing.T) {
 				Atomic("open"),
 			),
 		),
+		WithName("door-chart"),
 	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -345,18 +346,58 @@ func TestExecContextSessionIDAndNameInsideActionAndGuard(t *testing.T) {
 	if gotSessionID != "sess-xyz" {
 		t.Fatalf("ExecContext.SessionID() inside action = %q, want %q", gotSessionID, "sess-xyz")
 	}
-	if gotName != string(chart.ID()) {
-		t.Fatalf("ExecContext.Name() inside action = %q, want %q", gotName, chart.ID())
+	if gotName != chart.Name() {
+		t.Fatalf("ExecContext.Name() inside action = %q, want %q", gotName, chart.Name())
 	}
 	if guardSessionID != "sess-xyz" {
 		t.Fatalf("ExecContext.SessionID() inside guard = %q, want %q", guardSessionID, "sess-xyz")
 	}
-	if guardName != string(chart.ID()) {
-		t.Fatalf("ExecContext.Name() inside guard = %q, want %q", guardName, chart.ID())
+	if guardName != chart.Name() {
+		t.Fatalf("ExecContext.Name() inside guard = %q, want %q", guardName, chart.Name())
 	}
 
 	if err := in.Stop(ctx); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestExecContextPlatformVariablesProtectsBindings(t *testing.T) {
+	provided := map[string]any{"transport": "configured"}
+	var actionValue, guardValue any
+	var actionAdded, guardAdded bool
+	chart, err := Build(Atomic("root",
+		OnEntry(func(ec ExecContext) error {
+			variables := ec.PlatformVariables()
+			actionValue, actionAdded = variables["transport"], variables["added"] != nil
+			variables["transport"] = "action mutation"
+			variables["added"] = true
+			return nil
+		}),
+		On("inspect", If(func(ec ExecContext) bool {
+			variables := ec.PlatformVariables()
+			guardValue, guardAdded = variables["transport"], variables["added"] != nil
+			return true
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	in := New(chart, nil, WithPlatformVariables(provided))
+	provided["transport"] = "caller mutation"
+	provided["added"] = true
+	ctx := context.Background()
+	if err := in.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer in.Stop(ctx)
+	if err := in.Send(ctx, Event{Name: "inspect"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if actionValue != "configured" || guardValue != "configured" || actionAdded || guardAdded {
+		t.Fatalf("platform variables in action/guard = %v,%v added=%v,%v; want isolated configured bindings", actionValue, guardValue, actionAdded, guardAdded)
+	}
+	if empty := (ExecContext{}).PlatformVariables(); empty == nil || len(empty) != 0 {
+		t.Fatalf("empty PlatformVariables = %#v, want non-nil empty map", empty)
 	}
 }
 

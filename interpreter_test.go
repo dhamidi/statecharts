@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 )
 
 func hasState(ids []Identifier, want Identifier) bool {
@@ -801,6 +802,113 @@ func TestInterpreterGeneratedSendIDIsNotExposedOnDeliveredEvent(t *testing.T) {
 	ip.start()
 	if got != "" {
 		t.Fatalf("generated send ID exposed as _event.sendid %q, want blank", got)
+	}
+}
+
+func TestInterpreterSendIDLocationAssignsAndExposesGeneratedID(t *testing.T) {
+	type model struct {
+		assigned  Identifier
+		delivered Identifier
+	}
+	dm := &model{}
+	chart, err := Build(Atomic("root",
+		OnEntry(func(ec ExecContext) error {
+			ec.Send("ping", SendOptions{
+				Target: "#_internal",
+				IDLocation: func(locationEC ExecContext, id Identifier) error {
+					locationEC.Datamodel().(*model).assigned = id
+					return nil
+				},
+			})
+			if dm.assigned == "" {
+				return errors.New("idlocation was not assigned synchronously")
+			}
+			return nil
+		}),
+		On("ping", Then(func(ec ExecContext) error {
+			ev, _ := ec.Event()
+			dm.delivered = ev.SendID
+			return nil
+		})),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	ip := newInterpretation(chart, dm)
+	ip.start()
+	if dm.assigned != "send.1" || dm.delivered != dm.assigned {
+		t.Fatalf("assigned/delivered send IDs = %q/%q, want send.1 in both", dm.assigned, dm.delivered)
+	}
+}
+
+func TestInterpreterSendIDLocationCanCancelDelayedSend(t *testing.T) {
+	clock := NewManualClock(time.Unix(0, 0))
+	var assigned Identifier
+	delivered := false
+	chart, err := Build(Atomic("root",
+		OnEntry(func(ec ExecContext) error {
+			ec.Send("timeout", SendOptions{
+				Delay: time.Hour,
+				IDLocation: func(_ ExecContext, id Identifier) error {
+					assigned = id
+					return nil
+				},
+			})
+			ec.Cancel(assigned)
+			return nil
+		}),
+		On("timeout", Then(func(ExecContext) error { delivered = true; return nil })),
+	))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	ip := newInterpretation(chart, nil)
+	ip.clock = clock
+	ip.start()
+	if assigned != "send.1" || len(ip.pending) != 0 {
+		t.Fatalf("assigned ID/pending sends = %q/%d, want send.1/0 after cancel", assigned, len(ip.pending))
+	}
+	clock.Advance(time.Hour)
+	if delivered {
+		t.Fatal("delayed send fired after cancellation through its idlocation value")
+	}
+}
+
+func TestInterpreterSendIDLocationFailuresDiscardSend(t *testing.T) {
+	tests := []struct {
+		name       string
+		sendID     Identifier
+		location   IDLocationFunc
+		wantSendID Identifier
+	}{
+		{"error", "", func(ExecContext, Identifier) error { return errors.New("no location") }, "send.1"},
+		{"panic", "", func(ExecContext, Identifier) error { panic("bad location") }, "send.1"},
+		{"id and idlocation", "explicit", func(ExecContext, Identifier) error { return nil }, "explicit"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var errorEvent Event
+			delivered := false
+			chart, err := Build(Atomic("root",
+				OnEntry(func(ec ExecContext) error {
+					ec.Send("forbidden", SendOptions{SendID: tt.sendID, IDLocation: tt.location, Target: "#_internal"})
+					return nil
+				}),
+				On(string(ErrEventExecution), Then(func(ec ExecContext) error {
+					errorEvent, _ = ec.Event()
+					return nil
+				})),
+				On("forbidden", Then(func(ExecContext) error { delivered = true; return nil })),
+			))
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			ip := newInterpretation(chart, nil)
+			ip.start()
+			if errorEvent.Name != ErrEventExecution || errorEvent.SendID != tt.wantSendID || delivered {
+				t.Fatalf("error event/delivered = %+v/%v, want error.execution sendid=%q and no delivery", errorEvent, delivered, tt.wantSendID)
+			}
+		})
 	}
 }
 

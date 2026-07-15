@@ -8,17 +8,18 @@ import "fmt"
 // only supported datamodel is Go itself, these become plain method calls
 // instead.
 type ExecContext struct {
-	event        Event
-	hasEvent     bool
-	datamodel    any
-	sessionID    string
-	name         Identifier
-	active       func(Identifier) bool
-	raise        func(Event)
-	send         func(name Identifier, opts SendOptions)
-	cancel       func(sendID Identifier)
-	log          func(label string, data any)
-	ioProcessors func() []IOProcessorInfo
+	event             Event
+	hasEvent          bool
+	datamodel         any
+	sessionID         string
+	name              string
+	platformVariables map[string]any
+	active            func(Identifier) bool
+	raise             func(Event)
+	send              func(name Identifier, opts SendOptions)
+	cancel            func(sendID Identifier)
+	log               func(label string, data any)
+	ioProcessors      func() []IOProcessorInfo
 }
 
 // Event returns the event currently being processed, if any. Per SCXML
@@ -63,11 +64,27 @@ func (ec ExecContext) SessionID() string {
 	return ec.sessionID
 }
 
-// Name returns the chart's own name (Chart.ID()), bound for this session's
+// Name returns the SCXML document name, bound for this session's
 // entire lifetime, per SCXML 5.10's _name.
 func (ec ExecContext) Name() string {
-	return string(ec.name)
+	return ec.name
 }
+
+// PlatformVariables returns a fresh binding map for SCXML's protected _x
+// system variable. Opaque values are shared, but the map itself is not.
+func (ec ExecContext) PlatformVariables() map[string]any {
+	result := make(map[string]any, len(ec.platformVariables))
+	for k, v := range ec.platformVariables {
+		result[k] = v
+	}
+	return result
+}
+
+// IDLocationFunc is the Go datamodel profile's equivalent of SCXML's
+// idlocation expression. It synchronously assigns a generated send or invoke
+// ID while that element is being evaluated. Returning an error or panicking
+// produces error.execution and aborts the element.
+type IDLocationFunc func(ExecContext, Identifier) error
 
 // IOProcessors reports every Event I/O Processor available to this session,
 // per SCXML 5.10's _ioprocessors -- specifically, the ones with an address

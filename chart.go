@@ -11,6 +11,7 @@ import (
 // Build. It is safe for concurrent use by multiple Instances.
 type Chart struct {
 	root         *compiledState
+	name         string
 	byID         map[Identifier]*compiledState
 	order        []*compiledState // document order (pre-order traversal of the state tree)
 	newDatamodel func() any
@@ -53,6 +54,10 @@ func (jsonDatamodelCodec) Decode(b []byte, prototype any) (any, error) {
 // BuildOption configures a Chart being built by Build.
 type BuildOption func(*Chart)
 
+// WithName sets the SCXML document name exposed as _name. It is independent
+// of the root state's structural ID.
+func WithName(name string) BuildOption { return func(c *Chart) { c.name = name } }
+
 // WithNewDatamodel gives chart a way to produce a fresh datamodel value on
 // its own, for callers that build Instances of chart without constructing a
 // datamodel themselves. The actors package depends on this to page a
@@ -81,6 +86,9 @@ func (c *Chart) Version() string { return c.version }
 func (c *Chart) ID() Identifier {
 	return c.root.id
 }
+
+// Name returns the SCXML document's name attribute, or empty if omitted.
+func (c *Chart) Name() string { return c.name }
 
 // NewDatamodel calls the factory registered with WithNewDatamodel, if one
 // was. ok is false if none was.
@@ -143,6 +151,39 @@ func (c *Chart) States() []Identifier {
 // Errors are static, discovered here rather than at interpretation time.
 func Build(root StateSpec, opts ...BuildOption) (*Chart, error) {
 	c := &Chart{byID: make(map[Identifier]*compiledState), codec: jsonDatamodelCodec{}}
+	explicit := make(map[Identifier]bool)
+	var collect func(StateSpec)
+	collect = func(s StateSpec) {
+		if s.ID != "" {
+			explicit[s.ID] = true
+		}
+		for _, child := range s.Children {
+			collect(child)
+		}
+	}
+	collect(root)
+	generated := 0
+	var assign func(StateSpec) StateSpec
+	assign = func(s StateSpec) StateSpec {
+		if s.ID == "" {
+			for {
+				generated++
+				candidate := Identifier(fmt.Sprintf("state.%d", generated))
+				if !explicit[candidate] {
+					s.ID = candidate
+					explicit[candidate] = true
+					break
+				}
+			}
+		}
+		children := make([]StateSpec, len(s.Children))
+		for i, child := range s.Children {
+			children[i] = assign(child)
+		}
+		s.Children = children
+		return s
+	}
+	root = assign(root)
 	docOrder := 0
 	compiled, err := compileState(c, root, nil, &docOrder)
 	if err != nil {
@@ -159,9 +200,6 @@ func Build(root StateSpec, opts ...BuildOption) (*Chart, error) {
 }
 
 func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int) (*compiledState, error) {
-	if spec.ID == "" {
-		return nil, fmt.Errorf("statecharts: state has empty ID")
-	}
 	if err := validateStateID(spec.ID); err != nil {
 		return nil, err
 	}
@@ -243,6 +281,7 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 			finalize:    finalize,
 			autoForward: inv.AutoForward,
 			resume:      inv.Resume,
+			idLocation:  inv.IDLocation,
 		})
 	}
 
@@ -419,6 +458,9 @@ func (c *Chart) validateReferences() error {
 			}
 		}
 		for _, inv := range cs.invokes {
+			if inv.id != "" && inv.idLocation != nil {
+				return fmt.Errorf("statecharts: state %q invoke id and idlocation are mutually exclusive", cs.id)
+			}
 			if inv.start == nil {
 				return fmt.Errorf("statecharts: state %q has invoke without a start function", cs.id)
 			}
