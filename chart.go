@@ -109,7 +109,7 @@ type compiledState struct {
 	id          Identifier
 	kind        StateKind
 	historyKind HistoryKind
-	initial     Identifier // compound: default child id. history: default target id.
+	initial     *compiledTransition // compound initial or history default transition
 	parent      *compiledState
 	children    []*compiledState // document order
 	onEntry     []actionBlock
@@ -183,16 +183,34 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 		return nil, fmt.Errorf("statecharts: state %q onexit: %w", spec.ID, err)
 	}
 
+	var initial *compiledTransition
+	if spec.DefaultTransition != nil || spec.Initial != "" {
+		defaultSpec := TransitionSpec{}
+		if spec.DefaultTransition != nil {
+			defaultSpec = *spec.DefaultTransition
+		}
+		if spec.Initial != "" {
+			defaultSpec.Target = append([]Identifier{spec.Initial}, defaultSpec.Target...)
+		}
+		actions, err := reconcileActionBlocks(defaultSpec.Actions, defaultSpec.actionBlocks)
+		if err != nil {
+			return nil, fmt.Errorf("statecharts: state %q default transition actions: %w", spec.ID, err)
+		}
+		initial = &compiledTransition{events: defaultSpec.Events, target: defaultSpec.Target, cond: defaultSpec.Cond, actions: actions, internal: defaultSpec.Internal}
+	}
 	cs := &compiledState{
 		id:          spec.ID,
 		kind:        spec.Kind,
 		historyKind: spec.HistoryKind,
-		initial:     spec.Initial,
+		initial:     initial,
 		parent:      parent,
 		onEntry:     onEntry,
 		onExit:      onExit,
 		done:        spec.Done,
 		docOrder:    *counter,
+	}
+	if initial != nil {
+		initial.source = cs
 	}
 	*counter++
 	c.byID[spec.ID] = cs
@@ -234,6 +252,11 @@ func compileState(c *Chart, spec StateSpec, parent *compiledState, counter *int)
 			return nil, err
 		}
 		cs.children = append(cs.children, child)
+	}
+	if cs.kind == KindCompound && cs.initial == nil {
+		if children := realChildren(cs); len(children) > 0 {
+			cs.initial = &compiledTransition{target: []Identifier{children[0].id}, source: cs}
+		}
 	}
 	return cs, nil
 }
@@ -299,7 +322,7 @@ func (c *Chart) validateReferences() error {
 			if len(realChildren(cs)) == 0 {
 				return fmt.Errorf("statecharts: compound state %q has no children", cs.id)
 			}
-			if cs.initial == "" {
+			if cs.initial == nil || len(cs.initial.target) == 0 {
 				return fmt.Errorf("statecharts: compound state %q has no initial child", cs.id)
 			}
 			// SCXML 3.11 requires only that the target of a state's
@@ -307,14 +330,25 @@ func (c *Chart) validateReferences() error {
 			// direct child -- entry fills in every intervening ancestor
 			// (interpreter.go's addAncestorStatesToEnter), so a deeper
 			// target is entered correctly.
-			child, ok := c.byID[cs.initial]
-			if !ok || !isDescendant(child, cs) {
-				return fmt.Errorf("statecharts: compound state %q initial %q is not a descendant of it", cs.id, cs.initial)
+			for _, id := range cs.initial.target {
+				child, ok := c.byID[id]
+				if !ok || !isDescendant(child, cs) {
+					return fmt.Errorf("statecharts: compound state %q initial %q is not a descendant of it", cs.id, id)
+				}
 			}
-			if err := c.validateStateSpecification([]Identifier{cs.initial}); err != nil {
+			if err := validateDefaultTransition(cs); err != nil {
+				return err
+			}
+			if cs == c.root && (len(cs.initial.actions) > 0 || cs.initial.internal) {
+				return fmt.Errorf("statecharts: document root %q initial attribute may only specify targets", cs.id)
+			}
+			if err := c.validateStateSpecification(cs.initial.target); err != nil {
 				return fmt.Errorf("statecharts: compound state %q has invalid initial target: %w", cs.id, err)
 			}
 		case KindParallel:
+			if cs.initial != nil {
+				return fmt.Errorf("statecharts: parallel state %q must not have a default transition", cs.id)
+			}
 			if len(realChildren(cs)) == 0 {
 				return fmt.Errorf("statecharts: parallel state %q has no children", cs.id)
 			}
@@ -324,6 +358,9 @@ func (c *Chart) validateReferences() error {
 				}
 			}
 		case KindAtomic, KindFinal:
+			if cs.initial != nil {
+				return fmt.Errorf("statecharts: %s state %q must not have a default transition", cs.kind, cs.id)
+			}
 			if len(cs.children) != 0 {
 				return fmt.Errorf("statecharts: %s state %q must not have children", cs.kind, cs.id)
 			}
@@ -337,23 +374,28 @@ func (c *Chart) validateReferences() error {
 			if cs.parent == nil {
 				return fmt.Errorf("statecharts: history state %q must have a parent", cs.id)
 			}
-			if cs.initial == "" {
+			if cs.initial == nil || len(cs.initial.target) == 0 {
 				return fmt.Errorf("statecharts: history state %q has no default target", cs.id)
-			}
-			if _, ok := c.byID[cs.initial]; !ok {
-				return fmt.Errorf("statecharts: history state %q default target %q does not exist", cs.id, cs.initial)
 			}
 			if len(cs.transitions) > 0 || len(cs.invokes) > 0 || len(cs.onEntry) > 0 || len(cs.onExit) > 0 || cs.done != nil {
 				return fmt.Errorf("statecharts: history state %q contains unsupported state content", cs.id)
 			}
-			target := c.byID[cs.initial]
-			if !isDescendant(target, cs.parent) {
-				return fmt.Errorf("statecharts: history state %q default target %q is outside parent %q", cs.id, target.id, cs.parent.id)
+			if err := validateDefaultTransition(cs); err != nil {
+				return err
 			}
-			if cs.historyKind == Shallow && target.parent != cs.parent {
-				return fmt.Errorf("statecharts: shallow history state %q default target %q is not an immediate child", cs.id, target.id)
+			for _, id := range cs.initial.target {
+				target := c.byID[id]
+				if target == nil {
+					return fmt.Errorf("statecharts: history state %q default target %q does not exist", cs.id, id)
+				}
+				if !isDescendant(target, cs.parent) {
+					return fmt.Errorf("statecharts: history state %q default target %q is outside parent %q", cs.id, target.id, cs.parent.id)
+				}
+				if cs.historyKind == Shallow && target.parent != cs.parent {
+					return fmt.Errorf("statecharts: shallow history state %q default target %q is not an immediate child", cs.id, target.id)
+				}
 			}
-			if err := c.validateStateSpecification([]Identifier{cs.initial}); err != nil {
+			if err := c.validateStateSpecification(cs.initial.target); err != nil {
 				return fmt.Errorf("statecharts: history state %q has invalid default target: %w", cs.id, err)
 			}
 		}
@@ -391,6 +433,13 @@ func (c *Chart) validateReferences() error {
 			}
 			explicitInvokeIDs[inv.id] = cs.id
 		}
+	}
+	return nil
+}
+
+func validateDefaultTransition(s *compiledState) error {
+	if len(s.initial.events) != 0 || s.initial.cond != nil {
+		return fmt.Errorf("statecharts: state %q default transition must be eventless and unconditional", s.id)
 	}
 	return nil
 }
@@ -456,11 +505,19 @@ func (c *Chart) collectDefaultAtomicStates(s *compiledState, atoms, visiting map
 	defer delete(visiting, s)
 	switch s.kind {
 	case KindHistory, KindCompound:
-		target := c.byID[s.initial]
-		if target == nil {
-			return fmt.Errorf("state %q has unresolved default target %q", s.id, s.initial)
+		if s.initial == nil || len(s.initial.target) == 0 {
+			return fmt.Errorf("state %q has no default target", s.id)
 		}
-		return c.collectDefaultAtomicStates(target, atoms, visiting)
+		for _, id := range s.initial.target {
+			target := c.byID[id]
+			if target == nil {
+				return fmt.Errorf("state %q has unresolved default target %q", s.id, id)
+			}
+			if err := c.collectDefaultAtomicStates(target, atoms, visiting); err != nil {
+				return err
+			}
+		}
+		return nil
 	case KindParallel:
 		for _, child := range realChildren(s) {
 			if err := c.collectDefaultAtomicStates(child, atoms, visiting); err != nil {

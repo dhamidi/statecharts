@@ -52,18 +52,33 @@ func (k HistoryKind) String() string {
 // tree, built via Atomic/Compound/Parallel/Final/History and StateOptions,
 // then compiled once by Build.
 type StateSpec struct {
-	ID            Identifier
-	Kind          StateKind
-	Initial       Identifier // compound: default child. history: default target.
-	HistoryKind   HistoryKind
-	OnEntry       []ActionFunc
-	OnExit        []ActionFunc
-	Transitions   []TransitionSpec
-	Children      []StateSpec // preserved in call order == SCXML document order
-	Invokes       []InvokeSpec
-	Done          DoneDataFunc
-	onEntryBlocks []actionBlock
-	onExitBlocks  []actionBlock
+	ID                Identifier
+	Kind              StateKind
+	Initial           Identifier      // first target of a compound/history default transition
+	DefaultTransition *TransitionSpec // additional default-transition targets and executable content
+	HistoryKind       HistoryKind
+	OnEntry           []ActionFunc
+	OnExit            []ActionFunc
+	Transitions       []TransitionSpec
+	Children          []StateSpec // preserved in call order == SCXML document order
+	Invokes           []InvokeSpec
+	Done              DoneDataFunc
+	onEntryBlocks     []actionBlock
+	onExitBlocks      []actionBlock
+}
+
+// WithInitial enriches a compound state's eventless, unconditional default
+// transition with additional targets and executable content. The initial
+// argument passed to Compound remains its first target; pass an empty initial
+// when Target supplies the complete state specification.
+func WithInitial(opts ...TransitionOption) StateOption {
+	return func(s *StateSpec) {
+		t := &TransitionSpec{}
+		for _, opt := range opts {
+			opt(t)
+		}
+		s.DefaultTransition = t
+	}
 }
 
 // StateOption configures a StateSpec being built by Atomic/Compound/etc.
@@ -140,8 +155,10 @@ func Atomic(id Identifier, opts ...StateOption) StateSpec {
 	return newSpec(id, KindAtomic, opts...)
 }
 
-// Compound declares a state with children, exactly one of which (initial)
-// is entered by default.
+// Compound declares a state with children. initial is the first target of its
+// default transition; WithInitial may add targets and executable content. If
+// initial is empty and WithInitial is absent, the first child is the default,
+// as required by SCXML.
 func Compound(id Identifier, initial Identifier, opts ...StateOption) StateSpec {
 	s := newSpec(id, KindCompound, opts...)
 	s.Initial = initial
@@ -161,7 +178,17 @@ func Final(id Identifier, opts ...StateOption) StateSpec {
 
 // History declares a history pseudostate belonging to whichever compound or
 // parallel state contains it. defaultTarget is entered when the history has
-// never recorded a configuration (i.e. on first entry to the parent).
-func History(id Identifier, kind HistoryKind, defaultTarget Identifier) StateSpec {
-	return StateSpec{ID: id, Kind: KindHistory, HistoryKind: kind, Initial: defaultTarget}
+// never recorded a configuration (i.e. on first entry to the parent). opts
+// may add targets and executable content to that default transition.
+func History(id Identifier, kind HistoryKind, defaultTarget Identifier, opts ...TransitionOption) StateSpec {
+	s := StateSpec{ID: id, Kind: KindHistory, HistoryKind: kind, Initial: defaultTarget}
+	if len(opts) == 0 {
+		return s
+	}
+	t := &TransitionSpec{}
+	for _, opt := range opts {
+		opt(t)
+	}
+	s.DefaultTransition = t
+	return s
 }

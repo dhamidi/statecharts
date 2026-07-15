@@ -116,6 +116,97 @@ func TestInterpreterParallelRegionsIndependent(t *testing.T) {
 	}
 }
 
+func TestInterpreterInitialTransitionActionsOrderingAndExplicitEntry(t *testing.T) {
+	var got []string
+	record := func(v string) ActionFunc {
+		return Action(func(_ *struct{}, _ ExecContext) error { got = append(got, v); return nil })
+	}
+	chart, err := Build(Compound("root", "outside", Children(
+		Atomic("outside", On("default", Target("parent")), On("explicit", Target("child"))),
+		Compound("parent", "child", WithInitial(Then(record("default"))), OnEntry(record("parent")), On("reset", Target("outside")), Children(
+			Atomic("child", OnEntry(record("child"))),
+		)),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip := newInterpretation(chart, &struct{}{})
+	ip.start()
+	ip.enqueue(Event{Name: "default", Type: EventExternal})
+	ip.processNextExternal()
+	if fmt.Sprint(got) != "[parent default child]" {
+		t.Fatalf("default order = %v", got)
+	}
+	ip.enqueue(Event{Name: "reset", Type: EventExternal})
+	ip.processNextExternal()
+	got = nil
+	ip.enqueue(Event{Name: "explicit", Type: EventExternal})
+	ip.processNextExternal()
+	if fmt.Sprint(got) != "[parent child]" {
+		t.Fatalf("explicit order = %v", got)
+	}
+}
+
+func TestInterpreterMultiTargetInitialDoesNotDefaultExplicitParallelRegions(t *testing.T) {
+	var defaults []string
+	record := func(v string) ActionFunc {
+		return func(ExecContext) error { defaults = append(defaults, v); return nil }
+	}
+	chart, err := Build(Compound("root", "left.second", WithInitial(Target("right.second")), Children(
+		Parallel("regions", Children(
+			Compound("left", "left.first", WithInitial(Then(record("left"))), Children(
+				Atomic("left.first"), Atomic("left.second"),
+			)),
+			Compound("right", "right.first", WithInitial(Then(record("right"))), Children(
+				Atomic("right.first"), Atomic("right.second"),
+			)),
+		)),
+	)))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	got := ip.activeStates()
+	if len(defaults) != 0 || !hasState(got, "left.second") || !hasState(got, "right.second") || hasState(got, "left.first") || hasState(got, "right.first") {
+		t.Fatalf("initial configuration = %v, default actions = %v; want both explicit second states and no region defaults", got, defaults)
+	}
+}
+
+func TestInterpreterHistoryDefaultActionsAndMultiTarget(t *testing.T) {
+	var got []string
+	record := func(v string) ActionFunc {
+		return Action(func(_ *struct{}, _ ExecContext) error { got = append(got, v); return nil })
+	}
+	chart, err := Build(Compound("root", "away", Children(
+		Atomic("away", On("resume", Target("hist"))),
+		Parallel("work", OnEntry(record("work")), Children(
+			Compound("left", "l1", Children(Atomic("l1", OnEntry(record("l1"))), Atomic("l2"))),
+			Compound("right", "r1", Children(Atomic("r1", OnEntry(record("r1"))))),
+			History("hist", Deep, "l1", Target("r1"), Then(record("history-default"))),
+		), On("leave", Target("away"))),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip := newInterpretation(chart, &struct{}{})
+	ip.start()
+	got = nil
+	ip.enqueue(Event{Name: "resume", Type: EventExternal})
+	ip.processNextExternal()
+	if fmt.Sprint(got) != "[work history-default l1 r1]" {
+		t.Fatalf("first history order = %v", got)
+	}
+	got = nil
+	ip.enqueue(Event{Name: "leave", Type: EventExternal})
+	ip.processNextExternal()
+	ip.enqueue(Event{Name: "resume", Type: EventExternal})
+	ip.processNextExternal()
+	if fmt.Sprint(got) != "[work l1 r1]" {
+		t.Fatalf("restored history actions = %v", got)
+	}
+}
+
 func TestInterpreterShallowHistory(t *testing.T) {
 	chart, err := Build(
 		Compound("app", "running",

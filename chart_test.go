@@ -115,8 +115,53 @@ func TestBuildHistoryChart(t *testing.T) {
 	if hist.kind != KindHistory || hist.historyKind != Shallow {
 		t.Fatalf("history state kind/historyKind mismatch: %v/%v", hist.kind, hist.historyKind)
 	}
-	if hist.initial != "step1" {
-		t.Fatalf("history default target = %q, want step1", hist.initial)
+	if len(hist.initial.target) != 1 || hist.initial.target[0] != "step1" {
+		t.Fatalf("history default target = %v, want [step1]", hist.initial.target)
+	}
+}
+
+func TestBuildDefaultTransitionsValidateMultiTargets(t *testing.T) {
+	valid := Compound("root", "left.a", WithInitial(Target("right.a")), Children(
+		Parallel("p", Children(
+			Compound("left", "left.a", Children(Atomic("left.a"))),
+			Compound("right", "right.a", Children(Atomic("right.a"))),
+		)),
+	))
+	chart, err := Build(valid)
+	if err != nil {
+		t.Fatalf("valid multi-target initial: %v", err)
+	}
+	ip := newInterpretation(chart, &struct{}{})
+	ip.start()
+	if !hasState(ip.activeStates(), "left.a") || !hasState(ip.activeStates(), "right.a") {
+		t.Fatalf("root initial state specification did not enter both targets: states=%v", ip.activeStates())
+	}
+
+	invalid := Compound("root", "a", WithInitial(Target("a")), Children(Atomic("a")))
+	if _, err := Build(invalid); err == nil {
+		t.Fatal("duplicate initial targets accepted")
+	}
+}
+
+func TestBuildDefaultsMissingInitialToFirstChild(t *testing.T) {
+	chart, err := Build(Compound("root", "", Children(
+		Compound("first", "", Children(Atomic("first.child"), Atomic("ignored"))),
+		Atomic("second"),
+	)))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	ip := newInterpretation(chart, nil)
+	ip.start()
+	if got := ip.activeStates(); !hasState(got, "first") || !hasState(got, "first.child") || hasState(got, "second") || hasState(got, "ignored") {
+		t.Fatalf("initial configuration = %v, want first and first.child only", got)
+	}
+}
+
+func TestBuildRejectsExecutableContentOnDocumentInitial(t *testing.T) {
+	chart := Compound("root", "a", WithInitial(Then(func(ExecContext) error { return nil })), Children(Atomic("a")))
+	if _, err := Build(chart); err == nil {
+		t.Fatal("document root accepted executable initial-transition content")
 	}
 }
 

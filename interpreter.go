@@ -541,18 +541,27 @@ func (ip *interpretation) activeStates() []Identifier {
 
 // --- entry set computation (SCXML D.2) ---------------------------------
 
-func (ip *interpretation) addDescendantStatesToEnter(state *compiledState, entrySet, forDefault map[*compiledState]bool) {
+func (ip *interpretation) addDescendantStatesToEnter(state *compiledState, entrySet map[*compiledState]bool, defaults map[*compiledState][]actionBlock) {
 	if state.kind == KindHistory {
 		if recorded, ok := ip.historyValue[state]; ok {
 			for _, s := range recorded {
-				ip.addDescendantStatesToEnter(s, entrySet, forDefault)
+				ip.addDescendantStatesToEnter(s, entrySet, defaults)
 			}
 			for _, s := range recorded {
-				ip.addAncestorStatesToEnter(s, state.parent, entrySet, forDefault)
+				ip.addAncestorStatesToEnter(s, state.parent, entrySet, defaults)
 			}
-		} else if def := ip.chart.byID[state.initial]; def != nil {
-			ip.addDescendantStatesToEnter(def, entrySet, forDefault)
-			ip.addAncestorStatesToEnter(def, state.parent, entrySet, forDefault)
+		} else if state.initial != nil {
+			defaults[state.parent] = append(defaults[state.parent], state.initial.actions...)
+			for _, id := range state.initial.target {
+				if def := ip.chart.byID[id]; def != nil {
+					ip.addDescendantStatesToEnter(def, entrySet, defaults)
+				}
+			}
+			for _, id := range state.initial.target {
+				if def := ip.chart.byID[id]; def != nil {
+					ip.addAncestorStatesToEnter(def, state.parent, entrySet, defaults)
+				}
+			}
 		}
 		return
 	}
@@ -560,19 +569,27 @@ func (ip *interpretation) addDescendantStatesToEnter(state *compiledState, entry
 	entrySet[state] = true
 	switch state.kind {
 	case KindCompound:
-		forDefault[state] = true
-		if initial := ip.chart.byID[state.initial]; initial != nil {
-			ip.addDescendantStatesToEnter(initial, entrySet, forDefault)
-			ip.addAncestorStatesToEnter(initial, state, entrySet, forDefault)
+		if state.initial != nil {
+			defaults[state] = append(defaults[state], state.initial.actions...)
+			for _, id := range state.initial.target {
+				if initial := ip.chart.byID[id]; initial != nil {
+					ip.addDescendantStatesToEnter(initial, entrySet, defaults)
+				}
+			}
+			for _, id := range state.initial.target {
+				if initial := ip.chart.byID[id]; initial != nil {
+					ip.addAncestorStatesToEnter(initial, state, entrySet, defaults)
+				}
+			}
 		}
 	case KindParallel:
 		for _, child := range realChildren(state) {
-			ip.addDescendantStatesToEnter(child, entrySet, forDefault)
+			ip.addDescendantStatesToEnter(child, entrySet, defaults)
 		}
 	}
 }
 
-func (ip *interpretation) addAncestorStatesToEnter(state, ancestor *compiledState, entrySet, forDefault map[*compiledState]bool) {
+func (ip *interpretation) addAncestorStatesToEnter(state, ancestor *compiledState, entrySet map[*compiledState]bool, defaults map[*compiledState][]actionBlock) {
 	for _, anc := range properAncestors(state, ancestor) {
 		entrySet[anc] = true
 		if anc.kind != KindParallel {
@@ -582,7 +599,7 @@ func (ip *interpretation) addAncestorStatesToEnter(state, ancestor *compiledStat
 			if ip.entrySetCovers(entrySet, child) {
 				continue
 			}
-			ip.addDescendantStatesToEnter(child, entrySet, forDefault)
+			ip.addDescendantStatesToEnter(child, entrySet, defaults)
 		}
 	}
 }
@@ -626,8 +643,12 @@ func (ip *interpretation) collectEffectiveTarget(s *compiledState, result *[]*co
 					*result = append(*result, r)
 				}
 			}
-		} else if def := ip.chart.byID[s.initial]; def != nil {
-			ip.collectEffectiveTarget(def, result, seen, visiting)
+		} else if s.initial != nil {
+			for _, id := range s.initial.target {
+				if def := ip.chart.byID[id]; def != nil {
+					ip.collectEffectiveTarget(def, result, seen, visiting)
+				}
+			}
 		}
 		return
 	}
@@ -681,9 +702,9 @@ func (ip *interpretation) transitionDomain(t *compiledTransition) *compiledState
 	return ip.findLCCA(all)
 }
 
-func (ip *interpretation) computeEntrySet(transitions []*compiledTransition) ([]*compiledState, map[*compiledState]bool) {
+func (ip *interpretation) computeEntrySet(transitions []*compiledTransition) ([]*compiledState, map[*compiledState][]actionBlock) {
 	entrySet := map[*compiledState]bool{}
-	forDefault := map[*compiledState]bool{}
+	forDefault := map[*compiledState][]actionBlock{}
 	for _, t := range transitions {
 		for _, id := range t.target {
 			if target := ip.chart.byID[id]; target != nil {
@@ -737,9 +758,10 @@ func (ip *interpretation) isInFinalState(s *compiledState) bool {
 	}
 }
 
-func (ip *interpretation) enterState(s *compiledState, _ bool) {
+func (ip *interpretation) enterState(s *compiledState, defaults []actionBlock) {
 	ip.configuration[s] = true
 	ip.runActionBlocks(s.onEntry)
+	ip.runActionBlocks(defaults)
 
 	if len(s.invokes) > 0 {
 		// Deferred to the end of the macrostep by processInvokes, per
@@ -1185,13 +1207,21 @@ func (ip *interpretation) runToStable() {
 // stable point (interpret(), minus datamodel/global-script concerns).
 func (ip *interpretation) start() {
 	entrySet := map[*compiledState]bool{}
-	forDefault := map[*compiledState]bool{}
+	forDefault := map[*compiledState][]actionBlock{}
 	root := ip.chart.root
 	switch root.kind {
 	case KindCompound:
-		if initial := ip.chart.byID[root.initial]; initial != nil {
-			ip.addDescendantStatesToEnter(initial, entrySet, forDefault)
-			ip.addAncestorStatesToEnter(initial, root, entrySet, forDefault)
+		if root.initial != nil {
+			for _, id := range root.initial.target {
+				if initial := ip.chart.byID[id]; initial != nil {
+					ip.addDescendantStatesToEnter(initial, entrySet, forDefault)
+				}
+			}
+			for _, id := range root.initial.target {
+				if initial := ip.chart.byID[id]; initial != nil {
+					ip.addAncestorStatesToEnter(initial, root, entrySet, forDefault)
+				}
+			}
 		}
 	case KindParallel:
 		for _, child := range realChildren(root) {
