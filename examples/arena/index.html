@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STATECHART ARENA</title>
+  <style>
+    :root { color-scheme: dark; background: #06080d; color: #e5e7eb; font: 15px/1.35 Inter, ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #06080d; }
+    button { font: inherit; }
+  </style>
+</head>
+<body>
+  <arena-game></arena-game>
+  <script type="module">
+    const key = (x, y) => `${x}:${y}`;
+
+    class ArenaConnection extends HTMLElement {
+      set state(value) {
+        this.dataset.state = value;
+        this.textContent = value.toUpperCase();
+      }
+      connectedCallback() { this.state = this.dataset.state || 'connecting'; }
+    }
+    customElements.define('arena-connection', ArenaConnection);
+
+    class ArenaBoard extends HTMLElement {
+      constructor() { super(); this.attachShadow({mode: 'open'}); }
+      set snapshot(value) { this._snapshot = value; this.render(); }
+      set player(value) { this._player = value; this.render(); }
+      render() {
+        const s = this._snapshot;
+        if (!s) return;
+        const walls = new Set(s.walls.map(v => key(v.x, v.y)));
+        const powerups = new Map(s.powerups.map(v => [key(v.x, v.y), v]));
+        const shots = new Map(s.projectiles.map(v => [key(v.x, v.y), v]));
+        const creatures = new Map(s.creatures.map(v => [key(v.x, v.y), v]));
+        this.shadowRoot.replaceChildren();
+        const style = document.createElement('style');
+        style.textContent = `
+          :host { display: block; border: 1px solid #64748b; background: #0b1020; overflow: auto; }
+          .board { display: grid; width: max-content; grid-template-columns: repeat(${s.width}, clamp(24px, 3.6vw, 46px)); grid-template-rows: repeat(${s.height}, clamp(24px, 3.6vw, 46px)); background: #0b1020; }
+          .cell { position: relative; border-right: 1px solid #172033; border-bottom: 1px solid #172033; background: #0d1424; }
+          .wall { background: #334155; border-color: #475569; box-shadow: inset 0 0 0 3px #273449; }
+          .power { position: absolute; inset: 25%; background: #facc15; border: 2px solid #fef08a; transform: rotate(45deg); }
+          .shot { position: absolute; inset: 36%; background: #fff; box-shadow: 0 0 8px #fff; }
+          .creature { position: absolute; inset: 10%; display: grid; place-items: center; color: #020617; border: 2px solid #fff; font: 800 11px/1 ui-monospace, monospace; box-shadow: 3px 3px 0 #020617; }
+          .creature.me { outline: 3px solid #fff; outline-offset: 2px; }
+          .creature.offline { opacity: .35; }
+          .facing { position: absolute; width: 5px; height: 5px; background: #020617; }
+          .facing.right { right: 2px; } .facing.left { left: 2px; } .facing.up { top: 2px; } .facing.down { bottom: 2px; }
+        `;
+        const board = document.createElement('div');
+        board.className = 'board';
+        for (let y = 0; y < s.height; y++) for (let x = 0; x < s.width; x++) {
+          const position = key(x, y);
+          const cell = document.createElement('div');
+          cell.className = walls.has(position) ? 'cell wall' : 'cell';
+          if (powerups.has(position)) {
+            const item = document.createElement('div'); item.className = 'power'; item.title = 'power charge'; cell.append(item);
+          }
+          if (shots.has(position)) {
+            const shot = document.createElement('div'); shot.className = 'shot'; cell.append(shot);
+          }
+          const creature = creatures.get(position);
+          if (creature) {
+            const actor = document.createElement('div');
+            actor.className = `creature${creature.id === this._player ? ' me' : ''}${creature.connected ? '' : ' offline'}`;
+            actor.style.background = creature.color;
+            actor.title = `${creature.name} · ${creature.health} HP · ${creature.score} points`;
+            actor.textContent = creature.bot ? 'AI' : creature.name.slice(0, 2).toUpperCase();
+            const facing = document.createElement('span'); facing.className = `facing ${creature.facing}`; actor.append(facing);
+            cell.append(actor);
+          }
+          board.append(cell);
+        }
+        this.shadowRoot.append(style, board);
+      }
+    }
+    customElements.define('arena-board', ArenaBoard);
+
+    class ArenaScoreboard extends HTMLElement {
+      constructor() { super(); this.attachShadow({mode: 'open'}); }
+      set snapshot(value) { this._snapshot = value; this.render(); }
+      set player(value) { this._player = value; this.render(); }
+      render() {
+        if (!this._snapshot) return;
+        const rows = [...this._snapshot.creatures].sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+        this.shadowRoot.innerHTML = `<style>
+          :host { display: block; border: 1px solid #475569; background: #0d1424; }
+          h2 { margin: 0; padding: 12px 14px; border-bottom: 1px solid #475569; color: #94a3b8; font: 700 11px/1 ui-monospace, monospace; letter-spacing: .14em; }
+          table { width: 100%; border-collapse: collapse; }
+          td { padding: 9px 12px; border-bottom: 1px solid #1e293b; font: 12px/1.2 ui-monospace, monospace; }
+          tr:last-child td { border-bottom: 0; }
+          tr.me { background: #172033; }
+          .swatch { display: inline-block; width: 10px; height: 10px; margin-right: 8px; vertical-align: -1px; }
+          .number { text-align: right; color: #f8fafc; }
+          .muted { color: #64748b; }
+        </style><h2>LIVE CREATURES</h2>`;
+        const table = document.createElement('table');
+        for (const actor of rows) {
+          const row = table.insertRow(); if (actor.id === this._player) row.className = 'me';
+          const name = row.insertCell();
+          const swatch = document.createElement('span'); swatch.className = 'swatch'; swatch.style.background = actor.color; name.append(swatch, actor.name);
+          const health = row.insertCell(); health.className = 'muted number'; health.textContent = actor.connected ? `${actor.health} HP` : 'REJOINING';
+          const score = row.insertCell(); score.className = 'number'; score.textContent = actor.score;
+        }
+        this.shadowRoot.append(table);
+      }
+    }
+    customElements.define('arena-scoreboard', ArenaScoreboard);
+
+    class ArenaControls extends HTMLElement {
+      connectedCallback() {
+        this.innerHTML = `<button data-action="up">W</button><button data-action="left">A</button><button data-action="down">S</button><button data-action="right">D</button><button class="shoot" data-action="shoot">SPACE / FIRE</button>`;
+        this.addEventListener('click', event => {
+          const button = event.target.closest('button[data-action]');
+          if (button) this.dispatchEvent(new CustomEvent('arena-input', {bubbles: true, detail: button.dataset.action}));
+        });
+      }
+    }
+    customElements.define('arena-controls', ArenaControls);
+
+    class ArenaGame extends HTMLElement {
+      constructor() {
+        super();
+        this.sequence = 0; this.backoff = 250; this.snapshot = null;
+        this.player = localStorage.getItem('arena-player') || `player.${crypto.randomUUID().replaceAll('-', '')}`;
+        localStorage.setItem('arena-player', this.player);
+        this.match = new URLSearchParams(location.search).get('match') || 'match.main';
+        this.onKey = event => {
+          if (event.target.matches('input, textarea')) return;
+          const action = ({w:'up', a:'left', s:'down', d:'right', ' ':'shoot'})[event.key.toLowerCase()];
+          if (action) { event.preventDefault(); this.send(action); }
+        };
+      }
+      connectedCallback() {
+        this.innerHTML = `<style>
+          arena-game { display: block; max-width: 1320px; margin: auto; padding: 24px; }
+          header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; border-bottom: 2px solid #e2e8f0; padding-bottom: 14px; margin-bottom: 18px; }
+          h1 { margin: 0; font: 900 clamp(26px, 5vw, 62px)/.9 ui-monospace, monospace; letter-spacing: -.06em; color: #f8fafc; }
+          .eyebrow { margin-bottom: 8px; color: #22d3ee; font: 700 11px/1 ui-monospace, monospace; letter-spacing: .18em; }
+          arena-connection { padding: 8px 10px; border: 1px solid #475569; color: #fbbf24; font: 700 11px/1 ui-monospace, monospace; letter-spacing: .12em; }
+          arena-connection[data-state="online"] { border-color: #4ade80; color: #4ade80; }
+          .layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 18px; align-items: start; }
+          .side { display: grid; gap: 14px; }
+          .metric { border: 1px solid #475569; background: #0d1424; padding: 12px; }
+          .metric label { display: block; margin-bottom: 6px; color: #64748b; font: 700 10px/1 ui-monospace, monospace; letter-spacing: .12em; }
+          .metric output { display: block; overflow: hidden; color: #e2e8f0; font: 12px/1.4 ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
+          arena-controls { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; border: 1px solid #475569; background: #475569; }
+          arena-controls button { min-height: 42px; border: 0; background: #172033; color: #e2e8f0; cursor: pointer; font: 800 12px/1 ui-monospace, monospace; }
+          arena-controls button:hover { background: #22d3ee; color: #020617; }
+          arena-controls .shoot { grid-column: 1 / -1; background: #be123c; }
+          .notes { color: #64748b; font: 11px/1.55 ui-monospace, monospace; }
+          .notes strong { color: #cbd5e1; }
+          @media (max-width: 880px) { arena-game { padding: 14px; } .layout { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
+        </style>
+        <header><div><div class="eyebrow">AUTHORITATIVE ACTOR SIMULATION</div><h1>STATECHART<br>ARENA</h1></div><arena-connection></arena-connection></header>
+        <main class="layout"><arena-board></arena-board><aside class="side">
+          <div class="metric"><label>MATCH / TICK</label><output id="tick">${this.match} / —</output></div>
+          <div class="metric"><label>PINNED DEFINITION</label><output id="revision">—</output></div>
+          <arena-scoreboard></arena-scoreboard><arena-controls></arena-controls>
+          <div class="notes"><strong>WASD</strong> moves. <strong>SPACE</strong> fires. Yellow diamonds increase projectile damage. The browser never predicts movement; every frame is an authoritative snapshot routed from the match actor through your connection actor and the WebSocket I/O processor.</div>
+        </aside></main>`;
+        this.status = this.querySelector('arena-connection'); this.board = this.querySelector('arena-board'); this.scores = this.querySelector('arena-scoreboard');
+        this.addEventListener('arena-input', event => this.send(event.detail));
+        addEventListener('keydown', this.onKey); this.connect();
+      }
+      disconnectedCallback() { removeEventListener('keydown', this.onKey); clearTimeout(this.retry); this.socket?.close(); }
+      connect() {
+        this.status.state = 'connecting';
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        this.socket = new WebSocket(`${protocol}//${location.host}/ws?match=${encodeURIComponent(this.match)}&player=${encodeURIComponent(this.player)}`);
+        this.socket.onopen = () => { this.status.state = 'online'; this.backoff = 250; };
+        this.socket.onmessage = event => {
+          const message = JSON.parse(event.data);
+          if (message.type === 'welcome') { this.player = message.player; localStorage.setItem('arena-player', this.player); }
+          if (message.type === 'snapshot') this.render(message.snapshot);
+        };
+        this.socket.onclose = () => { this.status.state = 'reconnecting'; this.retry = setTimeout(() => this.connect(), this.backoff); this.backoff = Math.min(this.backoff * 2, 5000); };
+      }
+      send(action) {
+        if (this.socket?.readyState !== WebSocket.OPEN) return;
+        this.socket.send(JSON.stringify({v: 1, type: 'input', seq: ++this.sequence, action}));
+      }
+      render(snapshot) {
+        this.snapshot = snapshot;
+        const me = snapshot.creatures.find(actor => actor.id === this.player);
+        if (me) this.sequence = Math.max(this.sequence, me.last_sequence);
+        this.board.player = this.player; this.board.snapshot = snapshot;
+        this.scores.player = this.player; this.scores.snapshot = snapshot;
+        this.querySelector('#tick').textContent = `${snapshot.match} / ${snapshot.tick}`;
+        this.querySelector('#revision').textContent = snapshot.revision;
+      }
+    }
+    customElements.define('arena-game', ArenaGame);
+  </script>
+</body>
+</html>
