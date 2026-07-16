@@ -36,9 +36,10 @@ later delete the reconnected player. A disconnected player is visibly marked
 as rejoining and expires after a ten-second grace period if no replacement
 arrives.
 
-`arena.bot` actors subscribe to the same snapshots and emit the same
-`player.input` protocol as humans. Their simple deterministic policy pursues a
-powerup or creature and fires when aligned.
+`arena.bot` controller actors subscribe to the same snapshots and emit the same
+`player.input` protocol as humans. Bot player IDs are stable while controller
+IDs and leases are replaced during rollout. The authoritative creature keeps
+its position, health, power, score, and last input sequence.
 
 Matches are intentionally ephemeral in this example: a process restart starts
 a new game. Making them durable is a spawn-policy change plus storage, but a
@@ -77,3 +78,37 @@ rejection, one-successor tick scheduling, I/O capability isolation, AI use of
 the player protocol, reconnect/resubscribe behavior, lease takeover and
 expiry, and the old/new match revision split under whole-definition
 publication.
+
+## Live-edit a bot policy
+
+Open `/editor/bots` for a live spectator view, structured policy controls,
+per-bot canary rollout, fleet-wide rollout, and an advanced canonical
+Definition editor.
+
+The `arena.bot.observe` action has one `go.literal`, tagged
+`arena.bot-policy/v1`, whose payload is:
+
+```json
+{"target_priority":"nearest","shoot_range":64}
+```
+
+`target_priority` is `nearest`, `powerups`, or `creatures`. `shoot_range` is a
+non-negative Manhattan distance; zero disables shooting. Bot definition
+candidates receive this bot-specific validation before they can be published.
+Publishing does not alter running controllers. Roll out one canary or all bots
+explicitly:
+
+```sh
+curl -fsS http://127.0.0.1:8080/definitions/bot > bot.json
+curl -fsS -X POST --data-binary @bot.json http://127.0.0.1:8080/definitions/bot/validate
+curl -fsS -X PUT --data-binary @bot.json http://127.0.0.1:8080/definitions/bot
+curl -fsS -X POST http://127.0.0.1:8080/bots/bot.1/rollout
+curl -fsS -X POST http://127.0.0.1:8080/bots/rollout
+```
+
+`GET /definitions/bot?revision=<revision>` exports a retained immutable
+revision. `GET /bots` returns `{"bots":[...]}` sorted by player; each item has
+`player`, `controller`, `match`, `color`, `policy_revision`, and `generation`.
+The rollout endpoints return one such item and `{"bots":[...]}`, respectively.
+Snapshots expose `controller` and `policy_revision` on bot creatures so clients
+can confirm that a rollout took effect.

@@ -20,6 +20,7 @@ const (
 	snapshotTag         = "arena.snapshot/v1"
 	connectionConfigTag = "arena.connection-config/v1"
 	botConfigTag        = "arena.bot-config/v1"
+	botPolicyTag        = "arena.bot-policy/v1"
 )
 
 type matchConfig struct {
@@ -27,11 +28,13 @@ type matchConfig struct {
 }
 
 type joinRequest struct {
-	Player string `json:"player"`
-	Name   string `json:"name"`
-	Color  string `json:"color"`
-	Lease  string `json:"lease"`
-	Bot    bool   `json:"bot"`
+	Player         string `json:"player"`
+	Name           string `json:"name"`
+	Color          string `json:"color"`
+	Lease          string `json:"lease"`
+	Bot            bool   `json:"bot"`
+	Controller     string `json:"controller,omitempty"`
+	PolicyRevision string `json:"policy_revision,omitempty"`
 }
 
 type disconnectRequest struct {
@@ -44,18 +47,29 @@ type subscription struct {
 }
 
 type connectionConfig struct {
-	Match  string `json:"match"`
-	Player string `json:"player"`
-	Name   string `json:"name"`
-	Color  string `json:"color"`
-	Output string `json:"output"`
+	Match    string `json:"match"`
+	Player   string `json:"player"`
+	Name     string `json:"name"`
+	Color    string `json:"color"`
+	Output   string `json:"output"`
+	Spectate bool   `json:"spectate,omitempty"`
 }
 
 type botConfig struct {
-	Match  string `json:"match"`
-	Player string `json:"player"`
-	Name   string `json:"name"`
-	Color  string `json:"color"`
+	Match          string `json:"match"`
+	Player         string `json:"player"`
+	Name           string `json:"name"`
+	Color          string `json:"color"`
+	PolicyRevision string `json:"policy_revision"`
+}
+
+type botPolicy struct {
+	TargetPriority string `json:"target_priority"`
+	ShootRange     int    `json:"shoot_range"`
+}
+
+func defaultBotPolicy() botPolicy {
+	return botPolicy{TargetPriority: "nearest", ShootRange: 64}
 }
 
 type clientMessage struct {

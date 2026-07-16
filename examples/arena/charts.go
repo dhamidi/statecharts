@@ -72,7 +72,7 @@ func buildMatchChart(tickInterval time.Duration) (*statecharts.Chart, error) {
 			return fmt.Errorf("join requires player, name, color, and lease")
 		}
 		data.Leases[request.Player] = request.Lease
-		data.World.addPlayer(request.Player, request.Name, request.Color, request.Bot)
+		data.World.addPlayer(request.Player, request.Name, request.Color, request.Bot, request.Controller, request.PolicyRevision)
 		return publish(data, ec)
 	})
 	disconnect := match.Action("disconnect", func(data *matchModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
@@ -175,6 +175,7 @@ type connectionModel struct {
 	Match        string `json:"match"`
 	Player       string `json:"player"`
 	Output       string `json:"output"`
+	Spectate     bool   `json:"spectate"`
 	LastSequence uint64 `json:"last_sequence"`
 }
 
@@ -187,16 +188,19 @@ func buildConnectionChart() (*statecharts.Chart, error) {
 			return err
 		}
 		data.Match, data.Player, data.Output = config.Match, config.Player, config.Output
+		data.Spectate = config.Spectate
 		welcome, err := encodeServerMessage(serverMessage{Type: "welcome", Player: config.Player})
 		if err != nil {
 			return err
 		}
 		ec.Send("socket.frame", statecharts.SendOptions{Target: statecharts.Identifier(config.Output), Type: socketIOProcessor, Data: welcome})
-		join, err := taggedStruct(joinTag, joinRequest{Player: config.Player, Name: config.Name, Color: config.Color, Lease: ec.SessionID()})
-		if err != nil {
-			return err
+		if !config.Spectate {
+			join, err := taggedStruct(joinTag, joinRequest{Player: config.Player, Name: config.Name, Color: config.Color, Lease: ec.SessionID()})
+			if err != nil {
+				return err
+			}
+			ec.Send("player.join", statecharts.SendOptions{Target: statecharts.Identifier(config.Match), Data: join})
 		}
-		ec.Send("player.join", statecharts.SendOptions{Target: statecharts.Identifier(config.Match), Data: join})
 		subscribe, err := taggedStruct(subscriptionTag, subscription{Target: ec.SessionID()})
 		if err != nil {
 			return err
@@ -205,6 +209,9 @@ func buildConnectionChart() (*statecharts.Chart, error) {
 		return nil
 	})
 	clientInput := connection.Action("route-client-input", func(data *connectionModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		if data.Spectate {
+			return nil
+		}
 		event, _ := ec.Event()
 		message, err := parseClientMessage(event.Data)
 		if err != nil {
@@ -240,11 +247,13 @@ func buildConnectionChart() (*statecharts.Chart, error) {
 		}
 		target, _ := statecharts.StringValue(ec.SessionID())
 		ec.Send("subscriber.remove", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: target})
-		disconnect, err := taggedStruct(disconnectTag, disconnectRequest{Player: data.Player, Lease: ec.SessionID()})
-		if err != nil {
-			return err
+		if !data.Spectate {
+			disconnect, err := taggedStruct(disconnectTag, disconnectRequest{Player: data.Player, Lease: ec.SessionID()})
+			if err != nil {
+				return err
+			}
+			ec.Send("player.disconnect", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: disconnect})
 		}
-		ec.Send("player.disconnect", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: disconnect})
 		return nil
 	})
 	return connection.Build(statecharts.Compound(connectionKind, "open", statecharts.Children(
@@ -274,7 +283,7 @@ func buildBotChart() (*statecharts.Chart, error) {
 			return err
 		}
 		data.Match, data.Player = config.Match, config.Player
-		join, err := taggedStruct(joinTag, joinRequest{Player: config.Player, Name: config.Name, Color: config.Color, Lease: ec.SessionID(), Bot: true})
+		join, err := taggedStruct(joinTag, joinRequest{Player: config.Player, Name: config.Name, Color: config.Color, Lease: ec.SessionID(), Bot: true, Controller: ec.SessionID(), PolicyRevision: config.PolicyRevision})
 		if err != nil {
 			return err
 		}
@@ -286,17 +295,28 @@ func buildBotChart() (*statecharts.Chart, error) {
 		ec.Send("subscriber.add", statecharts.SendOptions{Target: statecharts.Identifier(config.Match), Data: subscribe})
 		return nil
 	})
-	observe := bot.Action("observe", func(data *botModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	observe := bot.Action("observe", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) error {
+		var policy botPolicy
+		if len(args) != 1 {
+			return fmt.Errorf("bot observe requires one policy argument")
+		}
+		if err := decodeTaggedStruct(args[0], botPolicyTag, &policy); err != nil {
+			return err
+		}
 		event, _ := ec.Event()
 		var snapshot arenaSnapshot
 		if err := decodeTaggedStruct(event.Data, snapshotTag, &snapshot); err != nil {
 			return err
 		}
+		self := snapshotPlayer(snapshot, data.Player)
+		if self.LastSequence > data.NextSequence {
+			data.NextSequence = self.LastSequence
+		}
 		if snapshot.Tick <= data.LastTick {
 			return nil
 		}
 		data.LastTick = snapshot.Tick
-		action := chooseBotAction(snapshot, data.Player)
+		action := chooseBotAction(snapshot, data.Player, policy)
 		if action == "" {
 			return nil
 		}
@@ -308,13 +328,36 @@ func buildBotChart() (*statecharts.Chart, error) {
 		ec.Send("player.input", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: input})
 		return nil
 	})
-	return bot.Build(statecharts.Atomic(botKind,
-		statecharts.On("bot.start", statecharts.Then(start.Call())),
-		statecharts.On("match.snapshot", statecharts.Then(observe.Call())),
-	))
+	policy, err := taggedStruct(botPolicyTag, defaultBotPolicy())
+	if err != nil {
+		return nil, err
+	}
+	stop := bot.Action("stop", func(data *botModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+		if data.Match == "" {
+			return nil
+		}
+		target, _ := statecharts.StringValue(ec.SessionID())
+		ec.Send("subscriber.remove", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: target})
+		disconnect, err := taggedStruct(disconnectTag, disconnectRequest{Player: data.Player, Lease: ec.SessionID()})
+		if err != nil {
+			return err
+		}
+		ec.Send("player.disconnect", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: disconnect})
+		return nil
+	})
+	return bot.Build(statecharts.Compound(botKind, "active", statecharts.Children(
+		statecharts.Atomic("active",
+			statecharts.On("bot.start", statecharts.Then(start.Call())),
+			statecharts.On("match.snapshot", statecharts.Then(observe.Call(statecharts.GoLiteral(policy)))),
+			statecharts.On("bot.stop", statecharts.Target("stopped"), statecharts.Then(stop.Call())),
+		), statecharts.Final("stopped"))))
 }
 
-func chooseBotAction(snapshot arenaSnapshot, player string) string {
+func chooseBotAction(snapshot arenaSnapshot, player string, policies ...botPolicy) string {
+	policy := defaultBotPolicy()
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
 	self := snapshotPlayer(snapshot, player)
 	if self.ID == "" {
 		return ""
@@ -323,32 +366,36 @@ func chooseBotAction(snapshot arenaSnapshot, player string) string {
 	targetIsCreature := false
 	hasTarget := false
 	best := int(^uint(0) >> 1)
-	for _, other := range snapshot.Creatures {
-		if other.ID == player || !other.Connected {
-			continue
-		}
-		distance := abs(other.X-self.X) + abs(other.Y-self.Y)
-		if distance < best {
-			best = distance
-			target = tile{X: other.X, Y: other.Y}
-			targetIsCreature = true
-			hasTarget = true
+	if policy.TargetPriority != "powerups" {
+		for _, other := range snapshot.Creatures {
+			if other.ID == player || !other.Connected {
+				continue
+			}
+			distance := abs(other.X-self.X) + abs(other.Y-self.Y)
+			if distance < best {
+				best = distance
+				target = tile{X: other.X, Y: other.Y}
+				targetIsCreature = true
+				hasTarget = true
+			}
 		}
 	}
-	for _, item := range snapshot.Powerups {
-		distance := abs(item.X-self.X) + abs(item.Y-self.Y)
-		if distance < best {
-			best = distance
-			target = tile{X: item.X, Y: item.Y}
-			targetIsCreature = false
-			hasTarget = true
+	if policy.TargetPriority != "creatures" {
+		for _, item := range snapshot.Powerups {
+			distance := abs(item.X-self.X) + abs(item.Y-self.Y)
+			if distance < best {
+				best = distance
+				target = tile{X: item.X, Y: item.Y}
+				targetIsCreature = false
+				hasTarget = true
+			}
 		}
 	}
 	if !hasTarget {
 		return botFallbackAction(snapshot, self)
 	}
 	if targetIsCreature {
-		if direction, aligned := alignedDirection(self, target); aligned && botLineClear(snapshot, self, target) {
+		if direction, aligned := alignedDirection(self, target); policy.ShootRange > 0 && best <= policy.ShootRange && aligned && botLineClear(snapshot, self, target) {
 			if self.Facing == direction {
 				return actionShoot
 			}
@@ -512,13 +559,21 @@ func startTestConnection(ctx context.Context, system *actors.System, id, match, 
 	return system.Tell(ctx, id, statecharts.Event{Name: "connection.start", Type: statecharts.EventExternal, Data: config})
 }
 
-func spawnBot(ctx context.Context, system *actors.System, id, match statecharts.Identifier, color string) error {
+func spawnBotPlayer(ctx context.Context, system *actors.System, id, match statecharts.Identifier, player, color string, revision statecharts.RevisionID) error {
 	if err := system.Spawn(ctx, id, botKind); err != nil {
 		return err
 	}
-	config, err := taggedStruct(botConfigTag, botConfig{Match: string(match), Player: string(id), Name: "BOT " + string(id), Color: color})
+	config, err := taggedStruct(botConfigTag, botConfig{Match: string(match), Player: player, Name: "BOT " + player, Color: color, PolicyRevision: string(revision)})
 	if err != nil {
 		return err
 	}
 	return system.Tell(ctx, id, statecharts.Event{Name: "bot.start", Type: statecharts.EventExternal, Data: config})
+}
+
+func spawnBot(ctx context.Context, system *actors.System, id, match statecharts.Identifier, color string) error {
+	_, revision, ok := system.CurrentDefinition(botKind)
+	if !ok {
+		return fmt.Errorf("bot definition is not registered")
+	}
+	return spawnBotPlayer(ctx, system, id, match, string(id), color, revision)
 }

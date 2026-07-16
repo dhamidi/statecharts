@@ -24,18 +24,20 @@ type tile struct {
 }
 
 type creature struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Color        string `json:"color"`
-	X            int    `json:"x"`
-	Y            int    `json:"y"`
-	Facing       string `json:"facing"`
-	Health       int    `json:"health"`
-	Power        int    `json:"power"`
-	Score        int    `json:"score"`
-	LastSequence uint64 `json:"last_sequence"`
-	Bot          bool   `json:"bot"`
-	Connected    bool   `json:"connected"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Color          string `json:"color"`
+	X              int    `json:"x"`
+	Y              int    `json:"y"`
+	Facing         string `json:"facing"`
+	Health         int    `json:"health"`
+	Power          int    `json:"power"`
+	Score          int    `json:"score"`
+	LastSequence   uint64 `json:"last_sequence"`
+	Bot            bool   `json:"bot"`
+	Connected      bool   `json:"connected"`
+	Controller     string `json:"controller,omitempty"`
+	PolicyRevision string `json:"policy_revision,omitempty"`
 }
 
 type projectile struct {
@@ -109,14 +111,15 @@ func newWorld(width, height int, seed uint64) world {
 	return w
 }
 
-func (w *world) addPlayer(id, name, color string, bot bool) bool {
+func (w *world) addPlayer(id, name, color string, bot bool, controller, policyRevision string) bool {
 	if current, ok := w.Creatures[id]; ok {
 		current.Name, current.Color, current.Bot, current.Connected = name, color, bot, true
+		current.Controller, current.PolicyRevision = controller, policyRevision
 		w.Creatures[id] = current
 		return false
 	}
 	x, y := w.openCell(uint64(len(w.Creatures)))
-	w.Creatures[id] = creature{ID: id, Name: name, Color: color, X: x, Y: y, Facing: directionRight, Health: 3, Bot: bot, Connected: true}
+	w.Creatures[id] = creature{ID: id, Name: name, Color: color, X: x, Y: y, Facing: directionRight, Health: 3, Bot: bot, Connected: true, Controller: controller, PolicyRevision: policyRevision}
 	return true
 }
 

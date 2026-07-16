@@ -298,6 +298,308 @@ func TestBotRoutesAroundWallBlockingDirectPath(t *testing.T) {
 	}
 }
 
+func TestBotPolicyChangesTargetAndShootRange(t *testing.T) {
+	snapshot := arenaSnapshot{Width: 9, Height: 9, Tick: 1, Creatures: []creature{
+		{ID: "bot", X: 2, Y: 2, Facing: directionRight, Connected: true},
+		{ID: "enemy", X: 4, Y: 2, Connected: true},
+	}, Powerups: []powerup{{X: 2, Y: 5, Kind: "charge"}}}
+	if got := chooseBotAction(snapshot, "bot", botPolicy{TargetPriority: "creatures", ShootRange: 0}); got != actionRight {
+		t.Fatalf("shoot-disabled creature action = %q, want right", got)
+	}
+	if got := chooseBotAction(snapshot, "bot", botPolicy{TargetPriority: "creatures", ShootRange: 2}); got != actionShoot {
+		t.Fatalf("in-range creature action = %q, want shoot", got)
+	}
+	if got := chooseBotAction(snapshot, "bot", botPolicy{TargetPriority: "powerups", ShootRange: 2}); got != actionDown {
+		t.Fatalf("powerup-priority action = %q, want down", got)
+	}
+}
+
+func TestBotDefinitionRequiresValidLiteralPolicy(t *testing.T) {
+	chart, err := buildBotChart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := chart.Definition()
+	if err := validateBotDefinition(valid); err != nil {
+		t.Fatalf("default definition is invalid: %v", err)
+	}
+	invalid := valid
+	if !setBotPolicy(&invalid.Root, botPolicy{TargetPriority: "anything", ShootRange: 1}) {
+		t.Fatal("definition has no bot policy")
+	}
+	if err := validateBotDefinition(invalid); err == nil {
+		t.Fatal("invalid target priority was accepted")
+	}
+}
+
+func TestPublishingBotDefinitionDoesNotRepinExistingActors(t *testing.T) {
+	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour, Bots: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
+	matchRevision, _ := runtime.system.ActorRevision("match.main")
+	before := runtime.listBots()
+	candidate := runtime.bot.Definition()
+	candidate.RevisionSalt = "published-without-rollout"
+	published, err := runtime.publishBotDefinition(context.Background(), candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published == before[0].PolicyRevision {
+		t.Fatal("publication did not produce a new bot revision")
+	}
+	if got, _ := runtime.system.ActorRevision("match.main"); got != matchRevision {
+		t.Fatalf("match revision changed from %q to %q", matchRevision, got)
+	}
+	after := runtime.listBots()
+	byPlayer := make(map[string]botStatus, len(after))
+	for _, status := range after {
+		byPlayer[status.Player] = status
+	}
+	for _, old := range before {
+		if got, _ := runtime.system.ActorRevision(old.Controller); got != old.PolicyRevision {
+			t.Errorf("controller %q revision changed from %q to %q", old.Controller, old.PolicyRevision, got)
+		}
+		if got := byPlayer[old.Player]; got != old {
+			t.Errorf("bot status changed on publication: got %+v, want %+v", got, old)
+		}
+	}
+}
+
+func TestBotRolloutPreservesCreatureAndRejectsObsoleteController(t *testing.T) {
+	ctx := context.Background()
+	runtime, err := setupArena(ctx, runtimeOptions{TickInterval: time.Hour, Bots: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
+	frames := runtime.transport.registerTest("rollout-output")
+	if err := startTestConnection(ctx, runtime.system, "connection.rollout", "match.main", "observer", "rollout-output"); err != nil {
+		t.Fatal(err)
+	}
+	old := runtime.listBots()[0]
+	initial := waitForPlayer(t, frames, old.Player, func(creature) bool { return true })
+	input, _ := taggedStruct(inputTag, playerInput{Player: old.Player, Lease: string(old.Controller), Sequence: initial.LastSequence + 7, Action: actionShoot})
+	if err := runtime.system.Tell(ctx, old.Match, statecharts.Event{Name: "player.input", Type: statecharts.EventExternal, Data: input}); err != nil {
+		t.Fatal(err)
+	}
+	before := waitForPlayer(t, frames, old.Player, func(c creature) bool { return c.LastSequence == initial.LastSequence+7 })
+
+	next, err := runtime.rolloutBot(ctx, old.Player)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := waitForPlayer(t, frames, old.Player, func(c creature) bool { return c.Controller == string(next.Controller) })
+	if joined.X != before.X || joined.Y != before.Y || joined.Health != before.Health || joined.Power != before.Power || joined.Score != before.Score || joined.LastSequence != before.LastSequence {
+		t.Fatalf("takeover changed stable creature state: before=%+v after=%+v", before, joined)
+	}
+	if joined.PolicyRevision != string(next.PolicyRevision) {
+		t.Fatalf("creature policy revision = %q, want %q", joined.PolicyRevision, next.PolicyRevision)
+	}
+	if got, _ := runtime.system.ActorRevision(next.Controller); got != next.PolicyRevision {
+		t.Fatalf("replacement actual revision = %q, status reports %q", got, next.PolicyRevision)
+	}
+	// A fresh snapshot makes the replacement act. Its first accepted sequence
+	// must continue above the match's authoritative sequence.
+	snapshot := arenaSnapshot{Match: string(old.Match), Width: 9, Height: 9, Tick: 1, Creatures: []creature{joined}}
+	snapshot.Creatures[0].X, snapshot.Creatures[0].Y = 2, 2
+	value, _ := taggedStruct(snapshotTag, snapshot)
+	if err := runtime.system.Tell(ctx, next.Controller, statecharts.Event{Name: "match.snapshot", Type: statecharts.EventExternal, Data: value}); err != nil {
+		t.Fatal(err)
+	}
+	afterInput := waitForPlayer(t, frames, old.Player, func(c creature) bool { return c.LastSequence > before.LastSequence })
+	if afterInput.LastSequence != before.LastSequence+1 {
+		t.Fatalf("replacement first sequence = %d, want %d", afterInput.LastSequence, before.LastSequence+1)
+	}
+
+	// Stop is ordered before these messages to the old controller. Neither its
+	// stale snapshot nor stale lease may act on or disconnect the creature.
+	_ = runtime.system.Tell(ctx, old.Controller, statecharts.Event{Name: "match.snapshot", Type: statecharts.EventExternal, Data: value})
+	disconnect, _ := taggedStruct(disconnectTag, disconnectRequest{Player: old.Player, Lease: string(old.Controller)})
+	if err := runtime.system.Tell(ctx, old.Match, statecharts.Event{Name: "player.disconnect", Type: statecharts.EventExternal, Data: disconnect}); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ := taggedStruct(inputTag, playerInput{Player: old.Player, Lease: string(old.Controller), Sequence: afterInput.LastSequence + 100, Action: actionShoot})
+	if err := runtime.system.Tell(ctx, old.Match, statecharts.Event{Name: "player.input", Type: statecharts.EventExternal, Data: stale}); err != nil {
+		t.Fatal(err)
+	}
+	confirm, _ := taggedStruct(inputTag, playerInput{Player: old.Player, Lease: string(next.Controller), Sequence: afterInput.LastSequence + 1, Action: actionShoot})
+	if err := runtime.system.Tell(ctx, old.Match, statecharts.Event{Name: "player.input", Type: statecharts.EventExternal, Data: confirm}); err != nil {
+		t.Fatal(err)
+	}
+	final := waitForPlayer(t, frames, old.Player, func(c creature) bool { return c.LastSequence == afterInput.LastSequence+1 })
+	if !final.Connected || final.Controller != string(next.Controller) {
+		t.Fatalf("obsolete controller altered takeover: %+v", final)
+	}
+	if got := runtime.listBots()[1]; got.Player == old.Player || got.Generation != 1 {
+		t.Fatalf("one-bot rollout changed unselected bot: %+v", got)
+	}
+}
+
+func TestAllBotRolloutPinsEveryReplacementToOnePublishedRevision(t *testing.T) {
+	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour, Bots: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
+	candidate := runtime.bot.Definition()
+	candidate.RevisionSalt = "all-bot-rollout"
+	want, err := runtime.publishBotDefinition(context.Background(), candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bots, err := runtime.rolloutBots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bot := range bots {
+		if bot.Generation != 2 || bot.PolicyRevision != want {
+			t.Errorf("replacement status = %+v, want generation 2 revision %q", bot, want)
+		}
+		if got, _ := runtime.system.ActorRevision(bot.Controller); got != want {
+			t.Errorf("controller %q pinned %q, want %q", bot.Controller, got, want)
+		}
+	}
+}
+
+func setBotPolicy(state *statecharts.StateDefinition, policy botPolicy) bool {
+	definition := statecharts.Definition{Root: *state}
+	changed, err := replaceBotPolicy(definition, policy)
+	if err != nil {
+		return false
+	}
+	*state = changed.Root
+	return true
+}
+
+func TestStructuredBotPolicyAPIAndEditor(t *testing.T) {
+	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour, Bots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
+	server := httptest.NewServer(arenaHandler(runtime))
+	t.Cleanup(server.Close)
+	response, err := http.Get(server.URL + "/editor/bots")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("editor response = %d %q", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+	before, _, _ := runtime.system.CurrentDefinition(botKind)
+	beforePolicy, _ := readBotPolicy(before)
+	candidate := `{"target_priority":"powerups","shoot_range":0}`
+	response, err = http.Post(server.URL+"/bot-policy/validate", "application/json", strings.NewReader(candidate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var validated struct {
+		Revision string    `json:"revision"`
+		Policy   botPolicy `json:"policy"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&validated); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || validated.Policy.TargetPriority != "powerups" {
+		t.Fatalf("validation = %d %+v", response.StatusCode, validated)
+	}
+	stillCurrent, _, _ := runtime.system.CurrentDefinition(botKind)
+	stillPolicy, _ := readBotPolicy(stillCurrent)
+	if stillPolicy != beforePolicy {
+		t.Fatalf("validation published policy: got %+v want %+v", stillPolicy, beforePolicy)
+	}
+	request, _ := http.NewRequest(http.MethodPut, server.URL+"/bot-policy", strings.NewReader(candidate))
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("publish status = %d", response.StatusCode)
+	}
+	published, _, _ := runtime.system.CurrentDefinition(botKind)
+	got, err := readBotPolicy(published)
+	if err != nil || got != (botPolicy{TargetPriority: "powerups", ShootRange: 0}) {
+		t.Fatalf("published policy = %+v, err=%v", got, err)
+	}
+}
+
+func TestStructuredBotPolicyPreservesCurrentDefinitionEdits(t *testing.T) {
+	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
+	definition := runtime.bot.Definition()
+	definition.RevisionSalt = "full-definition-edit"
+	if _, err := runtime.publishBotDefinition(context.Background(), definition); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.publishBotPolicy(context.Background(), botPolicy{TargetPriority: "powerups", ShootRange: 0}); err != nil {
+		t.Fatal(err)
+	}
+	published, _, ok := runtime.system.CurrentDefinition(botKind)
+	if !ok {
+		t.Fatal("bot definition is not registered")
+	}
+	if published.RevisionSalt != definition.RevisionSalt {
+		t.Fatalf("policy publication reset revision salt to %q, want %q", published.RevisionSalt, definition.RevisionSalt)
+	}
+	policy, err := readBotPolicy(published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != (botPolicy{TargetPriority: "powerups", ShootRange: 0}) {
+		t.Fatalf("published policy = %+v", policy)
+	}
+}
+
+func TestStructuredBotPolicyRejectsMalformedUnknownAndTrailingJSON(t *testing.T) {
+	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
+	server := httptest.NewServer(arenaHandler(runtime))
+	t.Cleanup(server.Close)
+	for _, body := range []string{`{`, `{"target_priority":"nearest","shoot_range":1,"extra":true}`, `{"target_priority":"nearest","shoot_range":1} {}`} {
+		response, err := http.Post(server.URL+"/bot-policy/validate", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Errorf("body %q status = %d, want 400", body, response.StatusCode)
+		}
+	}
+}
+
+func TestSpectatorSocketDeliversSnapshotWithoutCreatingCreature(t *testing.T) {
+	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour, Bots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
+	server := httptest.NewServer(arenaHandler(runtime))
+	t.Cleanup(server.Close)
+	connection, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/ws?match=match.main&spectate=1&player=spectator.test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.CloseNow()
+	message := readSocketUntil(t, connection, func(message serverMessage) bool { return message.Type == "snapshot" })
+	if snapshotPlayer(message.Snapshot, "spectator.test").ID != "" {
+		t.Fatal("spectator created a creature")
+	}
+	if snapshotPlayer(message.Snapshot, "bot.1").ID == "" {
+		t.Fatal("spectator did not receive authoritative bot snapshot")
+	}
+}
+
 func TestWebSocketReconnectResubscribesToAuthoritativeState(t *testing.T) {
 	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour, Bots: 0})
 	if err != nil {
