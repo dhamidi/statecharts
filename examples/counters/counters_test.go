@@ -1,17 +1,18 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/dhamidi/statecharts"
@@ -511,6 +512,10 @@ func TestEventStreamColorSelection(t *testing.T) {
 }
 
 func TestEventStreamDoesNotRepeatUnchangedSelectedCounters(t *testing.T) {
+	synctest.Test(t, testEventStreamDoesNotRepeatUnchangedSelectedCounters)
+}
+
+func testEventStreamDoesNotRepeatUnchangedSelectedCounters(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store, err := openLog(t.TempDir() + "/counters.db")
@@ -522,47 +527,67 @@ func TestEventStreamDoesNotRepeatUnchangedSelectedCounters(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rt.stop(context.Background())
-	server := httptest.NewServer(counterHandler(rt))
-	defer server.Close()
-
-	streamCtx, stopStream := context.WithCancel(ctx)
-	defer stopStream()
-	request, err := http.NewRequestWithContext(streamCtx, http.MethodGet, server.URL+"/events?colors=blue", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	stream := bufio.NewReader(response.Body)
-	for range 3 {
-		line, err := stream.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
+	var resident []string
+	for _, item := range mustQuery(t, rt, colors) {
+		if item.Resident {
+			resident = append(resident, item.Name)
 		}
-		if strings.HasPrefix(line, "data:") && !strings.Contains(line, `"name":"blue"`) {
-			t.Fatalf("initial snapshot = %q, want blue", line)
+	}
+	if len(resident) < 2 {
+		t.Fatalf("resident counters = %v, want at least two", resident)
+	}
+	selected, unrelated := resident[0], resident[1]
+	const actorID statecharts.Identifier = "test-selected-stream"
+	const output statecharts.Identifier = "test-selected-output"
+	frames := rt.streams.register(output)
+	defer rt.streams.unregister(output)
+	if err := rt.ui.Spawn(ctx, actorID, streamKind); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.ui.Tell(ctx, actorID, statecharts.Event{
+		Name: "start",
+		Type: statecharts.EventExternal,
+		Data: taggedMap(streamStartValueTag, map[string]statecharts.Value{
+			"mode":   stringValue("terminal"),
+			"colors": encodeStrings([]string{selected}),
+			"output": stringValue(string(output)),
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-frames:
+		if !strings.Contains(string(frame), `"name":"`+selected+`"`) {
+			t.Fatalf("initial snapshot = %q, want %s", frame, selected)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("initial %s snapshot was not emitted", selected)
+	}
+	synctest.Wait()
+drainInitial:
+	for {
+		select {
+		case frame := <-frames:
+			if !strings.Contains(string(frame), `"name":"`+selected+`"`) {
+				t.Fatalf("initial snapshot = %q, want %s", frame, selected)
+			}
+		default:
+			break drainInitial
 		}
 	}
 
 	// This projection can only reach hub@ui through the counter System's
 	// Bridge; the HTTP/service side never writes hub projection state.
-	// Indigo is among the initially resident actors, so this changes no blue
-	// value or residency state.
-	if err := rt.counters.Tell(ctx, "indigo", incrementEvent("unrelated-indigo")); err != nil {
+	// Both actors are already resident, so this changes neither the selected
+	// counter's value nor its residency state.
+	if err := rt.counters.Tell(ctx, statecharts.Identifier(unrelated), incrementEvent("unrelated-resident")); err != nil {
 		t.Fatal(err)
 	}
-	read := make(chan string, 1)
-	go func() {
-		line, _ := stream.ReadString('\n')
-		read <- line
-	}()
+	synctest.Wait()
 	select {
-	case line := <-read:
-		t.Fatalf("unrelated red update produced blue stream output %q", line)
-	case <-time.After(100 * time.Millisecond):
+	case frame := <-frames:
+		t.Fatalf("unrelated %s update produced %s stream output %q", unrelated, selected, frame)
+	default:
 	}
 }
 
@@ -608,20 +633,44 @@ func TestTerminalViewsShowCountsAndPerColorSparklines(t *testing.T) {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type snapshotBody struct {
+	reader *strings.Reader
+	done   <-chan struct{}
+}
+
+func (b *snapshotBody) Read(p []byte) (int, error) {
+	if b.reader.Len() > 0 {
+		return b.reader.Read(p)
+	}
+	<-b.done
+	return 0, io.EOF
+}
+
+func (*snapshotBody) Close() error { return nil }
+
 func TestFollowSnapshotsReconnects(t *testing.T) {
+	synctest.Test(t, testFollowSnapshotsReconnects)
+}
+
+func testFollowSnapshotsReconnects(t *testing.T) {
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		attempt := requests.Add(1)
 		if attempt == 1 {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
-			return
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("not ready"))}, nil
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "event: snapshot\ndata: [{\"name\":\"red\",\"color\":\"red\",\"value\":9}]\n\n")
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	}))
-	defer server.Close()
+		body := &snapshotBody{
+			reader: strings.NewReader("event: snapshot\ndata: [{\"name\":\"red\",\"color\":\"red\",\"value\":9}]\n\n"),
+			done:   request.Context().Done(),
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+	})}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	state := newReaderState()
@@ -630,30 +679,26 @@ func TestFollowSnapshotsReconnects(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.stop(context.Background())
+	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		followSnapshots(ctx, server.URL, []string{"red"}, state, connection)
+		followSnapshotsWithClient(ctx, client, "http://counters.test", []string{"red"}, state, connection)
 		close(done)
 	}()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		status, counters := connection.status(), state.snapshot()
-		if status == "connected" && len(counters) == 1 && counters[0].Value == 9 {
-			cancel()
-			select {
-			case <-done:
-				return
-			case <-time.After(time.Second):
-				t.Fatal("snapshot follower did not stop after cancellation")
-			}
-		}
-		time.Sleep(time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
+	synctest.Wait()
+	status, counters := connection.status(), state.snapshot()
+	if status != "connected" || len(counters) != 1 || counters[0].Value != 9 {
+		t.Fatalf("reader did not reconnect: requests=%d status=%q counters=%#v", requests.Load(), status, counters)
 	}
 	cancel()
-	<-done
-	status, counters := connection.status(), state.snapshot()
-	t.Fatalf("reader did not reconnect: requests=%d status=%q counters=%#v", requests.Load(), status, counters)
+	synctest.Wait()
+	select {
+	case <-done:
+	default:
+		t.Fatal("snapshot follower did not stop after cancellation")
+	}
 }
 
 func TestConnectionActorUsesExplicitChartStates(t *testing.T) {

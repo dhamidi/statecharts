@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -529,6 +530,10 @@ func (l *timerBetweenSnapshotAndSeqLog) LastSeq(ctx context.Context, sessionID s
 }
 
 func TestCheckpointCannotClaimTimerFireMissingFromSnapshot(t *testing.T) {
+	synctest.Test(t, testCheckpointCannotClaimTimerFireMissingFromSnapshot)
+}
+
+func testCheckpointCannotClaimTimerFireMissingFromSnapshot(t *testing.T) {
 	ctx := context.Background()
 	baseLog := openTestLog(t)
 	clock := statecharts.NewManualClock(time.Unix(0, 0))

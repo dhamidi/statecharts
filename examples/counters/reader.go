@@ -70,6 +70,10 @@ func flagSet(name string) *flag.FlagSet { return flag.NewFlagSet(name, flag.Cont
 
 func followSnapshots(ctx context.Context, base string, selected []string, state *readerState, connection *connectionActor) {
 	client := &http.Client{Timeout: 0}
+	followSnapshotsWithClient(ctx, client, base, selected, state, connection)
+}
+
+func followSnapshotsWithClient(ctx context.Context, client *http.Client, base string, selected []string, state *readerState, connection *connectionActor) {
 	const initialBackoff = 200 * time.Millisecond
 	backoff := initialBackoff
 	endpoint := base + "/events?colors=" + url.QueryEscape(strings.Join(selected, ","))

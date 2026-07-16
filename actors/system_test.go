@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/dhamidi/statecharts"
@@ -538,14 +539,15 @@ func TestSpawnStopRaceLeavesNoOrphanedInstance(t *testing.T) {
 // TestStopHonorsContextDeadline is finding #5: Stop's final wait for
 // in-flight asynchronous deliveries must be bounded by ctx, not
 // unconditional -- a wedged delivery (here, a target whose action never
-// returns) must not be able to hang Stop forever regardless of ctx's
-// deadline.
+// returns) must not be able to hang Stop forever past ctx's deadline.
 func TestStopHonorsContextDeadline(t *testing.T) {
 	ctx := context.Background()
 
+	entered := make(chan struct{})
 	release := make(chan struct{})
 	model := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
 	wedge, err := model.Action("wedge", "v1", func(_ *struct{}, _ statecharts.ExecContext, _ []statecharts.Value) error {
+		close(entered)
 		<-release // never returns until the test releases it
 		return nil
 	})
@@ -577,25 +579,18 @@ func TestStopHonorsContextDeadline(t *testing.T) {
 		t.Fatalf("enqueue dispatch: %v", err)
 	}
 
-	// Give the goroutine above a moment to actually enter the wedged
-	// action before racing Stop against it.
-	time.Sleep(20 * time.Millisecond)
+	<-entered
 
-	stopCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	stopCtx, cancel := context.WithTimeout(ctx, time.Millisecond)
 	defer cancel()
-	start := time.Now()
 	err = sys.Stop(stopCtx)
-	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Stop error = %v, want context.DeadlineExceeded", err)
 	}
-	if elapsed > time.Second {
-		t.Fatalf("Stop took %s to honor a 100ms ctx deadline -- it waited on the wedged delivery instead", elapsed)
-	}
 }
 
-func TestStopCanRetryCleanupAfterDeadline(t *testing.T) {
+func TestStopCanRetryCleanupAfterCancellation(t *testing.T) {
 	ctx := context.Background()
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -627,27 +622,31 @@ func TestStopCanRetryCleanupAfterDeadline(t *testing.T) {
 	}()
 	<-entered
 
-	stopCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
-	err = sys.Stop(stopCtx)
+	stopCtx, cancel := context.WithCancel(ctx)
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- sys.Stop(stopCtx) }()
+	for !sys.stopped.Load() {
+		runtime.Gosched()
+	}
 	cancel()
-	if !errors.Is(err, context.DeadlineExceeded) {
+	err = <-stopDone
+	if !errors.Is(err, context.Canceled) {
 		close(release)
-		t.Fatalf("first Stop error = %v, want context.DeadlineExceeded", err)
+		t.Fatalf("first Stop error = %v, want context.Canceled", err)
 	}
 
-	retryDone := make(chan error, 1)
-	go func() { retryDone <- sys.Stop(ctx) }()
-	select {
-	case err := <-retryDone:
+	probeCtx, probeCancel := context.WithCancel(ctx)
+	probeCancel()
+	if err := sys.Stop(probeCtx); !errors.Is(err, context.Canceled) {
 		close(release)
-		t.Fatalf("retry Stop returned %v before the wedged actor was released; it did not retry cleanup", err)
-	case <-time.After(20 * time.Millisecond):
+		t.Fatalf("retry Stop before release = %v, want context.Canceled", err)
 	}
+
 	close(release)
 	if err := <-tellDone; err != nil {
 		t.Fatalf("Tell: %v", err)
 	}
-	if err := <-retryDone; err != nil {
+	if err := sys.Stop(ctx); err != nil {
 		t.Fatalf("retry Stop: %v", err)
 	}
 	if testResident(sys, "wedged-retry-1") {
@@ -1031,9 +1030,32 @@ func TestConcurrentActivationCannotExceedMaxResident(t *testing.T) {
 			errs <- sys.Spawn(ctx, statecharts.Identifier(fmt.Sprintf("blocked-%d", i)), chart.ID())
 		}(i)
 	}
-	// Give the competing activations time to reach admission while the first
-	// activation has not yet published its Instance as resident.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until every competing activation holds its entry lock and is
+	// blocked behind the first activation's admission lock. A timed sleep here
+	// made this both slow and scheduler-dependent.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sys.tableMu.Lock()
+		entries := make([]*actorEntry, 0, len(sys.table))
+		for _, entry := range sys.table {
+			entries = append(entries, entry)
+		}
+		sys.tableMu.Unlock()
+		allAtAdmission := len(entries) == count
+		for _, entry := range entries {
+			if entry.mu.TryLock() {
+				entry.mu.Unlock()
+				allAtAdmission = false
+			}
+		}
+		if allAtAdmission {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("competing activations did not all reach admission")
+		}
+		runtime.Gosched()
+	}
 	close(release)
 
 	succeeded := 0
@@ -1104,7 +1126,20 @@ func TestPeerDispatchDoesNotCreateOneBlockedGoroutinePerMessage(t *testing.T) {
 		entry.mu.Unlock()
 		t.Fatalf("Tell: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sys.dispatchMu.Lock()
+		queued := len(sys.dispatchQueue)
+		sys.dispatchMu.Unlock()
+		if queued > 0 && queued < messages {
+			break
+		}
+		if time.Now().After(deadline) {
+			entry.mu.Unlock()
+			t.Fatal("peer dispatcher did not begin the blocked burst")
+		}
+		runtime.Gosched()
+	}
 	delta := runtime.NumGoroutine() - baseline
 	entry.mu.Unlock()
 	if delta > 16 {
@@ -1369,6 +1404,10 @@ func TestFallbackAdvertisesRegisteredIOProcessor(t *testing.T) {
 }
 
 func TestUnsupportedPeerIOProcessorTypeRaisesExecutionError(t *testing.T) {
+	synctest.Test(t, testUnsupportedPeerIOProcessorTypeRaisesExecutionError)
+}
+
+func testUnsupportedPeerIOProcessorTypeRaisesExecutionError(t *testing.T) {
 	ctx := context.Background()
 	var deliveries int
 	receiverModel := statecharts.NewGoModel(func() *struct{} { return &struct{}{} })
@@ -1427,7 +1466,7 @@ func TestUnsupportedPeerIOProcessorTypeRaisesExecutionError(t *testing.T) {
 	if !hasStateID(senderInstance.Configuration(), "failed") {
 		t.Fatalf("sender configuration = %v, want failed after unsupported I/O processor type", senderInstance.Configuration())
 	}
-	time.Sleep(20 * time.Millisecond)
+	synctest.Wait()
 	if deliveries != 0 {
 		t.Fatalf("unsupported typed send reached target %d time(s), want 0", deliveries)
 	}
@@ -1570,7 +1609,6 @@ func TestPeerMessagesFromOneSenderRetainFIFOOrder(t *testing.T) {
 		receiverEntry.mu.Unlock()
 		t.Fatalf("Tell: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond)
 	receiverEntry.mu.Unlock()
 	live := receiverModels[len(receiverModels)-1]
 	waitFor(t, 2*time.Second, func() bool {

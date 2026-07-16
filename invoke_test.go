@@ -5,11 +5,16 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
 func TestDeclarativeInvokeStartsDeliversAndCancelsWithItsState(t *testing.T) {
 	t.Parallel()
+	synctest.Test(t, testDeclarativeInvokeStartsDeliversAndCancelsWithItsState)
+}
+
+func testDeclarativeInvokeStartsDeliversAndCancelsWithItsState(t *testing.T) {
 	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	chart, err := b.build(Compound("root", "idle", Children(
 		Atomic("idle", On("start", Target("running"))),
@@ -61,7 +66,7 @@ func TestDeclarativeInvokeStartsDeliversAndCancelsWithItsState(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("invoke context was not cancelled on state exit")
 	}
-	time.Sleep(10 * time.Millisecond)
+	synctest.Wait()
 	if active := instance.Configuration(); !hasState(active, "idle") {
 		t.Fatalf("late invoke delivery changed configuration: active=%v", active)
 	}
@@ -69,6 +74,10 @@ func TestDeclarativeInvokeStartsDeliversAndCancelsWithItsState(t *testing.T) {
 
 func TestInvokeIsNotStartedWhenStateExitsInSameMacrostep(t *testing.T) {
 	t.Parallel()
+	synctest.Test(t, testInvokeIsNotStartedWhenStateExitsInSameMacrostep)
+}
+
+func testInvokeIsNotStartedWhenStateExitsInSameMacrostep(t *testing.T) {
 	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	chart, err := b.build(Compound("root", "transient", Children(
 		Atomic("transient", Invoke("worker", "jobs"), Eventless(Target("done"))),
@@ -88,10 +97,11 @@ func TestInvokeIsNotStartedWhenStateExitsInSameMacrostep(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer instance.Stop(context.Background())
+	synctest.Wait()
 	select {
 	case <-started:
 		t.Fatal("invoke started for a state exited before the macrostep settled")
-	case <-time.After(20 * time.Millisecond):
+	default:
 	}
 }
 
@@ -602,6 +612,10 @@ func TestInvokeCompletionCopiesPayloadAtServiceBoundary(t *testing.T) {
 }
 
 func TestInvokeAutoForwardStopsAfterCancellation(t *testing.T) {
+	synctest.Test(t, testInvokeAutoForwardStopsAfterCancellation)
+}
+
+func testInvokeAutoForwardStopsAfterCancellation(t *testing.T) {
 	b := newTestBuilder(t, func() *struct{} { return &struct{}{} })
 	chart, err := b.build(Compound("root", "a", Children(
 		Atomic("a", Invoke("worker", "jobs", WithAutoForward()), On("go", Target("b"))),
@@ -635,14 +649,14 @@ func TestInvokeAutoForwardStopsAfterCancellation(t *testing.T) {
 	if err := instance.Send(ctx, Event{Name: "after"}); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.After(200 * time.Millisecond)
+	synctest.Wait()
 	for {
 		select {
 		case event := <-received:
 			if event.Name == "after" {
 				t.Fatalf("received %+v after invocation cancellation", event)
 			}
-		case <-deadline:
+		default:
 			return
 		}
 	}

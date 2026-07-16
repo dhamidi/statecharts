@@ -3,6 +3,7 @@ package actors
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/dhamidi/statecharts"
@@ -324,6 +325,10 @@ func TestBridgePreservesNestedValueAndDeliveryIdentity(t *testing.T) {
 }
 
 func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
+	synctest.Test(t, testSourceSystemStopWaitsForBridgeDelivery)
+}
+
+func testSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 	ctx := context.Background()
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -379,11 +384,12 @@ func TestSourceSystemStopWaitsForBridgeDelivery(t *testing.T) {
 
 	stopped := make(chan error, 1)
 	go func() { stopped <- sysA.Stop(ctx) }()
+	synctest.Wait()
 	select {
 	case err := <-stopped:
 		close(release)
 		t.Fatalf("source Stop returned %v while its bridge delivery was still running", err)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	close(release)
 	if err := <-stopped; err != nil {
