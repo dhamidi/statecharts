@@ -319,37 +319,150 @@ func chooseBotAction(snapshot arenaSnapshot, player string) string {
 	if self.ID == "" {
 		return ""
 	}
-	var targetX, targetY int
-	found := false
+	target := tile{}
+	targetIsCreature := false
+	hasTarget := false
 	best := int(^uint(0) >> 1)
 	for _, other := range snapshot.Creatures {
-		if other.ID == player {
+		if other.ID == player || !other.Connected {
 			continue
 		}
 		distance := abs(other.X-self.X) + abs(other.Y-self.Y)
 		if distance < best {
-			best, targetX, targetY, found = distance, other.X, other.Y, true
+			best = distance
+			target = tile{X: other.X, Y: other.Y}
+			targetIsCreature = true
+			hasTarget = true
 		}
 	}
 	for _, item := range snapshot.Powerups {
 		distance := abs(item.X-self.X) + abs(item.Y-self.Y)
 		if distance < best {
-			best, targetX, targetY, found = distance, item.X, item.Y, true
+			best = distance
+			target = tile{X: item.X, Y: item.Y}
+			targetIsCreature = false
+			hasTarget = true
 		}
 	}
-	if !found {
-		return []string{actionRight, actionDown, actionLeft, actionUp}[snapshot.Tick%4]
+	if !hasTarget {
+		return botFallbackAction(snapshot, self)
 	}
-	if self.Y == targetY && self.Facing == horizontalDirection(targetX-self.X) {
-		return actionShoot
+	if targetIsCreature {
+		if direction, aligned := alignedDirection(self, target); aligned && botLineClear(snapshot, self, target) {
+			if self.Facing == direction {
+				return actionShoot
+			}
+			return direction
+		}
 	}
-	if self.X == targetX && self.Facing == verticalDirection(targetY-self.Y) {
-		return actionShoot
+	if action := botRoute(snapshot, self, target, targetIsCreature); action != "" {
+		return action
 	}
-	if abs(targetX-self.X) >= abs(targetY-self.Y) {
-		return horizontalDirection(targetX - self.X)
+	return botFallbackAction(snapshot, self)
+}
+
+type botDirection struct {
+	action string
+	dx     int
+	dy     int
+}
+
+var botDirections = []botDirection{
+	{action: actionUp, dy: -1},
+	{action: actionLeft, dx: -1},
+	{action: actionDown, dy: 1},
+	{action: actionRight, dx: 1},
+}
+
+func alignedDirection(self creature, target tile) (string, bool) {
+	if self.Y == target.Y && self.X != target.X {
+		return horizontalDirection(target.X - self.X), true
 	}
-	return verticalDirection(targetY - self.Y)
+	if self.X == target.X && self.Y != target.Y {
+		return verticalDirection(target.Y - self.Y), true
+	}
+	return "", false
+}
+
+func botLineClear(snapshot arenaSnapshot, self creature, target tile) bool {
+	direction, aligned := alignedDirection(self, target)
+	if !aligned {
+		return false
+	}
+	dx, dy := directionVector(direction)
+	for x, y := self.X+dx, self.Y+dy; x != target.X || y != target.Y; x, y = x+dx, y+dy {
+		if snapshotHasWall(snapshot, x, y) {
+			return false
+		}
+	}
+	return true
+}
+
+func botRoute(snapshot arenaSnapshot, self creature, target tile, stopAdjacent bool) string {
+	type routeNode struct {
+		position tile
+		first    string
+	}
+	start := tile{X: self.X, Y: self.Y}
+	queue := []routeNode{{position: start}}
+	visited := map[tile]bool{start: true}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		distance := abs(current.position.X-target.X) + abs(current.position.Y-target.Y)
+		if (!stopAdjacent && distance == 0) || (stopAdjacent && distance == 1) {
+			return current.first
+		}
+		for _, direction := range botDirections {
+			next := tile{X: current.position.X + direction.dx, Y: current.position.Y + direction.dy}
+			if visited[next] || botCellBlocked(snapshot, next, self.ID) {
+				continue
+			}
+			visited[next] = true
+			first := current.first
+			if first == "" {
+				first = direction.action
+			}
+			queue = append(queue, routeNode{position: next, first: first})
+		}
+	}
+	return ""
+}
+
+func botFallbackAction(snapshot arenaSnapshot, self creature) string {
+	start := int(snapshot.Tick % uint64(len(botDirections)))
+	for offset := range len(botDirections) {
+		direction := botDirections[(start+offset)%len(botDirections)]
+		next := tile{X: self.X + direction.dx, Y: self.Y + direction.dy}
+		if !botCellBlocked(snapshot, next, self.ID) {
+			return direction.action
+		}
+	}
+	return ""
+}
+
+func botCellBlocked(snapshot arenaSnapshot, position tile, self string) bool {
+	if position.X <= 0 || position.Y <= 0 || position.X >= snapshot.Width-1 || position.Y >= snapshot.Height-1 {
+		return true
+	}
+	if snapshotHasWall(snapshot, position.X, position.Y) {
+		return true
+	}
+	for _, actor := range snapshot.Creatures {
+		if actor.ID != self && actor.X == position.X && actor.Y == position.Y {
+			return true
+		}
+	}
+	return false
+}
+
+func snapshotHasWall(snapshot arenaSnapshot, x, y int) bool {
+	for _, wall := range snapshot.Walls {
+		if wall.X == x && wall.Y == y {
+			return true
+		}
+	}
+	return false
 }
 
 func horizontalDirection(delta int) string {

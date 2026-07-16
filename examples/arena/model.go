@@ -277,8 +277,8 @@ func (w *world) snapshot(match, revision string) arenaSnapshot {
 	sort.Slice(creatures, func(i, j int) bool { return creatures[i].ID < creatures[j].ID })
 	return arenaSnapshot{
 		Match: match, Revision: revision, Tick: w.Tick, Width: w.Width, Height: w.Height,
-		Creatures: creatures, Projectiles: append([]projectile(nil), w.Projectiles...),
-		Powerups: append([]powerup(nil), w.Powerups...), Walls: append([]tile(nil), w.Walls...),
+		Creatures: creatures, Projectiles: append([]projectile{}, w.Projectiles...),
+		Powerups: append([]powerup{}, w.Powerups...), Walls: append([]tile{}, w.Walls...),
 	}
 }
 

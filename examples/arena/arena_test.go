@@ -92,6 +92,31 @@ func TestClientProtocolRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestServerSnapshotEncodesEmptyCollectionsAsArrays(t *testing.T) {
+	world := newWorld(7, 7, 1)
+	frame, err := encodeServerMessage(serverMessage{Type: "snapshot", Snapshot: world.snapshot("match.test", "revision")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, ok := frame.AsString()
+	if !ok {
+		t.Fatal("server frame is not text")
+	}
+	var message map[string]any
+	if err := json.Unmarshal([]byte(text), &message); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := message["snapshot"].(map[string]any)
+	if !ok {
+		t.Fatalf("snapshot = %#v, want object", message["snapshot"])
+	}
+	for _, field := range []string{"creatures", "projectiles", "powerups", "walls"} {
+		if _, ok := snapshot[field].([]any); !ok {
+			t.Errorf("snapshot.%s = %#v, want array", field, snapshot[field])
+		}
+	}
+}
+
 func TestPublishedMovementOnlyAffectsNewMatches(t *testing.T) {
 	ctx := context.Background()
 	clock := statecharts.NewManualClock(time.Unix(0, 0))
@@ -238,11 +263,38 @@ func TestBotObservesSnapshotsAndUsesPlayerProtocol(t *testing.T) {
 	if err := spawnBot(ctx, system, "bot.cyan", "match.bot", "#22d3ee"); err != nil {
 		t.Fatal(err)
 	}
-	waitForPlayer(t, frames, "bot.cyan", func(creature) bool { return true })
+	initial := waitForPlayer(t, frames, "bot.cyan", func(creature) bool { return true })
 	clock.Advance(100 * time.Millisecond)
 	bot := waitForPlayer(t, frames, "bot.cyan", func(c creature) bool { return c.LastSequence > 0 })
 	if bot.LastSequence != 1 {
 		t.Fatalf("bot sequence = %d, want 1", bot.LastSequence)
+	}
+	if bot.X == initial.X && bot.Y == initial.Y {
+		t.Fatalf("bot did not move from (%d,%d)", initial.X, initial.Y)
+	}
+}
+
+func TestBotMovesTowardPowerupInsteadOfShootingIt(t *testing.T) {
+	snapshot := arenaSnapshot{
+		Width: 7, Height: 7, Tick: 1,
+		Creatures: []creature{{ID: "bot", X: 2, Y: 2, Facing: directionRight, Connected: true}},
+		Powerups:  []powerup{{X: 3, Y: 2, Kind: "charge"}},
+	}
+	if action := chooseBotAction(snapshot, "bot"); action != actionRight {
+		t.Fatalf("action = %q, want %q toward powerup", action, actionRight)
+	}
+}
+
+func TestBotRoutesAroundWallBlockingDirectPath(t *testing.T) {
+	snapshot := arenaSnapshot{
+		Width: 7, Height: 7, Tick: 1,
+		Creatures: []creature{{ID: "bot", X: 2, Y: 2, Facing: directionRight, Connected: true}},
+		Powerups:  []powerup{{X: 4, Y: 2, Kind: "charge"}},
+		Walls:     []tile{{X: 3, Y: 2}},
+	}
+	action := chooseBotAction(snapshot, "bot")
+	if action != actionUp && action != actionDown {
+		t.Fatalf("action = %q, want a legal detour around wall", action)
 	}
 }
 
