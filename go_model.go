@@ -143,6 +143,11 @@ func (r GoActionRef) Do(args ...Expression) Executable {
 	return NewScriptExecutable(ScriptDefinition{Expr: r.Expression(args...)})
 }
 
+// Call returns this registered action as an explicit named call node.
+func (r GoActionRef) Call(args ...Expression) Executable {
+	return NewCallExecutable(CallDefinition{Function: r.Function(args...)})
+}
+
 // Get returns this registered value computation as a serializable expression.
 func (r GoValueRef) Get(args ...Expression) Expression { return r.Expression(args...) }
 

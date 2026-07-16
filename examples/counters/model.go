@@ -113,7 +113,7 @@ func requiredString(fields map[string]statecharts.Value, name string) (string, e
 // canonicalRoundTrip exercises the same definition transport path used by an
 // inspector or deployment store: JSON contains refs, while behavior remains
 // in the appropriately scoped model registry.
-func canonicalRoundTrip(chart *statecharts.Chart, model statecharts.Datamodel) (*statecharts.Chart, error) {
+func canonicalRoundTrip(chart *statecharts.Chart) (*statecharts.Chart, error) {
 	wire, err := statejson.Marshal(chart.Definition())
 	if err != nil {
 		return nil, fmt.Errorf("marshal canonical definition: %w", err)
@@ -122,7 +122,7 @@ func canonicalRoundTrip(chart *statecharts.Chart, model statecharts.Datamodel) (
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal canonical definition: %w", err)
 	}
-	recompiled, err := statecharts.Compile(definition, model)
+	recompiled, err := statecharts.Compile(definition, chart.Datamodel())
 	if err != nil {
 		return nil, fmt.Errorf("recompile canonical definition: %w", err)
 	}
@@ -223,10 +223,10 @@ const (
 )
 
 func buildCounterChart() (*statecharts.Chart, error) {
-	model := statecharts.NewGoModel(func() *counterModel {
+	counter := statecharts.New(counterKind, func() *counterModel {
 		return &counterModel{Processed: make(map[statecharts.Identifier]bool)}
-	})
-	publish, err := model.Action("counters.counter.publish-projection", "v1", func(d *counterModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	}, statecharts.Version("v1"))
+	publish := counter.Action("publish-projection", func(d *counterModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		name := ec.SessionID()
 		color, ok := counterColor(name)
 		if !ok {
@@ -235,11 +235,8 @@ func buildCounterChart() (*statecharts.Chart, error) {
 		ec.Send("projection", statecharts.SendOptions{Target: "hub@ui", Data: encodeProjection(projection{Name: name, Color: color, Value: d.Value})})
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	registerIncrement := func(version string, delta int) (statecharts.GoActionRef, error) {
-		return model.Action("counters.counter.apply-idempotent-increment", version, func(d *counterModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	registerIncrement := func(version string, delta int) statecharts.GoActionRef {
+		return counter.ActionVersion("apply-idempotent-increment", version, func(d *counterModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 			ev, _ := ec.Event()
 			fields, err := taggedFields(ev.Data, incrementValueTag)
 			if err != nil {
@@ -260,20 +257,15 @@ func buildCounterChart() (*statecharts.Chart, error) {
 			return nil
 		})
 	}
-	increment, err := registerIncrement("v1", 1)
+	increment := registerIncrement("v1", 1)
+	registerIncrement("v2", 2)
+	chart, err := counter.Build(statecharts.Atomic(counterKind,
+		statecharts.On("increment", statecharts.Then(increment.Call(), publish.Do())),
+		statecharts.On("publish", statecharts.Then(publish.Do()))))
 	if err != nil {
 		return nil, err
 	}
-	if _, err := registerIncrement("v2", 2); err != nil {
-		return nil, err
-	}
-	chart, err := statecharts.Build(statecharts.Atomic(counterKind,
-		statecharts.On("increment", statecharts.Then(statecharts.NewCallExecutable(statecharts.CallDefinition{Function: increment.Function()}), publish.Do())),
-		statecharts.On("publish", statecharts.Then(publish.Do()))), model, statecharts.WithRevisionSalt("counter-v1"))
-	if err != nil {
-		return nil, err
-	}
-	return canonicalRoundTrip(chart, model)
+	return canonicalRoundTrip(chart)
 }
 
 func counterColor(actorID string) (string, bool) {
@@ -319,10 +311,10 @@ func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 			ec.Send("snapshot", statecharts.SendOptions{Target: target, Data: encodeProjections(hubSnapshot(d, selected))})
 		}
 	}
-	model := statecharts.NewGoModel(func() *hubModel {
+	hub := statecharts.New(hubKind, func() *hubModel {
 		return &hubModel{Values: map[string]projection{}, Residencies: map[string]string{}, Revisions: map[string]string{}, Subscribers: map[statecharts.Identifier][]string{}}
-	})
-	projectionAction, err := model.Action("counters.hub.accept-projection", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	}, statecharts.Version("v1"))
+	projectionAction := hub.Action("accept-projection", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		p, err := decodeProjection(ev.Data)
 		if err != nil {
@@ -332,10 +324,7 @@ func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 		notify(d, ec)
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	revisionAction, err := model.Action("counters.hub.accept-revision", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	revisionAction := hub.Action("accept-revision", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		fields, err := taggedFields(ev.Data, revisionValueTag)
 		if err != nil {
@@ -353,10 +342,7 @@ func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 		notify(d, ec)
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	residencyAction, err := model.Action("counters.hub.accept-residency", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	residencyAction := hub.Action("accept-residency", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		fields, err := taggedFields(ev.Data, residencyValueTag)
 		if err != nil {
@@ -374,10 +360,7 @@ func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 		notify(d, ec)
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	subscribeAction, err := model.Action("counters.hub.subscribe-stream", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	subscribeAction := hub.Action("subscribe-stream", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		fields, err := taggedFields(ev.Data, subscriptionValueTag)
 		if err != nil {
@@ -396,10 +379,7 @@ func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 		ec.Send("snapshot", statecharts.SendOptions{Target: sub.Target, Data: encodeProjections(hubSnapshot(d, sub.Colors))})
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	unsubscribeAction, err := model.Action("counters.hub.unsubscribe-stream", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	unsubscribeAction := hub.Action("unsubscribe-stream", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		target, ok := ev.Data.AsString()
 		if !ok {
@@ -408,10 +388,7 @@ func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 		delete(d.Subscribers, statecharts.Identifier(target))
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	queryAction, err := model.Action("counters.hub.answer-runtime-query", "v1", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	queryAction := hub.Action("answer-runtime-query", func(d *hubModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		fields, err := taggedFields(ev.Data, hubQueryValueTag)
 		if err != nil {
@@ -428,21 +405,18 @@ func buildHubChart(requests *hubRequestRegistry) (*statecharts.Chart, error) {
 		q.reply <- hubSnapshot(d, q.colors)
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	chart, err := statecharts.Build(statecharts.Atomic(hubKind,
+	chart, err := hub.Build(statecharts.Atomic(hubKind,
 		statecharts.On("projection", statecharts.Then(projectionAction.Do())),
 		statecharts.On("residency", statecharts.Then(residencyAction.Do())),
 		statecharts.On("revision", statecharts.Then(revisionAction.Do())),
 		statecharts.On("subscribe", statecharts.Then(subscribeAction.Do())),
 		statecharts.On("unsubscribe", statecharts.Then(unsubscribeAction.Do())),
 		statecharts.On("query", statecharts.Then(queryAction.Do())),
-	), model, statecharts.WithRevisionSalt("projection-hub-v1"))
+	))
 	if err != nil {
 		return nil, err
 	}
-	return canonicalRoundTrip(chart, model)
+	return canonicalRoundTrip(chart)
 }
 
 type streamStart struct {
@@ -458,8 +432,8 @@ type streamModel struct {
 }
 
 func buildStreamChart() (*statecharts.Chart, error) {
-	model := statecharts.NewGoModel(func() *streamModel { return &streamModel{} })
-	start, err := model.Action("counters.stream.start-subscription", "v1", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	stream := statecharts.New(streamKind, func() *streamModel { return &streamModel{} }, statecharts.Version("v1"))
+	start := stream.Action("start-subscription", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		fields, err := taggedFields(ev.Data, streamStartValueTag)
 		if err != nil {
@@ -483,10 +457,7 @@ func buildStreamChart() (*statecharts.Chart, error) {
 		ec.Send("keepalive", statecharts.SendOptions{Delay: 15 * time.Second})
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	emit, err := model.Action("counters.stream.emit-snapshot", "v1", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	emit := stream.Action("emit-snapshot", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ev, _ := ec.Event()
 		ps, err := decodeProjections(ev.Data)
 		if err != nil {
@@ -506,31 +477,22 @@ func buildStreamChart() (*statecharts.Chart, error) {
 		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: stringValue(frame)})
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	keepalive, err := model.Action("counters.stream.emit-keepalive", "v1", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	keepalive := stream.Action("emit-keepalive", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ec.Send("frame", statecharts.SendOptions{Target: d.Output, Type: streamIOProcessor, Data: stringValue(": keepalive\n\n")})
 		ec.Send("keepalive", statecharts.SendOptions{Delay: 15 * time.Second})
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	closeStream, err := model.Action("counters.stream.close-subscription", "v1", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	closeStream := stream.Action("close-subscription", func(d *streamModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		ec.Send("unsubscribe", statecharts.SendOptions{Target: "hub", Data: stringValue(ec.SessionID())})
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	chart, err := statecharts.Build(statecharts.Compound(streamKind, "open", statecharts.Children(
+	chart, err := stream.Build(statecharts.Compound(streamKind, "open", statecharts.Children(
 		statecharts.Atomic("open", statecharts.On("start", statecharts.Then(start.Do())), statecharts.On("snapshot", statecharts.Then(emit.Do())), statecharts.On("keepalive", statecharts.Then(keepalive.Do())), statecharts.On("close", statecharts.Target("closed"), statecharts.Then(closeStream.Do()))),
 		statecharts.Final("closed"),
 	),
-	), model, statecharts.WithRevisionSalt("sse-stream-v1"))
+	))
 	if err != nil {
 		return nil, err
 	}
-	return canonicalRoundTrip(chart, model)
+	return canonicalRoundTrip(chart)
 }

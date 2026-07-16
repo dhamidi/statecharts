@@ -8,11 +8,14 @@
 // can be encoded, edited, decoded, and compiled through exactly the same path.
 // Chart.Definition always returns an independently editable deep copy.
 //
-// GoModel is the default datamodel. Applications register typed actions,
-// conditions, value producers, and locations under explicit names and
-// versions. Builder nodes store those stable references rather than Go
-// function values, making the complete definition deterministic and
-// inspectable while each running Instance still owns ordinary typed Go data.
+// New is the default Go authoring path. It combines ordinary typed Go state
+// with a chart-local behavior registry, qualifies short action, condition,
+// value, and location names under the chart ID, and compiles through the same
+// syntax-neutral Definition path as every other datamodel. Definitions store
+// stable names and versions rather than Go function values, making them
+// deterministic and inspectable while each running Instance still owns
+// ordinary typed Go data. NewGoModel and package-level Build expose the
+// underlying registry and compiler directly when an application needs them.
 // Compile derives Chart.Revision from a versioned canonical definition,
 // datamodel identity, and deterministic program fingerprint; snapshots and
 // durable outbound identities are scoped to that revision.

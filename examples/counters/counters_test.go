@@ -60,7 +60,7 @@ func setIncrementVersion(t *testing.T, definition *statecharts.Definition, versi
 	for _, transition := range definition.Root.Transitions {
 		for _, block := range transition.Actions {
 			for _, executable := range block {
-				if executable.Call != nil && executable.Call.Function.Name == "counters.counter.apply-idempotent-increment" {
+				if executable.Call != nil && executable.Call.Function.Name == "counter.apply-idempotent-increment" {
 					executable.Call.Function.Version = version
 					return
 				}
@@ -75,7 +75,7 @@ func incrementVersion(t *testing.T, definition statecharts.Definition) string {
 	for _, transition := range definition.Root.Transitions {
 		for _, block := range transition.Actions {
 			for _, executable := range block {
-				if executable.Call != nil && executable.Call.Function.Name == "counters.counter.apply-idempotent-increment" {
+				if executable.Call != nil && executable.Call.Function.Name == "counter.apply-idempotent-increment" {
 					return executable.Call.Function.Version
 				}
 			}
@@ -314,7 +314,7 @@ func TestServerUIIncrementEndpointUpdatesCounter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode canonical definition: %v", err)
 	}
-	if definition.ID != counterKind || !strings.Contains(definitionResponse.Body.String(), "counters.counter.apply-idempotent-increment") || strings.Contains(definitionResponse.Body.String(), "func(") {
+	if definition.ID != counterKind || !strings.Contains(definitionResponse.Body.String(), "counter.apply-idempotent-increment") || strings.Contains(definitionResponse.Body.String(), "func(") {
 		t.Fatalf("counter definition is not stable and inspectable: %s", definitionResponse.Body.String())
 	}
 

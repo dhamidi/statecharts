@@ -31,12 +31,12 @@ actors emit bytes through the custom `"sse"` IOProcessor type. HTTP handlers
 only attach and drain transport channels rather than reading shared actor
 state to manufacture updates.
 
-Every chart uses its own typed `GoModel[D]`. Application behavior is registered
-under explicit, versioned names and chart nodes contain only serializable
-references to those registrations; runtime transports, channels, callbacks,
-and log storage are not part of snapshot data. Each of the seven dashboard
-cards displays its actor's pinned chart revision in addition to residency and
-value; `GET /actors` reports pins for every actor, including canaries.
+Every chart uses `statecharts.New` with ordinary typed Go state. Short behavior
+names are scoped to that chart and chart nodes contain only serializable,
+versioned references to them; runtime transports, channels, callbacks, and log
+storage are not part of snapshot data. Each of the seven dashboard cards
+displays its actor's pinned chart revision in addition to residency and value;
+`GET /actors` reports pins for every actor, including canaries.
 
 ## Inspect, edit, and publish
 
@@ -54,13 +54,13 @@ curl -s http://127.0.0.1:8080/definitions/counter > counter-v1.json
 ```
 
 The server has both `v1` (+1) and `v2` (+2) implementations of
-`counters.counter.apply-idempotent-increment` in its Go model registry. The
+`counter.apply-idempotent-increment` in its chart-local Go registry. The
 initial Go definition references `v1`. Edit that reference as ordinary data
 and give the chart revision an operator-visible salt:
 
 ```sh
 jq '(.root.transitions[].actions[][] |
-     select(.call.function.name? == "counters.counter.apply-idempotent-increment") |
+     select(.call.function.name? == "counter.apply-idempotent-increment") |
      .call.function.version) = "v2" |
     .revisionSalt = "counter-v2"' \
   counter-v1.json > counter-v2.json

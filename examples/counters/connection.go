@@ -29,9 +29,11 @@ type connectionActor struct {
 
 func newConnectionActor(ctx context.Context, changed func(string)) (*connectionActor, error) {
 	statusValue := &connectionStatus{value: "connecting"}
-	model := statecharts.NewGoModel(func() *connectionModel { return &connectionModel{Status: "connecting"} })
-	set := func(name, status string) (statecharts.GoActionRef, error) {
-		return model.Action(statecharts.Identifier("counters.connection.enter-"+name), "v1", func(d *connectionModel, _ statecharts.ExecContext, _ []statecharts.Value) error {
+	connection := statecharts.New(connectionKind, func() *connectionModel {
+		return &connectionModel{Status: "connecting"}
+	}, statecharts.Version("v1"))
+	set := func(name, status string) statecharts.GoActionRef {
+		return connection.Action("enter-"+name, func(d *connectionModel, _ statecharts.ExecContext, _ []statecharts.Value) error {
 			d.Status = status
 			statusValue.set(status)
 			if changed != nil {
@@ -40,28 +42,19 @@ func newConnectionActor(ctx context.Context, changed func(string)) (*connectionA
 			return nil
 		})
 	}
-	connecting, err := set("connecting", "connecting")
-	if err != nil {
-		return nil, err
-	}
-	connected, err := set("connected", "connected")
-	if err != nil {
-		return nil, err
-	}
-	reconnecting, err := set("reconnecting", "reconnecting")
-	if err != nil {
-		return nil, err
-	}
-	chart, err := statecharts.Build(
+	connecting := set("connecting", "connecting")
+	connected := set("connected", "connected")
+	reconnecting := set("reconnecting", "reconnecting")
+	chart, err := connection.Build(
 		statecharts.Compound(connectionKind, "connecting", statecharts.Children(
 			statecharts.Atomic("connecting", statecharts.OnEntry(connecting.Do()), statecharts.On("success", statecharts.Target("connected")), statecharts.On("failure", statecharts.Target("reconnecting"))),
 			statecharts.Atomic("connected", statecharts.OnEntry(connected.Do()), statecharts.On("failure", statecharts.Target("reconnecting"))),
 			statecharts.Atomic("reconnecting", statecharts.OnEntry(reconnecting.Do()), statecharts.On("success", statecharts.Target("connected"))),
-		)), model, statecharts.WithRevisionSalt("connection-v1"))
+		)))
 	if err != nil {
 		return nil, err
 	}
-	chart, err = canonicalRoundTrip(chart, model)
+	chart, err = canonicalRoundTrip(chart)
 	if err != nil {
 		return nil, err
 	}

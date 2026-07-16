@@ -18,8 +18,7 @@ go get github.com/dhamidi/statecharts
 
 ## Quickstart
 
-Create a typed model, register behavior by stable application name and
-version, build a chart, and start an instance:
+Create a typed model, name its behavior, build a chart, and start an instance:
 
 ```go
 package main
@@ -37,19 +36,16 @@ type Door struct {
 }
 
 func main() {
-	model := statecharts.NewGoModel(func() *Door { return &Door{} })
-	recordOpen, err := model.Action(
-		"example.door.record-open", "v1",
+	door := statecharts.New("door", func() *Door { return &Door{} }, statecharts.Version("v1"))
+	recordOpen := door.Action(
+		"record-open",
 		func(door *Door, _ statecharts.ExecContext, _ []statecharts.Value) error {
 			door.OpenCount++
 			return nil
 		},
 	)
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	chart, err := statecharts.Build(
+	chart, err := door.Build(
 		statecharts.Compound("door", "closed",
 			statecharts.Children(
 				statecharts.Atomic("closed",
@@ -60,7 +56,6 @@ func main() {
 				),
 			),
 		),
-		model,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -109,28 +104,29 @@ isolated datamodel session and interpreter.
 State and event IDs use `Identifier`. Dots express hierarchy in application
 names, for example `orders.invoice-42`; they do not imply a network location.
 
-### GoModel and stable function references
+### Go authoring and stable function references
 
-`GoModel[D]` is the default datamodel. It combines a factory for ordinary Go
-state with a model-scoped registry:
+`New` is the default authoring path. It combines a factory for ordinary Go
+state with a model-scoped behavior registry, qualifies short behavior names
+under the chart ID, and reports any registration errors from `Build`:
 
 ```go
 type Job struct {
 	Attempts int
 }
 
-model := statecharts.NewGoModel(func() *Job { return &Job{} })
+job := statecharts.New("job", func() *Job { return &Job{} }, statecharts.Version("v1"))
 
-retry, err := model.Condition(
-	"billing.job.can-retry", "v1",
+retry := job.Condition(
+	"can-retry",
 	func(job *Job, _ statecharts.ExecContext, args []statecharts.Value) (bool, error) {
 		limit, ok := args[0].AsInt64()
 		return ok && int64(job.Attempts) < limit, nil
 	},
 )
 
-record, err := model.Action(
-	"billing.job.record-attempt", "v1",
+record := job.Action(
+	"record-attempt",
 	func(job *Job, _ statecharts.ExecContext, args []statecharts.Value) error {
 		amount, _ := args[0].AsInt64()
 		job.Attempts += int(amount)
@@ -145,24 +141,32 @@ working := statecharts.Atomic("working",
 		statecharts.Then(record.Do(statecharts.GoLiteral(statecharts.Int64Value(1)))),
 	),
 )
+
+chart, err := job.Build(working)
 ```
 
 The definition stores the names, versions, and canonical arguments, not Go
 function values. Compilation resolves those references against the supplied
-registry. This gives application authors a simple convention:
+registry. `record-attempt` is stored as `job.record-attempt`, and both
+behaviors use the builder's `v1` version. This gives application authors a
+simple convention:
 
-- use a package- or domain-qualified descriptive name such as
-  `billing.job.record-attempt`;
-- use a non-empty semantic implementation version such as `v1`;
-- bump the function version when that named operation changes meaning;
-- use `WithRevisionSalt` when chart behavior changes without changing a
-  referenced function version.
+- give each behavior a short, descriptive name within its chart;
+- bump `Version` when the chart's Go behavior changes;
+- use `ActionVersion`, `ConditionVersion`, `ValueVersion`, or
+  `LocationVersion` to retain an older implementation while revision-pinned
+  actors still use it. Keep every version referenced by a retained definition
+  registered until those actors have terminated.
 
 Registries are deliberately model scoped. There is no global concrete-type or
 function registry, and generated closure names never enter definitions.
 
-Besides `Action` and `Condition`, a model can register a `Value` producer or a
-readable/writable `Location`. References accept expression arguments, so a
+`NewGoModel` and the package-level `Build` remain available when direct
+registry control is useful. Custom datamodels always use package-level
+`Build(root, model)`.
+
+Besides `Action` and `Condition`, a builder can register a `Value` producer or
+a readable/writable `Location`. References accept expression arguments, so a
 single registration can be reused at many definition sites without captured
 parameter closures. `GoLiteral` supplies canonical constants and `GoData`
 addresses declared definition data.

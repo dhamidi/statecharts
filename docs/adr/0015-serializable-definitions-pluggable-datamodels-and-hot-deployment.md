@@ -90,46 +90,44 @@ The names `Definition` and `Chart` are deliberate:
 - Surface encodings are adapters around `Definition`, not architectural
   centers of the interpreter.
 
-The ordinary Go API remains close to the current builder experience. The
-following is illustrative; exact constructor names may change during
-implementation:
+The ordinary Go API keeps datamodel plumbing and globally qualified behavior
+names out of the common path:
 
 ```go
 type Counter struct {
 	Value int
 }
 
-model := statecharts.NewGoModel(func() *Counter {
+counter := statecharts.New("counter", func() *Counter {
 	return &Counter{}
-})
+}, statecharts.Version("v1"))
 
-increment := model.Action(
-	"increment", "v1",
+increment := counter.Action(
+	"increment",
 	func(c *Counter, ec statecharts.ExecContext, args []statecharts.Value) error {
 		c.Value++
 		return nil
 	},
 )
 
-belowLimit := model.Condition(
-	"below-limit", "v1",
+belowLimit := counter.Condition(
+	"below-limit",
 	func(c *Counter, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
 		return c.Value < 100, nil
 	},
 )
 
-chart, err := statecharts.Build(
+chart, err := counter.Build(
 	statecharts.Compound("counter", "ready",
 		statecharts.Children(
 			statecharts.Atomic("ready",
 				statecharts.On("increment",
-					statecharts.If(belowLimit),
-					statecharts.Then(increment),
+					statecharts.If(belowLimit.If()),
+					statecharts.Then(increment.Do()),
 				),
 			),
 		),
 	),
-	statecharts.WithDatamodel(model),
 )
 ```
 
