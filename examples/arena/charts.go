@@ -28,10 +28,8 @@ type matchModel struct {
 
 func buildMatchChart(tickInterval time.Duration) (*statecharts.Chart, error) {
 	match := statecharts.New(matchKind, func() *matchModel {
-		world := newWorld(19, 13, 0x5eed)
-		world.Powerups = []powerup{{X: 5, Y: 3, Kind: "charge"}, {X: 13, Y: 9, Kind: "charge"}}
-		return &matchModel{World: world, Subscribers: map[string]bool{}, Leases: map[string]string{}}
-	}, statecharts.Version("v1"))
+		return &matchModel{World: newDefaultWorld(), Subscribers: map[string]bool{}, Leases: map[string]string{}}
+	}, statecharts.Version("v2"))
 
 	publish := func(data *matchModel, ec statecharts.ExecContext) error {
 		snapshot, err := taggedStruct(snapshotTag, data.World.snapshot(data.Match, data.Revision))
@@ -180,7 +178,7 @@ type connectionModel struct {
 }
 
 func buildConnectionChart() (*statecharts.Chart, error) {
-	connection := statecharts.New(connectionKind, func() *connectionModel { return &connectionModel{} }, statecharts.Version("v1"))
+	connection := statecharts.New(connectionKind, func() *connectionModel { return &connectionModel{} }, statecharts.Version("v2"))
 	start := connection.Action("start", func(data *connectionModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		event, _ := ec.Event()
 		var config connectionConfig
@@ -280,17 +278,19 @@ type botReferences struct {
 	move             statecharts.GoActionRef
 	moveToward       statecharts.GoActionRef
 	shoot            statecharts.GoActionRef
+	reload           statecharts.GoActionRef
 	wander           statecharts.GoActionRef
 	targetExists     statecharts.GoConditionRef
 	targetWithin     statecharts.GoConditionRef
 	opponentInSights statecharts.GoConditionRef
+	weaponEmpty      statecharts.GoConditionRef
 	healthBelow      statecharts.GoConditionRef
 	powerAtLeast     statecharts.GoConditionRef
 	tickEvery        statecharts.GoConditionRef
 }
 
 func newBotBuilder() (*statecharts.Builder[botModel], botReferences) {
-	bot := statecharts.New(botKind, func() *botModel { return &botModel{} }, statecharts.Version("v1"))
+	bot := statecharts.New(botKind, func() *botModel { return &botModel{} }, statecharts.Version("v2"))
 	refs := botReferences{}
 	refs.start = bot.Action("start", func(data *botModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		event, _ := ec.Event()
@@ -344,6 +344,12 @@ func newBotBuilder() (*statecharts.Builder[botModel], botReferences) {
 			return fmt.Errorf("bot shoot takes no arguments")
 		}
 		return emitBotAction(data, ec, actionShoot)
+	})
+	refs.reload = bot.Action("reload", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) error {
+		if len(args) != 0 {
+			return fmt.Errorf("bot reload takes no arguments")
+		}
+		return emitBotAction(data, ec, actionReload)
 	})
 	refs.wander = bot.Action("wander", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) error {
 		if len(args) != 0 {
@@ -413,6 +419,13 @@ func newBotBuilder() (*statecharts.Builder[botModel], botReferences) {
 		}
 		return false, nil
 	})
+	refs.weaponEmpty = bot.Condition("weapon-empty", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
+		if len(args) != 0 {
+			return false, fmt.Errorf("bot weapon-empty takes no arguments")
+		}
+		_, self, err := botSnapshot(data, ec)
+		return err == nil && !self.Loaded, err
+	})
 	refs.healthBelow = bot.Condition("health-below", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
 		if len(args) != 1 {
 			return false, fmt.Errorf("bot health-below requires one health argument")
@@ -471,6 +484,7 @@ func buildBotChart() (*statecharts.Chart, error) {
 	return bot.Build(statecharts.Compound(botKind, "active", statecharts.Children(
 		statecharts.Atomic("active",
 			statecharts.On("bot.start", statecharts.Then(refs.start.Call())),
+			statecharts.On("match.snapshot", statecharts.If(refs.weaponEmpty.If()), statecharts.Then(refs.reload.Call())),
 			statecharts.On("match.snapshot", statecharts.If(refs.opponentInSights.If(statecharts.GoLiteral(statecharts.Int64Value(8)))), statecharts.Then(refs.shoot.Call())),
 			statecharts.On("match.snapshot", statecharts.If(refs.tickEvery.If(statecharts.GoLiteral(statecharts.Int64Value(8)))), statecharts.Then(refs.move.Call(statecharts.GoLiteral(right)))),
 			statecharts.On("match.snapshot", statecharts.If(refs.powerAtLeast.If(statecharts.GoLiteral(statecharts.Int64Value(1)))), statecharts.Then(refs.moveToward.Call(statecharts.GoLiteral(opponent)))),

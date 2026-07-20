@@ -68,7 +68,7 @@
             const actor = document.createElement('div');
             actor.className = `creature${creature.id === this._player ? ' me' : ''}${creature.connected ? '' : ' offline'}`;
             actor.style.background = creature.color;
-            actor.title = `${creature.name} · ${creature.health} HP · ${creature.score} points`;
+            actor.title = `${creature.name} · ${creature.health} HP · ${creature.score} points · ${creature.loaded ? 'weapon ready' : 'reload required'}`;
             actor.textContent = creature.bot ? 'AI' : creature.name.slice(0, 2).toUpperCase();
             const facing = document.createElement('span'); facing.className = `facing ${creature.facing}`; actor.append(facing);
             cell.append(actor);
@@ -103,7 +103,7 @@
           const row = table.insertRow(); if (actor.id === this._player) row.className = 'me';
           const name = row.insertCell();
           const swatch = document.createElement('span'); swatch.className = 'swatch'; swatch.style.background = actor.color; name.append(swatch, actor.name);
-          const health = row.insertCell(); health.className = 'muted number'; health.textContent = actor.connected ? `${actor.health} HP` : 'REJOINING';
+          const health = row.insertCell(); health.className = 'muted number'; health.textContent = actor.connected ? `${actor.health} HP / ${actor.loaded ? 'READY' : 'EMPTY'}` : 'REJOINING';
           const score = row.insertCell(); score.className = 'number'; score.textContent = actor.score;
         }
         this.shadowRoot.append(table);
@@ -112,12 +112,21 @@
     customElements.define('arena-scoreboard', ArenaScoreboard);
 
     class ArenaControls extends HTMLElement {
+      set loaded(value) { this._loaded = value; this.sync(); }
       connectedCallback() {
-        this.innerHTML = `<button data-action="up">W</button><button data-action="left">A</button><button data-action="down">S</button><button data-action="right">D</button><button class="shoot" data-action="shoot">SPACE / FIRE</button>`;
+        this.innerHTML = `<button data-action="up">W</button><button data-action="left">A</button><button data-action="down">S</button><button data-action="right">D</button><button class="shoot" data-action="shoot">SPACE / FIRE</button><button class="reload" data-action="reload">R / RELOAD</button>`;
         this.addEventListener('click', event => {
           const button = event.target.closest('button[data-action]');
           if (button) this.dispatchEvent(new CustomEvent('arena-input', {bubbles: true, detail: button.dataset.action}));
         });
+        this.sync();
+      }
+      sync() {
+        const shoot = this.querySelector('[data-action="shoot"]');
+        const reload = this.querySelector('[data-action="reload"]');
+        if (!shoot || !reload) return;
+        shoot.disabled = this._loaded !== true;
+        reload.disabled = this._loaded !== false;
       }
     }
     customElements.define('arena-controls', ArenaControls);
@@ -131,7 +140,7 @@
         this.match = new URLSearchParams(location.search).get('match') || 'match.main';
         this.onKey = event => {
           if (event.target.matches('input, textarea')) return;
-          const action = ({w:'up', a:'left', s:'down', d:'right', ' ':'shoot'})[event.key.toLowerCase()];
+          const action = ({w:'up', a:'left', s:'down', d:'right', ' ':'shoot', r:'reload'})[event.key.toLowerCase()];
           if (action) { event.preventDefault(); this.send(action); }
         };
       }
@@ -152,7 +161,9 @@
           arena-controls { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; border: 1px solid #475569; background: #475569; }
           arena-controls button { min-height: 42px; border: 0; background: #172033; color: #e2e8f0; cursor: pointer; font: 800 12px/1 ui-monospace, monospace; }
           arena-controls button:hover { background: #22d3ee; color: #020617; }
-          arena-controls .shoot { grid-column: 1 / -1; background: #be123c; }
+          arena-controls button:disabled { background: #111827; color: #475569; cursor: not-allowed; }
+          arena-controls .shoot { grid-column: span 2; background: #be123c; }
+          arena-controls .reload { grid-column: span 2; background: #a16207; }
           .notes { color: #64748b; font: 11px/1.55 ui-monospace, monospace; }
           .notes strong { color: #cbd5e1; }
           @media (max-width: 880px) { arena-game { padding: 14px; } .layout { grid-template-columns: minmax(0, 1fr); } header { align-items: flex-start; flex-direction: column; } }
@@ -162,9 +173,9 @@
           <div class="metric"><label>MATCH / TICK</label><output id="tick">${this.match} / —</output></div>
           <div class="metric"><label>PINNED DEFINITION</label><output id="revision">—</output></div>
           <arena-scoreboard></arena-scoreboard><arena-controls></arena-controls>
-          <div class="notes"><strong>WASD</strong> moves. <strong>SPACE</strong> fires. Yellow diamonds increase projectile damage. The browser never predicts movement; every frame is an authoritative snapshot routed from the match actor through your connection actor and the WebSocket I/O processor.</div>
+          <div class="notes"><strong>WASD</strong> moves. <strong>SPACE</strong> fires once; <strong>R</strong> explicitly reloads. Yellow diamonds increase projectile damage. The browser never predicts movement; every frame is an authoritative snapshot routed from the match actor through your connection actor and the WebSocket I/O processor.</div>
         </aside></main>`;
-        this.status = this.querySelector('arena-connection'); this.board = this.querySelector('arena-board'); this.scores = this.querySelector('arena-scoreboard');
+        this.status = this.querySelector('arena-connection'); this.board = this.querySelector('arena-board'); this.scores = this.querySelector('arena-scoreboard'); this.controls = this.querySelector('arena-controls');
         this.addEventListener('arena-input', event => this.send(event.detail));
         addEventListener('keydown', this.onKey); this.connect();
       }
@@ -183,6 +194,8 @@
       }
       send(action) {
         if (this.socket?.readyState !== WebSocket.OPEN) return;
+        const me = this.snapshot?.creatures.find(actor => actor.id === this.player);
+        if ((action === 'shoot' && me?.loaded !== true) || (action === 'reload' && me?.loaded !== false)) return;
         this.socket.send(JSON.stringify({v: 1, type: 'input', seq: ++this.sequence, action}));
       }
       render(snapshot) {
@@ -191,6 +204,7 @@
         if (me) this.sequence = Math.max(this.sequence, me.last_sequence);
         this.board.player = this.player; this.board.snapshot = snapshot;
         this.scores.player = this.player; this.scores.snapshot = snapshot;
+        this.controls.loaded = me?.loaded;
         this.querySelector('#tick').textContent = `${snapshot.match} / ${snapshot.tick}`;
         this.querySelector('#revision').textContent = snapshot.revision;
       }

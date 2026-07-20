@@ -20,8 +20,8 @@ import (
 func TestArenaMechanicsAreDeterministicAndRejectStaleInput(t *testing.T) {
 	world := newWorld(11, 9, 42)
 	world.Creatures = map[string]creature{
-		"red":  {ID: "red", X: 2, Y: 2, Facing: directionRight, Health: 3},
-		"blue": {ID: "blue", X: 5, Y: 2, Facing: directionLeft, Health: 3},
+		"red":  {ID: "red", X: 2, Y: 2, Facing: directionRight, Health: 3, Loaded: true},
+		"blue": {ID: "blue", X: 5, Y: 2, Facing: directionLeft, Health: 3, Loaded: true},
 	}
 	world.Powerups = []powerup{{X: 3, Y: 2, Kind: "charge"}}
 
@@ -59,8 +59,8 @@ func TestArenaMechanicsAreDeterministicAndRejectStaleInput(t *testing.T) {
 func TestProjectileHitsAdjacentCreatureOnNextTick(t *testing.T) {
 	world := newWorld(11, 9, 42)
 	world.Creatures = map[string]creature{
-		"red":  {ID: "red", X: 2, Y: 2, Facing: directionRight, Health: 3},
-		"blue": {ID: "blue", X: 3, Y: 2, Facing: directionLeft, Health: 3},
+		"red":  {ID: "red", X: 2, Y: 2, Facing: directionRight, Health: 3, Loaded: true},
+		"blue": {ID: "blue", X: 3, Y: 2, Facing: directionLeft, Health: 3, Loaded: true},
 	}
 	if changed := world.applyInput(playerInput{Player: "red", Sequence: 1, Action: actionShoot}, 1); !changed {
 		t.Fatal("shot was not applied")
@@ -71,6 +71,93 @@ func TestProjectileHitsAdjacentCreatureOnNextTick(t *testing.T) {
 	}
 	if len(world.Projectiles) != 0 {
 		t.Fatalf("projectile survived adjacent collision: %+v", world.Projectiles)
+	}
+}
+
+func TestWeaponRequiresExplicitReloadBetweenShots(t *testing.T) {
+	world := newWorld(11, 9, 42)
+	world.Creatures = map[string]creature{
+		"red": {ID: "red", X: 2, Y: 2, Facing: directionRight, Health: 3, Loaded: true},
+	}
+	if changed := world.applyInput(playerInput{Player: "red", Sequence: 1, Action: actionShoot}, 1); !changed {
+		t.Fatal("first shot was not applied")
+	}
+	if actor := world.Creatures["red"]; actor.Loaded {
+		t.Fatal("weapon remained loaded after firing")
+	}
+	if changed := world.applyInput(playerInput{Player: "red", Sequence: 2, Action: actionShoot}, 1); !changed {
+		t.Fatal("suppressed shot did not consume its authoritative sequence")
+	}
+	if len(world.Projectiles) != 1 {
+		t.Fatalf("projectiles after spam = %d, want 1", len(world.Projectiles))
+	}
+	if sequence := world.Creatures["red"].LastSequence; sequence != 2 {
+		t.Fatalf("sequence after suppressed shot = %d, want 2", sequence)
+	}
+	if changed := world.applyInput(playerInput{Player: "red", Sequence: 3, Action: actionReload}, 1); !changed {
+		t.Fatal("reload was not applied")
+	}
+	if actor := world.Creatures["red"]; !actor.Loaded {
+		t.Fatal("weapon remained empty after reload")
+	}
+	if changed := world.applyInput(playerInput{Player: "red", Sequence: 2, Action: actionShoot}, 1); changed {
+		t.Fatal("suppressed shot sequence was reusable after reload")
+	}
+	if changed := world.applyInput(playerInput{Player: "red", Sequence: 4, Action: actionShoot}, 1); !changed {
+		t.Fatal("shot after reload was not applied")
+	}
+	if len(world.Projectiles) != 2 {
+		t.Fatalf("projectiles after reload = %d, want 2", len(world.Projectiles))
+	}
+}
+
+func TestDefaultArenaIsExpandedAndSlower(t *testing.T) {
+	world := newDefaultWorld()
+	if world.Width != 37 || world.Height != 25 {
+		t.Fatalf("default arena = %dx%d, want 37x25", world.Width, world.Height)
+	}
+	interiorWalls := 0
+	for _, wall := range world.Walls {
+		if wall.X > 0 && wall.X < world.Width-1 && wall.Y > 0 && wall.Y < world.Height-1 {
+			interiorWalls++
+		}
+	}
+	if interiorWalls < 32 {
+		t.Fatalf("default arena has %d interior obstacles, want at least 32", interiorWalls)
+	}
+	if len(world.Powerups) != 4 {
+		t.Fatalf("default arena has %d powerups, want 4", len(world.Powerups))
+	}
+	start := tile{X: 1, Y: 1}
+	visited := map[tile]bool{start: true}
+	queue := []tile{start}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, direction := range []tile{{X: 1}, {X: -1}, {Y: 1}, {Y: -1}} {
+			next := tile{X: current.X + direction.X, Y: current.Y + direction.Y}
+			if next.X <= 0 || next.X >= world.Width-1 || next.Y <= 0 || next.Y >= world.Height-1 || world.wallAt(next.X, next.Y) || visited[next] {
+				continue
+			}
+			visited[next] = true
+			queue = append(queue, next)
+		}
+	}
+	for y := 1; y < world.Height-1; y++ {
+		for x := 1; x < world.Width-1; x++ {
+			position := tile{X: x, Y: y}
+			if !world.wallAt(x, y) && !visited[position] {
+				t.Fatalf("open cell %+v is unreachable", position)
+			}
+		}
+	}
+	for _, item := range world.Powerups {
+		if !visited[tile{X: item.X, Y: item.Y}] {
+			t.Fatalf("powerup %+v is unreachable", item)
+		}
+	}
+	if defaultTickInterval != 150*time.Millisecond {
+		t.Fatalf("default tick = %s, want 150ms", defaultTickInterval)
 	}
 }
 
@@ -89,6 +176,17 @@ func TestClientProtocolRejectsTrailingJSON(t *testing.T) {
 	value, _ := statecharts.StringValue(`{"v":1,"type":"input","seq":1,"action":"right"} garbage`)
 	if _, err := parseClientMessage(value); err == nil {
 		t.Fatal("client protocol accepted trailing non-JSON data")
+	}
+}
+
+func TestClientProtocolAcceptsExplicitReload(t *testing.T) {
+	value, _ := statecharts.StringValue(`{"v":1,"type":"input","seq":1,"action":"reload"}`)
+	message, err := parseClientMessage(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Action != actionReload {
+		t.Fatalf("action = %q, want reload", message.Action)
 	}
 }
 
@@ -437,12 +535,12 @@ func TestBotChartExposesComposableDecisionVocabulary(t *testing.T) {
 		}
 	}
 	visit(definition.Root)
-	for _, name := range []statecharts.Identifier{"arena.bot.move", "arena.bot.move-toward", "arena.bot.shoot", "arena.bot.wander"} {
+	for _, name := range []statecharts.Identifier{"arena.bot.move", "arena.bot.move-toward", "arena.bot.shoot", "arena.bot.reload", "arena.bot.wander"} {
 		if !actions[name] {
 			t.Errorf("default bot chart does not demonstrate action %q", name)
 		}
 	}
-	for _, name := range []statecharts.Identifier{"arena.bot.target-exists", "arena.bot.opponent-in-sights", "arena.bot.power-at-least"} {
+	for _, name := range []statecharts.Identifier{"arena.bot.target-exists", "arena.bot.opponent-in-sights", "arena.bot.weapon-empty", "arena.bot.power-at-least"} {
 		if !conditions[name] {
 			t.Errorf("default bot chart does not demonstrate condition %q", name)
 		}
@@ -511,7 +609,7 @@ func TestBotRolloutPreservesCreatureAndRejectsObsoleteController(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := waitForPlayer(t, frames, old.Player, func(c creature) bool { return c.Controller == string(next.Controller) })
-	if joined.X != before.X || joined.Y != before.Y || joined.Health != before.Health || joined.Power != before.Power || joined.Score != before.Score || joined.LastSequence != before.LastSequence {
+	if joined.X != before.X || joined.Y != before.Y || joined.Health != before.Health || joined.Power != before.Power || joined.Score != before.Score || joined.Loaded != before.Loaded || joined.LastSequence != before.LastSequence {
 		t.Fatalf("takeover changed stable creature state: before=%+v after=%+v", before, joined)
 	}
 	if joined.DefinitionRevision != string(next.Revision) {
@@ -668,7 +766,7 @@ func TestBotDefinitionWorkbenchUsesHTMLCFormAndComposableVocabulary(t *testing.T
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || len(vocabulary.Actions) < 6 || len(vocabulary.Conditions) < 6 || len(vocabulary.Events) != 3 {
+	if response.StatusCode != http.StatusOK || len(vocabulary.Actions) < 7 || len(vocabulary.Conditions) < 7 || len(vocabulary.Events) != 3 {
 		t.Fatalf("vocabulary = %d %+v", response.StatusCode, vocabulary)
 	}
 	actionNames := map[string]bool{}
@@ -685,12 +783,12 @@ func TestBotDefinitionWorkbenchUsesHTMLCFormAndComposableVocabulary(t *testing.T
 		}
 		conditionNames[condition.Name] = true
 	}
-	for _, name := range []string{"arena.bot.move", "arena.bot.move-toward", "arena.bot.shoot", "arena.bot.wander"} {
+	for _, name := range []string{"arena.bot.move", "arena.bot.move-toward", "arena.bot.shoot", "arena.bot.reload", "arena.bot.wander"} {
 		if !actionNames[name] {
 			t.Errorf("action vocabulary omits %q", name)
 		}
 	}
-	for _, name := range []string{"arena.bot.target-exists", "arena.bot.target-within", "arena.bot.opponent-in-sights", "arena.bot.health-below", "arena.bot.power-at-least", "arena.bot.tick-every"} {
+	for _, name := range []string{"arena.bot.target-exists", "arena.bot.target-within", "arena.bot.opponent-in-sights", "arena.bot.weapon-empty", "arena.bot.health-below", "arena.bot.power-at-least", "arena.bot.tick-every"} {
 		if !conditionNames[name] {
 			t.Errorf("condition vocabulary omits %q", name)
 		}

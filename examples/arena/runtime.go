@@ -12,6 +12,8 @@ import (
 	"github.com/dhamidi/statecharts/actors"
 )
 
+const defaultTickInterval = 150 * time.Millisecond
+
 type runtimeOptions struct {
 	TickInterval time.Duration
 	Bots         int
@@ -45,7 +47,7 @@ type arenaRuntime struct {
 
 func setupArena(ctx context.Context, options runtimeOptions) (*arenaRuntime, error) {
 	if options.TickInterval <= 0 {
-		options.TickInterval = 100 * time.Millisecond
+		options.TickInterval = defaultTickInterval
 	}
 	transport := newSocketTransport()
 	system := actors.NewSystem(

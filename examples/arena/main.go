@@ -16,7 +16,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		log.Fatal("usage: arena serve [--addr :8080] [--bots 3] [--tick 100ms]")
+		log.Fatal("usage: arena serve [--addr :8080] [--bots 3] [--tick 150ms]")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -29,7 +29,7 @@ func runServe(ctx context.Context, arguments []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	address := flags.String("addr", ":8080", "listen address")
 	bots := flags.Int("bots", 3, "number of AI creatures")
-	tick := flags.Duration("tick", 100*time.Millisecond, "authoritative simulation interval")
+	tick := flags.Duration("tick", defaultTickInterval, "authoritative simulation interval")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}

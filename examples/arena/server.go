@@ -337,14 +337,22 @@ func botDefinitionVocabulary() (botVocabulary, error) {
 			parameters = []botVocabularyParameter{}
 		}
 		example, err := call(executable)
-		return botVocabularyCapability{Name: name, Version: "v1", Category: category, Summary: summary, Example: example, Parameters: parameters, Events: events, Constraints: constraints}, err
+		version := ""
+		if executable.Call != nil {
+			version = executable.Call.Function.Version
+		}
+		return botVocabularyCapability{Name: name, Version: version, Category: category, Summary: summary, Example: example, Parameters: parameters, Events: events, Constraints: constraints}, err
 	}
 	check := func(name statecharts.Identifier, category, summary string, events []statecharts.Identifier, expression statecharts.Expression, parameters []botVocabularyParameter, constraints ...string) (botVocabularyCapability, error) {
 		if parameters == nil {
 			parameters = []botVocabularyParameter{}
 		}
 		example, err := condition(expression)
-		return botVocabularyCapability{Name: name, Version: "v1", Category: category, Summary: summary, Example: example, Parameters: parameters, Events: events, Constraints: constraints}, err
+		function, referenceErr := goReference(expression)
+		if err == nil {
+			err = referenceErr
+		}
+		return botVocabularyCapability{Name: name, Version: function.Version, Category: category, Summary: summary, Example: example, Parameters: parameters, Events: events, Constraints: constraints}, err
 	}
 	var vocabulary botVocabulary
 	var err error
@@ -370,10 +378,12 @@ func botDefinitionVocabulary() (botVocabulary, error) {
 	appendAction(action("arena.bot.move-toward", "movement", "Pathfind one cell toward the nearest selected target.", snapshotEvents, refs.moveToward.Call(stringLiteral(botTargetPowerup)), []botVocabularyParameter{parameter("target", "Target", "enum", botTargetPowerup, targets, nil)}, "Use on match.snapshot."))
 	appendAction(action("arena.bot.wander", "movement", "Choose a deterministic available direction.", snapshotEvents, refs.wander.Call(), nil, "Use on match.snapshot."))
 	appendAction(action("arena.bot.shoot", "combat", "Fire in the current facing direction.", snapshotEvents, refs.shoot.Call(), nil, "Use on match.snapshot."))
+	appendAction(action("arena.bot.reload", "combat", "Reload the weapon after firing.", snapshotEvents, refs.reload.Call(), nil, "Use on match.snapshot."))
 	appendAction(action("arena.bot.stop", "lifecycle", "Unsubscribe and release the controller lease.", stopEvents, refs.stop.Call(), nil, "Use on bot.stop and transition to a final state."))
 	appendCondition(check("arena.bot.target-exists", "sensing", "Whether a target of this kind exists.", snapshotEvents, refs.targetExists.If(stringLiteral(botTargetPowerup)), []botVocabularyParameter{parameter("target", "Target", "enum", botTargetPowerup, targets, nil)}))
 	appendCondition(check("arena.bot.target-within", "sensing", "Whether the nearest selected target is within Manhattan distance.", snapshotEvents, refs.targetWithin.If(stringLiteral(botTargetOpponent), integerLiteral(5)), []botVocabularyParameter{parameter("target", "Target", "enum", botTargetOpponent, targets, nil), parameter("distance", "Distance", "integer", 5, nil, minimum(0))}))
 	appendCondition(check("arena.bot.opponent-in-sights", "combat", "Whether a clear, aligned opponent is in front of the bot.", snapshotEvents, refs.opponentInSights.If(integerLiteral(8)), []botVocabularyParameter{parameter("range", "Range", "integer", 8, nil, minimum(1))}))
+	appendCondition(check("arena.bot.weapon-empty", "combat", "Whether the weapon must be reloaded before firing.", snapshotEvents, refs.weaponEmpty.If(), nil))
 	appendCondition(check("arena.bot.health-below", "status", "Whether health is below a threshold.", snapshotEvents, refs.healthBelow.If(integerLiteral(2)), []botVocabularyParameter{parameter("health", "Health", "integer", 2, nil, minimum(1))}))
 	appendCondition(check("arena.bot.power-at-least", "status", "Whether collected power is at least a threshold.", snapshotEvents, refs.powerAtLeast.If(integerLiteral(1)), []botVocabularyParameter{parameter("power", "Power", "integer", 1, nil, minimum(0))}))
 	appendCondition(check("arena.bot.tick-every", "timing", "True on every Nth authoritative match tick.", snapshotEvents, refs.tickEvery.If(integerLiteral(8)), []botVocabularyParameter{parameter("interval", "Every N ticks", "integer", 8, nil, minimum(1))}))

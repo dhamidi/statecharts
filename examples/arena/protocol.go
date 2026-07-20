@@ -186,7 +186,7 @@ func parseClientMessage(value statecharts.Value) (clientMessage, error) {
 		return clientMessage{}, fmt.Errorf("invalid client envelope")
 	}
 	switch message.Action {
-	case actionUp, actionDown, actionLeft, actionRight, actionShoot:
+	case actionUp, actionDown, actionLeft, actionRight, actionShoot, actionReload:
 		return message, nil
 	default:
 		return clientMessage{}, fmt.Errorf("unknown action %q", message.Action)

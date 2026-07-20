@@ -11,11 +11,12 @@ const (
 	directionLeft  = "left"
 	directionRight = "right"
 
-	actionUp    = "up"
-	actionDown  = "down"
-	actionLeft  = "left"
-	actionRight = "right"
-	actionShoot = "shoot"
+	actionUp     = "up"
+	actionDown   = "down"
+	actionLeft   = "left"
+	actionRight  = "right"
+	actionShoot  = "shoot"
+	actionReload = "reload"
 )
 
 type tile struct {
@@ -33,6 +34,7 @@ type creature struct {
 	Health             int    `json:"health"`
 	Power              int    `json:"power"`
 	Score              int    `json:"score"`
+	Loaded             bool   `json:"loaded"`
 	LastSequence       uint64 `json:"last_sequence"`
 	Bot                bool   `json:"bot"`
 	Connected          bool   `json:"connected"`
@@ -111,6 +113,17 @@ func newWorld(width, height int, seed uint64) world {
 	return w
 }
 
+func newDefaultWorld() world {
+	world := newWorld(37, 25, 0x5eed)
+	world.Powerups = []powerup{
+		{X: 5, Y: 3, Kind: "charge"},
+		{X: 13, Y: 9, Kind: "charge"},
+		{X: 23, Y: 15, Kind: "charge"},
+		{X: 31, Y: 21, Kind: "charge"},
+	}
+	return world
+}
+
 func (w *world) addPlayer(id, name, color string, bot bool, controller, definitionRevision string) bool {
 	if current, ok := w.Creatures[id]; ok {
 		current.Name, current.Color, current.Bot, current.Connected = name, color, bot, true
@@ -119,7 +132,7 @@ func (w *world) addPlayer(id, name, color string, bot bool, controller, definiti
 		return false
 	}
 	x, y := w.openCell(uint64(len(w.Creatures)))
-	w.Creatures[id] = creature{ID: id, Name: name, Color: color, X: x, Y: y, Facing: directionRight, Health: 3, Bot: bot, Connected: true, Controller: controller, DefinitionRevision: definitionRevision}
+	w.Creatures[id] = creature{ID: id, Name: name, Color: color, X: x, Y: y, Facing: directionRight, Health: 3, Loaded: true, Bot: bot, Connected: true, Controller: controller, DefinitionRevision: definitionRevision}
 	return true
 }
 
@@ -158,8 +171,15 @@ func (w *world) applyInput(input playerInput, movement int) bool {
 			w.collect(&actor)
 		}
 	case actionShoot:
-		dx, dy := directionVector(actor.Facing)
-		w.Projectiles = append(w.Projectiles, projectile{Owner: actor.ID, X: actor.X, Y: actor.Y, DX: dx, DY: dy, Damage: 1 + actor.Power, TTL: max(w.Width, w.Height)})
+		if actor.Loaded {
+			actor.Loaded = false
+			dx, dy := directionVector(actor.Facing)
+			w.Projectiles = append(w.Projectiles, projectile{Owner: actor.ID, X: actor.X, Y: actor.Y, DX: dx, DY: dy, Damage: 1 + actor.Power, TTL: max(w.Width, w.Height)})
+		}
+	case actionReload:
+		if !actor.Loaded {
+			actor.Loaded = true
+		}
 	default:
 		return false
 	}
@@ -201,7 +221,7 @@ func (w *world) advance() {
 			owner := w.Creatures[shot.Owner]
 			owner.Score += 10
 			w.Creatures[shot.Owner] = owner
-			victim.Health, victim.Power = 3, 0
+			victim.Health, victim.Power, victim.Loaded = 3, 0, true
 			victim.X, victim.Y = w.openCell(w.nextRandom())
 		}
 		w.Creatures[victimID] = victim

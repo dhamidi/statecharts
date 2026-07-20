@@ -8,13 +8,14 @@ deterministic grid, collect power charges, and fire projectiles at one another.
 
 ```sh
 ./run serve                       # http://127.0.0.1:8080
-./run serve --bots 6 --tick 80ms
+./run serve --bots 6 --tick 150ms
 ```
 
-Open two browser tabs to add human creatures. WASD moves and Space fires. The
-plain-JavaScript Web Components render only snapshots from the server; they do
-not predict or mutate game state. Reloading or reconnecting with the same
-browser identity resubscribes to the existing authoritative creature.
+Open two browser tabs to add human creatures. WASD moves, Space fires, and R
+explicitly reloads before the next shot. The plain-JavaScript Web Components
+render only snapshots from the server; they do not predict or mutate game
+state. Reloading or reconnecting with the same browser identity resubscribes to
+the existing authoritative creature.
 
 ## Architecture
 
@@ -39,7 +40,8 @@ arrives.
 `arena.bot` controller actors subscribe to the same snapshots and emit the same
 `player.input` protocol as humans. Bot player IDs are stable while controller
 IDs and leases are replaced during rollout. The authoritative creature keeps
-its position, health, power, score, and last input sequence.
+its position, health, power, score, loaded-weapon state, and last input
+sequence.
 
 Matches are intentionally ephemeral in this example: a process restart starts
 a new game. Making them durable is a spawn-policy change plus storage, but a
@@ -84,11 +86,11 @@ publication.
 Open `/editor/bots` to build the complete bot Definition with a form-based
 state and transition editor. It is an `htmlc` custom element backed by the
 registered Go capability vocabulary. Conditions such as `target-exists`,
-`opponent-in-sights`, `health-below`, `power-at-least`, and `tick-every` can be
-combined with `move`, `move-toward`, `wander`, and `shoot` actions in ordered
-transitions. This makes the decision tree itself editable rather than hiding
-it behind a fixed policy struct. Canonical JSON remains available under the
-advanced escape hatch.
+`opponent-in-sights`, `weapon-empty`, `health-below`, `power-at-least`, and
+`tick-every` can be combined with `move`, `move-toward`, `wander`, `shoot`, and
+`reload` actions in ordered transitions. This makes the decision tree itself
+editable rather than hiding it behind a fixed policy struct. Canonical JSON
+remains available under the advanced escape hatch.
 
 The workbench validates the whole statechart, publishes it as a new immutable
 revision, and rolls that revision out to one canary or the entire fleet.
