@@ -314,7 +314,7 @@ func TestBotPolicyChangesTargetAndShootRange(t *testing.T) {
 	}
 }
 
-func TestBotDefinitionRequiresValidLiteralPolicy(t *testing.T) {
+func TestBotDefinitionAllowsFreeFormBehaviorWithValidObserveCalls(t *testing.T) {
 	chart, err := buildBotChart()
 	if err != nil {
 		t.Fatal(err)
@@ -323,8 +323,28 @@ func TestBotDefinitionRequiresValidLiteralPolicy(t *testing.T) {
 	if err := validateBotDefinition(valid); err != nil {
 		t.Fatalf("default definition is invalid: %v", err)
 	}
-	invalid := valid
-	if !setBotPolicy(&invalid.Root, botPolicy{TargetPriority: "anything", ShootRange: 1}) {
+
+	withoutObserve := valid.Clone()
+	active := &withoutObserve.Root.Children[0]
+	transitions := active.Transitions[:0]
+	for _, transition := range active.Transitions {
+		if len(transition.Events) != 1 || transition.Events[0] != "match.snapshot" {
+			transitions = append(transitions, transition)
+		}
+	}
+	active.Transitions = transitions
+	if err := validateBotDefinition(withoutObserve); err != nil {
+		t.Fatalf("definition without observe action is invalid: %v", err)
+	}
+
+	multipleObserve := valid.Clone()
+	multipleObserve.Root.Children[0].Transitions = append(multipleObserve.Root.Children[0].Transitions, valid.Root.Children[0].Transitions[1])
+	if err := validateBotDefinition(multipleObserve); err != nil {
+		t.Fatalf("definition with multiple observe actions is invalid: %v", err)
+	}
+
+	invalid := valid.Clone()
+	if !setFirstBotPolicy(&invalid.Root, botPolicy{TargetPriority: "anything", ShootRange: 1}) {
 		t.Fatal("definition has no bot policy")
 	}
 	if err := validateBotDefinition(invalid); err == nil {
@@ -346,7 +366,7 @@ func TestPublishingBotDefinitionDoesNotRepinExistingActors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if published == before[0].PolicyRevision {
+	if published == before[0].Revision {
 		t.Fatal("publication did not produce a new bot revision")
 	}
 	if got, _ := runtime.system.ActorRevision("match.main"); got != matchRevision {
@@ -358,8 +378,8 @@ func TestPublishingBotDefinitionDoesNotRepinExistingActors(t *testing.T) {
 		byPlayer[status.Player] = status
 	}
 	for _, old := range before {
-		if got, _ := runtime.system.ActorRevision(old.Controller); got != old.PolicyRevision {
-			t.Errorf("controller %q revision changed from %q to %q", old.Controller, old.PolicyRevision, got)
+		if got, _ := runtime.system.ActorRevision(old.Controller); got != old.Revision {
+			t.Errorf("controller %q revision changed from %q to %q", old.Controller, old.Revision, got)
 		}
 		if got := byPlayer[old.Player]; got != old {
 			t.Errorf("bot status changed on publication: got %+v, want %+v", got, old)
@@ -394,11 +414,11 @@ func TestBotRolloutPreservesCreatureAndRejectsObsoleteController(t *testing.T) {
 	if joined.X != before.X || joined.Y != before.Y || joined.Health != before.Health || joined.Power != before.Power || joined.Score != before.Score || joined.LastSequence != before.LastSequence {
 		t.Fatalf("takeover changed stable creature state: before=%+v after=%+v", before, joined)
 	}
-	if joined.PolicyRevision != string(next.PolicyRevision) {
-		t.Fatalf("creature policy revision = %q, want %q", joined.PolicyRevision, next.PolicyRevision)
+	if joined.DefinitionRevision != string(next.Revision) {
+		t.Fatalf("creature definition revision = %q, want %q", joined.DefinitionRevision, next.Revision)
 	}
-	if got, _ := runtime.system.ActorRevision(next.Controller); got != next.PolicyRevision {
-		t.Fatalf("replacement actual revision = %q, status reports %q", got, next.PolicyRevision)
+	if got, _ := runtime.system.ActorRevision(next.Controller); got != next.Revision {
+		t.Fatalf("replacement actual revision = %q, status reports %q", got, next.Revision)
 	}
 	// A fresh snapshot makes the replacement act. Its first accepted sequence
 	// must continue above the match's authoritative sequence.
@@ -454,7 +474,7 @@ func TestAllBotRolloutPinsEveryReplacementToOnePublishedRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, bot := range bots {
-		if bot.Generation != 2 || bot.PolicyRevision != want {
+		if bot.Generation != 2 || bot.Revision != want {
 			t.Errorf("replacement status = %+v, want generation 2 revision %q", bot, want)
 		}
 		if got, _ := runtime.system.ActorRevision(bot.Controller); got != want {
@@ -463,17 +483,31 @@ func TestAllBotRolloutPinsEveryReplacementToOnePublishedRevision(t *testing.T) {
 	}
 }
 
-func setBotPolicy(state *statecharts.StateDefinition, policy botPolicy) bool {
-	definition := statecharts.Definition{Root: *state}
-	changed, err := replaceBotPolicy(definition, policy)
+func setFirstBotPolicy(state *statecharts.StateDefinition, policy botPolicy) bool {
+	value, err := taggedStruct(botPolicyTag, policy)
 	if err != nil {
 		return false
 	}
-	*state = changed.Root
-	return true
+	for transitionIndex := range state.Transitions {
+		for blockIndex := range state.Transitions[transitionIndex].Actions {
+			for actionIndex := range state.Transitions[transitionIndex].Actions[blockIndex] {
+				action := &state.Transitions[transitionIndex].Actions[blockIndex][actionIndex]
+				if action.Call != nil && action.Call.Function.Name == "arena.bot.observe" {
+					action.Call.Function.Args = []statecharts.Expression{statecharts.GoLiteral(value)}
+					return true
+				}
+			}
+		}
+	}
+	for index := range state.Children {
+		if setFirstBotPolicy(&state.Children[index], policy) {
+			return true
+		}
+	}
+	return false
 }
 
-func TestStructuredBotPolicyAPIAndEditor(t *testing.T) {
+func TestBotDefinitionWorkbenchExposesFullDefinitionAndVocabulary(t *testing.T) {
 	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour, Bots: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -485,96 +519,115 @@ func TestStructuredBotPolicyAPIAndEditor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	editor, err := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/html") {
-		t.Fatalf("editor response = %d %q", response.StatusCode, response.Header.Get("Content-Type"))
-	}
-	before, _, _ := runtime.system.CurrentDefinition(botKind)
-	beforePolicy, _ := readBotPolicy(before)
-	candidate := `{"target_priority":"powerups","shoot_range":0}`
-	response, err = http.Post(server.URL+"/bot-policy/validate", "application/json", strings.NewReader(candidate))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var validated struct {
-		Revision string    `json:"revision"`
-		Policy   botPolicy `json:"policy"`
+	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("editor response = %d %q", response.StatusCode, response.Header.Get("Content-Type"))
 	}
-	if err := json.NewDecoder(response.Body).Decode(&validated); err != nil {
+	if text := string(editor); !strings.Contains(text, "FULL DEFINITION") || !strings.Contains(text, "ACTION VOCABULARY") {
+		t.Fatalf("editor does not foreground the full chart and vocabulary")
+	} else if strings.Contains(text, "POLICY DRAFT") || strings.Contains(text, "LIVE ARENA PREVIEW") {
+		t.Fatalf("editor still renders the old policy dashboard")
+	}
+
+	response, err = http.Get(server.URL + "/definitions/bot/vocabulary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vocabulary struct {
+		Actions []struct {
+			Name    string          `json:"name"`
+			Version string          `json:"version"`
+			Example json.RawMessage `json:"example"`
+		} `json:"actions"`
+		Events []struct {
+			Name string `json:"name"`
+		} `json:"events"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&vocabulary); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || validated.Policy.TargetPriority != "powerups" {
-		t.Fatalf("validation = %d %+v", response.StatusCode, validated)
+	if response.StatusCode != http.StatusOK || len(vocabulary.Actions) != 3 || len(vocabulary.Events) != 3 {
+		t.Fatalf("vocabulary = %d %+v", response.StatusCode, vocabulary)
 	}
-	stillCurrent, _, _ := runtime.system.CurrentDefinition(botKind)
-	stillPolicy, _ := readBotPolicy(stillCurrent)
-	if stillPolicy != beforePolicy {
-		t.Fatalf("validation published policy: got %+v want %+v", stillPolicy, beforePolicy)
+	for _, action := range vocabulary.Actions {
+		if action.Name == "" || action.Version == "" || !json.Valid(action.Example) {
+			t.Fatalf("incomplete action vocabulary entry: %+v", action)
+		}
 	}
-	request, _ := http.NewRequest(http.MethodPut, server.URL+"/bot-policy", strings.NewReader(candidate))
+
+	response, err = http.Get(server.URL + "/definitions/bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitionData, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Header.Get("X-Statechart-Revision") == "" {
+		t.Fatal("definition response omitted current revision")
+	}
+	definition, err := statejson.Unmarshal(definitionData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := &definition.Root.Children[0]
+	transitions := active.Transitions[:0]
+	for _, transition := range active.Transitions {
+		if len(transition.Events) != 1 || transition.Events[0] != "match.snapshot" {
+			transitions = append(transitions, transition)
+		}
+	}
+	active.Transitions = transitions
+	definition.RevisionSalt = "free-form-no-observe"
+	definitionData, err = statejson.Marshal(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.Post(server.URL+"/definitions/bot/validate", "application/json", bytes.NewReader(definitionData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("free-form definition validation = %d: %s", response.StatusCode, message)
+	}
+
+	request, err := http.NewRequest(http.MethodPut, server.URL+"/definitions/bot", bytes.NewReader(definitionData))
+	if err != nil {
+		t.Fatal(err)
+	}
 	response, err = http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var published struct {
+		Revision statecharts.RevisionID `json:"revision"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&published); err != nil {
+		t.Fatal(err)
+	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("publish status = %d", response.StatusCode)
+	if response.StatusCode != http.StatusOK || published.Revision == "" {
+		t.Fatalf("free-form definition publication = %d %+v", response.StatusCode, published)
 	}
-	published, _, _ := runtime.system.CurrentDefinition(botKind)
-	got, err := readBotPolicy(published)
-	if err != nil || got != (botPolicy{TargetPriority: "powerups", ShootRange: 0}) {
-		t.Fatalf("published policy = %+v, err=%v", got, err)
-	}
-}
-
-func TestStructuredBotPolicyPreservesCurrentDefinitionEdits(t *testing.T) {
-	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour})
+	response, err = http.Post(server.URL+"/bots/bot.1/rollout", "application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
-	definition := runtime.bot.Definition()
-	definition.RevisionSalt = "full-definition-edit"
-	if _, err := runtime.publishBotDefinition(context.Background(), definition); err != nil {
+	var rolledOut botStatus
+	if err := json.NewDecoder(response.Body).Decode(&rolledOut); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.publishBotPolicy(context.Background(), botPolicy{TargetPriority: "powerups", ShootRange: 0}); err != nil {
-		t.Fatal(err)
-	}
-	published, _, ok := runtime.system.CurrentDefinition(botKind)
-	if !ok {
-		t.Fatal("bot definition is not registered")
-	}
-	if published.RevisionSalt != definition.RevisionSalt {
-		t.Fatalf("policy publication reset revision salt to %q, want %q", published.RevisionSalt, definition.RevisionSalt)
-	}
-	policy, err := readBotPolicy(published)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if policy != (botPolicy{TargetPriority: "powerups", ShootRange: 0}) {
-		t.Fatalf("published policy = %+v", policy)
-	}
-}
-
-func TestStructuredBotPolicyRejectsMalformedUnknownAndTrailingJSON(t *testing.T) {
-	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
-	server := httptest.NewServer(arenaHandler(runtime))
-	t.Cleanup(server.Close)
-	for _, body := range []string{`{`, `{"target_priority":"nearest","shoot_range":1,"extra":true}`, `{"target_priority":"nearest","shoot_range":1} {}`} {
-		response, err := http.Post(server.URL+"/bot-policy/validate", "application/json", strings.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		response.Body.Close()
-		if response.StatusCode != http.StatusBadRequest {
-			t.Errorf("body %q status = %d, want 400", body, response.StatusCode)
-		}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || rolledOut.Revision != published.Revision || rolledOut.Generation != 2 {
+		t.Fatalf("free-form rollout = %d %+v, want revision %q generation 2", response.StatusCode, rolledOut, published.Revision)
 	}
 }
 

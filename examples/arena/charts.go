@@ -72,7 +72,7 @@ func buildMatchChart(tickInterval time.Duration) (*statecharts.Chart, error) {
 			return fmt.Errorf("join requires player, name, color, and lease")
 		}
 		data.Leases[request.Player] = request.Lease
-		data.World.addPlayer(request.Player, request.Name, request.Color, request.Bot, request.Controller, request.PolicyRevision)
+		data.World.addPlayer(request.Player, request.Name, request.Color, request.Bot, request.Controller, request.DefinitionRevision)
 		return publish(data, ec)
 	})
 	disconnect := match.Action("disconnect", func(data *matchModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
@@ -283,7 +283,7 @@ func buildBotChart() (*statecharts.Chart, error) {
 			return err
 		}
 		data.Match, data.Player = config.Match, config.Player
-		join, err := taggedStruct(joinTag, joinRequest{Player: config.Player, Name: config.Name, Color: config.Color, Lease: ec.SessionID(), Bot: true, Controller: ec.SessionID(), PolicyRevision: config.PolicyRevision})
+		join, err := taggedStruct(joinTag, joinRequest{Player: config.Player, Name: config.Name, Color: config.Color, Lease: ec.SessionID(), Bot: true, Controller: ec.SessionID(), DefinitionRevision: config.DefinitionRevision})
 		if err != nil {
 			return err
 		}
@@ -563,7 +563,7 @@ func spawnBotPlayer(ctx context.Context, system *actors.System, id, match statec
 	if err := system.Spawn(ctx, id, botKind); err != nil {
 		return err
 	}
-	config, err := taggedStruct(botConfigTag, botConfig{Match: string(match), Player: player, Name: "BOT " + player, Color: color, PolicyRevision: string(revision)})
+	config, err := taggedStruct(botConfigTag, botConfig{Match: string(match), Player: player, Name: "BOT " + player, Color: color, DefinitionRevision: string(revision)})
 	if err != nil {
 		return err
 	}

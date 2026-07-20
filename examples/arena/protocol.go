@@ -28,13 +28,13 @@ type matchConfig struct {
 }
 
 type joinRequest struct {
-	Player         string `json:"player"`
-	Name           string `json:"name"`
-	Color          string `json:"color"`
-	Lease          string `json:"lease"`
-	Bot            bool   `json:"bot"`
-	Controller     string `json:"controller,omitempty"`
-	PolicyRevision string `json:"policy_revision,omitempty"`
+	Player             string `json:"player"`
+	Name               string `json:"name"`
+	Color              string `json:"color"`
+	Lease              string `json:"lease"`
+	Bot                bool   `json:"bot"`
+	Controller         string `json:"controller,omitempty"`
+	DefinitionRevision string `json:"definition_revision,omitempty"`
 }
 
 type disconnectRequest struct {
@@ -56,11 +56,11 @@ type connectionConfig struct {
 }
 
 type botConfig struct {
-	Match          string `json:"match"`
-	Player         string `json:"player"`
-	Name           string `json:"name"`
-	Color          string `json:"color"`
-	PolicyRevision string `json:"policy_revision"`
+	Match              string `json:"match"`
+	Player             string `json:"player"`
+	Name               string `json:"name"`
+	Color              string `json:"color"`
+	DefinitionRevision string `json:"definition_revision"`
 }
 
 type botPolicy struct {

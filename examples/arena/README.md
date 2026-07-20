@@ -79,24 +79,27 @@ the player protocol, reconnect/resubscribe behavior, lease takeover and
 expiry, and the old/new match revision split under whole-definition
 publication.
 
-## Live-edit a bot policy
+## Live-edit the bot chart
 
-Open `/editor/bots` for a live spectator view, structured policy controls,
-per-bot canary rollout, fleet-wide rollout, and an advanced canonical
-Definition editor.
+Open `/editor/bots` to edit the complete canonical bot Definition. The
+workbench lists the registered Go action vocabulary with insertable examples,
+validates the whole statechart, publishes it as a new immutable revision, and
+rolls that revision out to one canary or the entire fleet. You can add states,
+transitions, delayed sends, internal events, and multiple strategy phases; the
+editor does not reduce the chart to a settings form.
 
-The `arena.bot.observe` action has one `go.literal`, tagged
-`arena.bot-policy/v1`, whose payload is:
+The `arena.bot.observe` action is one available strategy primitive. It accepts
+one `go.literal`, tagged `arena.bot-policy/v1`, whose payload is:
 
 ```json
 {"target_priority":"nearest","shoot_range":64}
 ```
 
 `target_priority` is `nearest`, `powerups`, or `creatures`. `shoot_range` is a
-non-negative Manhattan distance; zero disables shooting. Bot definition
-candidates receive this bot-specific validation before they can be published.
-Publishing does not alter running controllers. Roll out one canary or all bots
-explicitly:
+non-negative Manhattan distance; zero disables shooting. Every occurrence of
+this action receives argument validation, but the action itself is optional
+and may appear any number of times. Publishing does not alter running
+controllers. Roll out one canary or all bots explicitly:
 
 ```sh
 curl -fsS http://127.0.0.1:8080/definitions/bot > bot.json
@@ -108,7 +111,7 @@ curl -fsS -X POST http://127.0.0.1:8080/bots/rollout
 
 `GET /definitions/bot?revision=<revision>` exports a retained immutable
 revision. `GET /bots` returns `{"bots":[...]}` sorted by player; each item has
-`player`, `controller`, `match`, `color`, `policy_revision`, and `generation`.
+`player`, `controller`, `match`, `color`, `revision`, and `generation`.
 The rollout endpoints return one such item and `{"bots":[...]}`, respectively.
-Snapshots expose `controller` and `policy_revision` on bot creatures so clients
-can confirm that a rollout took effect.
+Snapshots expose `controller` and `definition_revision` on bot creatures so
+clients can confirm that a rollout took effect.

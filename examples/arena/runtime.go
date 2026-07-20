@@ -23,12 +23,12 @@ type matchStatus struct {
 }
 
 type botStatus struct {
-	Player         string                 `json:"player"`
-	Controller     statecharts.Identifier `json:"controller"`
-	Match          statecharts.Identifier `json:"match"`
-	Color          string                 `json:"color"`
-	PolicyRevision statecharts.RevisionID `json:"policy_revision"`
-	Generation     uint64                 `json:"generation"`
+	Player     string                 `json:"player"`
+	Controller statecharts.Identifier `json:"controller"`
+	Match      statecharts.Identifier `json:"match"`
+	Color      string                 `json:"color"`
+	Revision   statecharts.RevisionID `json:"revision"`
+	Generation uint64                 `json:"generation"`
 }
 
 type arenaRuntime struct {
@@ -118,7 +118,7 @@ func (runtime *arenaRuntime) startBotLocked(ctx context.Context, player string, 
 		cleanup()
 		return botStatus{}, fmt.Errorf("bot controller %q pinned revision %q, expected current revision %q", controller, actualRevision, expectedRevision)
 	}
-	config, err := taggedStruct(botConfigTag, botConfig{Match: string(match), Player: player, Name: "BOT " + player, Color: color, PolicyRevision: string(actualRevision)})
+	config, err := taggedStruct(botConfigTag, botConfig{Match: string(match), Player: player, Name: "BOT " + player, Color: color, DefinitionRevision: string(actualRevision)})
 	if err != nil {
 		cleanup()
 		return botStatus{}, err
@@ -127,7 +127,7 @@ func (runtime *arenaRuntime) startBotLocked(ctx context.Context, player string, 
 		cleanup()
 		return botStatus{}, err
 	}
-	status := botStatus{Player: player, Controller: controller, Match: match, Color: color, PolicyRevision: actualRevision, Generation: generation}
+	status := botStatus{Player: player, Controller: controller, Match: match, Color: color, Revision: actualRevision, Generation: generation}
 	runtime.bots[player] = status
 	return status, nil
 }
@@ -187,38 +187,6 @@ func (runtime *arenaRuntime) publishBotDefinition(ctx context.Context, definitio
 	runtime.botAdminMu.Lock()
 	defer runtime.botAdminMu.Unlock()
 	return runtime.system.Publish(ctx, definition)
-}
-
-func (runtime *arenaRuntime) botPolicyCandidate(policy botPolicy) (statecharts.Definition, statecharts.RevisionID, error) {
-	current, _, ok := runtime.system.CurrentDefinition(botKind)
-	if !ok {
-		return statecharts.Definition{}, "", fmt.Errorf("bot definition is not registered")
-	}
-	candidate, err := replaceBotPolicy(current, policy)
-	if err != nil {
-		return statecharts.Definition{}, "", err
-	}
-	chart, err := statecharts.Compile(candidate, runtime.bot.Datamodel())
-	if err == nil {
-		err = chart.Prepare()
-	}
-	if err != nil {
-		return statecharts.Definition{}, "", err
-	}
-	return candidate, chart.Revision(), nil
-}
-
-// publishBotPolicy holds the administration lock across the whole
-// read-modify-publish operation so a concurrent full-definition publication
-// cannot be overwritten by a policy update based on an older definition.
-func (runtime *arenaRuntime) publishBotPolicy(ctx context.Context, policy botPolicy) (statecharts.RevisionID, error) {
-	runtime.botAdminMu.Lock()
-	defer runtime.botAdminMu.Unlock()
-	candidate, _, err := runtime.botPolicyCandidate(policy)
-	if err != nil {
-		return "", err
-	}
-	return runtime.system.Publish(ctx, candidate)
 }
 
 func newTestSystem(clock statecharts.Clock, transport *socketTransport) (*actors.System, error) {

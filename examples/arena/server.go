@@ -59,8 +59,15 @@ func registerAdministrationRoutes(mux *http.ServeMux, runtime *arenaRuntime) {
 		}
 		writeJSON(w, bot)
 	})
+	mux.HandleFunc("GET /definitions/bot/vocabulary", func(w http.ResponseWriter, _ *http.Request) {
+		vocabulary, err := botDefinitionVocabulary()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, vocabulary)
+	})
 	registerDefinitionRoutes(mux, runtime, "bot", botKind, runtime.bot, validateBotDefinition, runtime.publishBotDefinition)
-	registerBotPolicyRoutes(mux, runtime)
 	mux.HandleFunc("GET /definitions/match", func(w http.ResponseWriter, request *http.Request) {
 		var definition statecharts.Definition
 		if revision := statecharts.RevisionID(request.URL.Query().Get("revision")); revision != "" {
@@ -120,11 +127,13 @@ func registerAdministrationRoutes(mux *http.ServeMux, runtime *arenaRuntime) {
 func registerDefinitionRoutes(mux *http.ServeMux, runtime *arenaRuntime, path string, kind statecharts.Identifier, source *statecharts.Chart, validate func(statecharts.Definition) error, publisher func(context.Context, statecharts.Definition) (statecharts.RevisionID, error)) {
 	mux.HandleFunc("GET /definitions/"+path, func(w http.ResponseWriter, request *http.Request) {
 		var definition statecharts.Definition
+		var revision statecharts.RevisionID
 		var ok bool
-		if revision := statecharts.RevisionID(request.URL.Query().Get("revision")); revision != "" {
+		if requested := statecharts.RevisionID(request.URL.Query().Get("revision")); requested != "" {
+			revision = requested
 			definition, ok = runtime.system.Definition(kind, revision)
 		} else {
-			definition, _, ok = runtime.system.CurrentDefinition(kind)
+			definition, revision, ok = runtime.system.CurrentDefinition(kind)
 		}
 		if !ok {
 			http.Error(w, path+" definition is not retained", http.StatusNotFound)
@@ -136,6 +145,7 @@ func registerDefinitionRoutes(mux *http.ServeMux, runtime *arenaRuntime, path st
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Statechart-Revision", string(revision))
 		_, _ = w.Write(append(data, '\n'))
 	})
 	handleCandidate := func(publish bool) http.HandlerFunc {
@@ -173,141 +183,133 @@ func registerDefinitionRoutes(mux *http.ServeMux, runtime *arenaRuntime, path st
 }
 
 func validateBotDefinition(definition statecharts.Definition) error {
-	_, err := readBotPolicy(definition)
-	return err
-}
-
-func readBotPolicy(definition statecharts.Definition) (botPolicy, error) {
-	count := 0
-	var result botPolicy
-	var visit func(*statecharts.StateDefinition) error
-	visit = func(state *statecharts.StateDefinition) error {
-		for _, transition := range state.Transitions {
-			for _, block := range transition.Actions {
-				for _, executable := range block {
-					if executable.Call == nil || executable.Call.Function.Name != "arena.bot.observe" {
-						continue
-					}
-					count++
+	var validateBlocks func([]statecharts.ExecutableBlock) error
+	validateBlocks = func(blocks []statecharts.ExecutableBlock) error {
+		for _, block := range blocks {
+			for _, executable := range block {
+				if executable.Call != nil && executable.Call.Function.Name == "arena.bot.observe" {
 					args := executable.Call.Function.Args
 					if len(args) != 1 || args[0].Kind != "go.literal" {
 						return fmt.Errorf("bot observe requires one literal policy argument")
 					}
-					if err := decodeTaggedStruct(args[0].Data, botPolicyTag, &result); err != nil {
+					var policy botPolicy
+					if err := decodeTaggedStruct(args[0].Data, botPolicyTag, &policy); err != nil {
 						return fmt.Errorf("invalid bot policy: %w", err)
 					}
-					if result.TargetPriority != "nearest" && result.TargetPriority != "powerups" && result.TargetPriority != "creatures" {
-						return fmt.Errorf("invalid bot target_priority %q", result.TargetPriority)
+					if policy.TargetPriority != "nearest" && policy.TargetPriority != "powerups" && policy.TargetPriority != "creatures" {
+						return fmt.Errorf("invalid bot target_priority %q", policy.TargetPriority)
 					}
-					if result.ShootRange < 0 {
+					if policy.ShootRange < 0 {
 						return fmt.Errorf("bot shoot_range must be non-negative")
+					}
+				}
+				if executable.Choose != nil {
+					for _, branch := range executable.Choose.Branches {
+						if err := validateBlocks(branch.Actions); err != nil {
+							return err
+						}
+					}
+					if err := validateBlocks(executable.Choose.Else); err != nil {
+						return err
+					}
+				}
+				if executable.ForEach != nil {
+					if err := validateBlocks(executable.ForEach.Actions); err != nil {
+						return err
 					}
 				}
 			}
 		}
-		for index := range state.Children {
-			if err := visit(&state.Children[index]); err != nil {
+		return nil
+	}
+	var visit func(statecharts.StateDefinition) error
+	visit = func(state statecharts.StateDefinition) error {
+		if err := validateBlocks(state.OnEntry); err != nil {
+			return err
+		}
+		if err := validateBlocks(state.OnExit); err != nil {
+			return err
+		}
+		if state.Initial != nil {
+			if err := validateBlocks(state.Initial.Actions); err != nil {
+				return err
+			}
+		}
+		for _, transition := range state.Transitions {
+			if err := validateBlocks(transition.Actions); err != nil {
+				return err
+			}
+		}
+		for _, invoke := range state.Invokes {
+			if err := validateBlocks(invoke.Finalize); err != nil {
+				return err
+			}
+		}
+		for _, child := range state.Children {
+			if err := visit(child); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	if err := visit(&definition.Root); err != nil {
-		return botPolicy{}, err
-	}
-	if count != 1 {
-		return botPolicy{}, fmt.Errorf("bot definition must contain exactly one observe policy, found %d", count)
-	}
-	return result, nil
+	return visit(definition.Root)
 }
 
-func replaceBotPolicy(definition statecharts.Definition, policy botPolicy) (statecharts.Definition, error) {
-	value, err := taggedStruct(botPolicyTag, policy)
+type botVocabularyAction struct {
+	Name        statecharts.Identifier `json:"name"`
+	Version     string                 `json:"version"`
+	Summary     string                 `json:"summary"`
+	Example     json.RawMessage        `json:"example"`
+	Constraints []string               `json:"constraints,omitempty"`
+}
+
+type botVocabularyEvent struct {
+	Name    statecharts.Identifier `json:"name"`
+	Summary string                 `json:"summary"`
+}
+
+type botVocabulary struct {
+	Actions     []botVocabularyAction `json:"actions"`
+	Events      []botVocabularyEvent  `json:"events"`
+	States      []string              `json:"states"`
+	Executables []string              `json:"executables"`
+}
+
+func botDefinitionVocabulary() (botVocabulary, error) {
+	call := func(name statecharts.Identifier, args ...statecharts.Expression) (json.RawMessage, error) {
+		executable := statecharts.NewCallExecutable(statecharts.CallDefinition{Function: statecharts.FunctionRef{Name: name, Version: "v1", Args: args}})
+		return json.Marshal(executable)
+	}
+	start, err := call("arena.bot.start")
 	if err != nil {
-		return statecharts.Definition{}, err
+		return botVocabulary{}, err
 	}
-	count := 0
-	var visit func(*statecharts.StateDefinition)
-	visit = func(state *statecharts.StateDefinition) {
-		for ti := range state.Transitions {
-			for bi := range state.Transitions[ti].Actions {
-				for ai := range state.Transitions[ti].Actions[bi] {
-					a := &state.Transitions[ti].Actions[bi][ai]
-					if a.Call != nil && a.Call.Function.Name == "arena.bot.observe" {
-						a.Call.Function.Args = []statecharts.Expression{statecharts.GoLiteral(value)}
-						count++
-					}
-				}
-			}
-		}
-		for i := range state.Children {
-			visit(&state.Children[i])
-		}
+	policy, err := taggedStruct(botPolicyTag, defaultBotPolicy())
+	if err != nil {
+		return botVocabulary{}, err
 	}
-	visit(&definition.Root)
-	if count != 1 {
-		return statecharts.Definition{}, fmt.Errorf("bot definition must contain exactly one observe policy, found %d", count)
+	observe, err := call("arena.bot.observe", statecharts.GoLiteral(policy))
+	if err != nil {
+		return botVocabulary{}, err
 	}
-	return definition, nil
-}
-
-func validatePolicy(policy botPolicy) error {
-	if policy.TargetPriority != "nearest" && policy.TargetPriority != "powerups" && policy.TargetPriority != "creatures" {
-		return fmt.Errorf("invalid bot target_priority %q", policy.TargetPriority)
+	stop, err := call("arena.bot.stop")
+	if err != nil {
+		return botVocabulary{}, err
 	}
-	if policy.ShootRange < 0 {
-		return fmt.Errorf("bot shoot_range must be non-negative")
-	}
-	return nil
-}
-
-func registerBotPolicyRoutes(mux *http.ServeMux, runtime *arenaRuntime) {
-	mux.HandleFunc("GET /bot-policy", func(w http.ResponseWriter, _ *http.Request) {
-		definition, revision, ok := runtime.system.CurrentDefinition(botKind)
-		if !ok {
-			http.Error(w, "bot definition is not registered", 404)
-			return
-		}
-		policy, err := readBotPolicy(definition)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		writeJSON(w, map[string]any{"policy": policy, "revision": revision})
-	})
-	handle := func(publish bool) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			var policy botPolicy
-			decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
-			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(&policy); err != nil {
-				http.Error(w, "decode policy: "+err.Error(), 400)
-				return
-			}
-			if err := decoder.Decode(&struct{}{}); err != io.EOF {
-				http.Error(w, "policy contains trailing data", 400)
-				return
-			}
-			if err := validatePolicy(policy); err != nil {
-				http.Error(w, err.Error(), 422)
-				return
-			}
-			_, revision, err := runtime.botPolicyCandidate(policy)
-			if publish {
-				revision, err = runtime.publishBotPolicy(r.Context(), policy)
-				if err != nil {
-					http.Error(w, err.Error(), 422)
-					return
-				}
-			} else if err != nil {
-				http.Error(w, err.Error(), 422)
-				return
-			}
-			writeJSON(w, map[string]any{"chart_id": botKind, "revision": revision, "policy": policy})
-		}
-	}
-	mux.HandleFunc("POST /bot-policy/validate", handle(false))
-	mux.HandleFunc("PUT /bot-policy", handle(true))
+	return botVocabulary{
+		Actions: []botVocabularyAction{
+			{Name: "arena.bot.start", Version: "v1", Summary: "Join the authoritative match and subscribe to snapshots.", Example: start, Constraints: []string{"Call while handling bot.start before strategy actions."}},
+			{Name: "arena.bot.observe", Version: "v1", Summary: "Read the current match.snapshot and emit one ordinary player input.", Example: observe, Constraints: []string{"Requires one arena.bot-policy/v1 go.literal.", "target_priority: nearest | powerups | creatures", "shoot_range: 0 disables shooting"}},
+			{Name: "arena.bot.stop", Version: "v1", Summary: "Unsubscribe and release the controller lease.", Example: stop, Constraints: []string{"Call while handling bot.stop and transition to a final state for clean rollout."}},
+		},
+		Events: []botVocabularyEvent{
+			{Name: "bot.start", Summary: "Runtime configuration delivered once to a new controller."},
+			{Name: "match.snapshot", Summary: "Authoritative world update; strategy actions inspect this event."},
+			{Name: "bot.stop", Summary: "Rollout asks the old controller to release its lease and finish."},
+		},
+		States:      []string{"atomic", "compound", "parallel", "final", "history"},
+		Executables: []string{"call", "raise", "send", "cancel", "log", "assign", "choose", "foreach", "script"},
+	}, nil
 }
 
 func readMatchDefinition(request *http.Request) (statecharts.Definition, error) {
