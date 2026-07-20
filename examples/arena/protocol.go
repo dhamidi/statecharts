@@ -20,7 +20,6 @@ const (
 	snapshotTag         = "arena.snapshot/v1"
 	connectionConfigTag = "arena.connection-config/v1"
 	botConfigTag        = "arena.bot-config/v1"
-	botPolicyTag        = "arena.bot-policy/v1"
 )
 
 type matchConfig struct {
@@ -61,15 +60,6 @@ type botConfig struct {
 	Name               string `json:"name"`
 	Color              string `json:"color"`
 	DefinitionRevision string `json:"definition_revision"`
-}
-
-type botPolicy struct {
-	TargetPriority string `json:"target_priority"`
-	ShootRange     int    `json:"shoot_range"`
-}
-
-func defaultBotPolicy() botPolicy {
-	return botPolicy{TargetPriority: "nearest", ShootRange: 64}
 }
 
 type clientMessage struct {

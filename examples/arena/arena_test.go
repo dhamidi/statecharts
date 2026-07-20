@@ -280,7 +280,12 @@ func TestBotMovesTowardPowerupInsteadOfShootingIt(t *testing.T) {
 		Creatures: []creature{{ID: "bot", X: 2, Y: 2, Facing: directionRight, Connected: true}},
 		Powerups:  []powerup{{X: 3, Y: 2, Kind: "charge"}},
 	}
-	if action := chooseBotAction(snapshot, "bot"); action != actionRight {
+	self := snapshot.Creatures[0]
+	target, creature, ok := nearestBotTarget(snapshot, self, botTargetPowerup)
+	if !ok || creature {
+		t.Fatalf("powerup target = %+v, creature=%v, found=%v", target, creature, ok)
+	}
+	if action := botRoute(snapshot, self, target, creature); action != actionRight {
 		t.Fatalf("action = %q, want %q toward powerup", action, actionRight)
 	}
 }
@@ -292,29 +297,38 @@ func TestBotRoutesAroundWallBlockingDirectPath(t *testing.T) {
 		Powerups:  []powerup{{X: 4, Y: 2, Kind: "charge"}},
 		Walls:     []tile{{X: 3, Y: 2}},
 	}
-	action := chooseBotAction(snapshot, "bot")
+	self := snapshot.Creatures[0]
+	target, creature, ok := nearestBotTarget(snapshot, self, botTargetPowerup)
+	if !ok {
+		t.Fatal("powerup target not found")
+	}
+	action := botRoute(snapshot, self, target, creature)
 	if action != actionUp && action != actionDown {
 		t.Fatalf("action = %q, want a legal detour around wall", action)
 	}
 }
 
-func TestBotPolicyChangesTargetAndShootRange(t *testing.T) {
+func TestBotTargetSelectionIsComposable(t *testing.T) {
 	snapshot := arenaSnapshot{Width: 9, Height: 9, Tick: 1, Creatures: []creature{
 		{ID: "bot", X: 2, Y: 2, Facing: directionRight, Connected: true},
 		{ID: "enemy", X: 4, Y: 2, Connected: true},
 	}, Powerups: []powerup{{X: 2, Y: 5, Kind: "charge"}}}
-	if got := chooseBotAction(snapshot, "bot", botPolicy{TargetPriority: "creatures", ShootRange: 0}); got != actionRight {
-		t.Fatalf("shoot-disabled creature action = %q, want right", got)
+	self := snapshot.Creatures[0]
+	opponent, creature, ok := nearestBotTarget(snapshot, self, botTargetOpponent)
+	if !ok || !creature || opponent != (tile{X: 4, Y: 2}) {
+		t.Fatalf("opponent target = %+v, creature=%v, found=%v", opponent, creature, ok)
 	}
-	if got := chooseBotAction(snapshot, "bot", botPolicy{TargetPriority: "creatures", ShootRange: 2}); got != actionShoot {
-		t.Fatalf("in-range creature action = %q, want shoot", got)
+	item, creature, ok := nearestBotTarget(snapshot, self, botTargetPowerup)
+	if !ok || creature || item != (tile{X: 2, Y: 5}) {
+		t.Fatalf("powerup target = %+v, creature=%v, found=%v", item, creature, ok)
 	}
-	if got := chooseBotAction(snapshot, "bot", botPolicy{TargetPriority: "powerups", ShootRange: 2}); got != actionDown {
-		t.Fatalf("powerup-priority action = %q, want down", got)
+	nearest, creature, ok := nearestBotTarget(snapshot, self, botTargetNearest)
+	if !ok || !creature || nearest != opponent {
+		t.Fatalf("nearest target = %+v, creature=%v, found=%v", nearest, creature, ok)
 	}
 }
 
-func TestBotDefinitionAllowsFreeFormBehaviorWithValidObserveCalls(t *testing.T) {
+func TestBotDefinitionAllowsFreeFormBehaviorWithValidCapabilityArguments(t *testing.T) {
 	chart, err := buildBotChart()
 	if err != nil {
 		t.Fatal(err)
@@ -324,8 +338,8 @@ func TestBotDefinitionAllowsFreeFormBehaviorWithValidObserveCalls(t *testing.T) 
 		t.Fatalf("default definition is invalid: %v", err)
 	}
 
-	withoutObserve := valid.Clone()
-	active := &withoutObserve.Root.Children[0]
+	withoutDecisions := valid.Clone()
+	active := &withoutDecisions.Root.Children[0]
 	transitions := active.Transitions[:0]
 	for _, transition := range active.Transitions {
 		if len(transition.Events) != 1 || transition.Events[0] != "match.snapshot" {
@@ -333,22 +347,108 @@ func TestBotDefinitionAllowsFreeFormBehaviorWithValidObserveCalls(t *testing.T) 
 		}
 	}
 	active.Transitions = transitions
-	if err := validateBotDefinition(withoutObserve); err != nil {
-		t.Fatalf("definition without observe action is invalid: %v", err)
-	}
-
-	multipleObserve := valid.Clone()
-	multipleObserve.Root.Children[0].Transitions = append(multipleObserve.Root.Children[0].Transitions, valid.Root.Children[0].Transitions[1])
-	if err := validateBotDefinition(multipleObserve); err != nil {
-		t.Fatalf("definition with multiple observe actions is invalid: %v", err)
+	if err := validateBotDefinition(withoutDecisions); err != nil {
+		t.Fatalf("definition without snapshot decisions is invalid: %v", err)
 	}
 
 	invalid := valid.Clone()
-	if !setFirstBotPolicy(&invalid.Root, botPolicy{TargetPriority: "anything", ShootRange: 1}) {
-		t.Fatal("definition has no bot policy")
+	invalidDirection, _ := statecharts.StringValue("sideways")
+	if !setFirstBotActionArguments(&invalid.Root, "arena.bot.move", statecharts.GoLiteral(invalidDirection)) {
+		t.Fatal("definition has no move action")
 	}
 	if err := validateBotDefinition(invalid); err == nil {
-		t.Fatal("invalid target priority was accepted")
+		t.Fatal("invalid movement direction was accepted")
+	}
+}
+
+func TestBotDefinitionRejectsCapabilitiesOutsideTheirEvents(t *testing.T) {
+	chart, err := buildBotChart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := chart.Definition()
+
+	tests := []struct {
+		name   string
+		mutate func(*statecharts.StateDefinition)
+	}{
+		{
+			name: "snapshot action on start",
+			mutate: func(active *statecharts.StateDefinition) {
+				active.Transitions[7].Events = []statecharts.Identifier{"bot.start"}
+			},
+		},
+		{
+			name: "snapshot condition on start",
+			mutate: func(active *statecharts.StateDefinition) {
+				active.Transitions[1].Events = []statecharts.Identifier{"bot.start"}
+			},
+		},
+		{
+			name: "start action on stop",
+			mutate: func(active *statecharts.StateDefinition) {
+				active.Transitions[0].Events = []statecharts.Identifier{"bot.stop"}
+			},
+		},
+		{
+			name: "snapshot action on entry",
+			mutate: func(active *statecharts.StateDefinition) {
+				active.OnEntry = active.Transitions[7].Actions
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			definition := valid.Clone()
+			test.mutate(&definition.Root.Children[0])
+			if err := validateBotDefinition(definition); err == nil {
+				t.Fatal("definition accepted a capability outside its required event")
+			}
+		})
+	}
+}
+
+func TestBotChartExposesComposableDecisionVocabulary(t *testing.T) {
+	chart, err := buildBotChart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := chart.Definition()
+	actions := map[statecharts.Identifier]bool{}
+	conditions := map[statecharts.Identifier]bool{}
+	var visit func(statecharts.StateDefinition)
+	visit = func(state statecharts.StateDefinition) {
+		for _, transition := range state.Transitions {
+			if transition.Condition != nil {
+				if name, ok := goReferenceName(*transition.Condition); ok {
+					conditions[name] = true
+				}
+			}
+			for _, block := range transition.Actions {
+				for _, executable := range block {
+					if executable.Call != nil {
+						actions[executable.Call.Function.Name] = true
+					}
+				}
+			}
+		}
+		for _, child := range state.Children {
+			visit(child)
+		}
+	}
+	visit(definition.Root)
+	for _, name := range []statecharts.Identifier{"arena.bot.move", "arena.bot.move-toward", "arena.bot.shoot", "arena.bot.wander"} {
+		if !actions[name] {
+			t.Errorf("default bot chart does not demonstrate action %q", name)
+		}
+	}
+	for _, name := range []statecharts.Identifier{"arena.bot.target-exists", "arena.bot.opponent-in-sights", "arena.bot.power-at-least"} {
+		if !conditions[name] {
+			t.Errorf("default bot chart does not demonstrate condition %q", name)
+		}
+	}
+	if actions["arena.bot.observe"] {
+		t.Fatal("default bot chart still hides decision-making behind arena.bot.observe")
 	}
 }
 
@@ -483,31 +583,27 @@ func TestAllBotRolloutPinsEveryReplacementToOnePublishedRevision(t *testing.T) {
 	}
 }
 
-func setFirstBotPolicy(state *statecharts.StateDefinition, policy botPolicy) bool {
-	value, err := taggedStruct(botPolicyTag, policy)
-	if err != nil {
-		return false
-	}
+func setFirstBotActionArguments(state *statecharts.StateDefinition, name statecharts.Identifier, arguments ...statecharts.Expression) bool {
 	for transitionIndex := range state.Transitions {
 		for blockIndex := range state.Transitions[transitionIndex].Actions {
 			for actionIndex := range state.Transitions[transitionIndex].Actions[blockIndex] {
 				action := &state.Transitions[transitionIndex].Actions[blockIndex][actionIndex]
-				if action.Call != nil && action.Call.Function.Name == "arena.bot.observe" {
-					action.Call.Function.Args = []statecharts.Expression{statecharts.GoLiteral(value)}
+				if action.Call != nil && action.Call.Function.Name == name {
+					action.Call.Function.Args = arguments
 					return true
 				}
 			}
 		}
 	}
 	for index := range state.Children {
-		if setFirstBotPolicy(&state.Children[index], policy) {
+		if setFirstBotActionArguments(&state.Children[index], name, arguments...) {
 			return true
 		}
 	}
 	return false
 }
 
-func TestBotDefinitionWorkbenchExposesFullDefinitionAndVocabulary(t *testing.T) {
+func TestBotDefinitionWorkbenchUsesHTMLCFormAndComposableVocabulary(t *testing.T) {
 	runtime, err := setupArena(context.Background(), runtimeOptions{TickInterval: time.Hour, Bots: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -527,10 +623,22 @@ func TestBotDefinitionWorkbenchExposesFullDefinitionAndVocabulary(t *testing.T) 
 	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/html") {
 		t.Fatalf("editor response = %d %q", response.StatusCode, response.Header.Get("Content-Type"))
 	}
-	if text := string(editor); !strings.Contains(text, "FULL DEFINITION") || !strings.Contains(text, "ACTION VOCABULARY") {
-		t.Fatalf("editor does not foreground the full chart and vocabulary")
-	} else if strings.Contains(text, "POLICY DRAFT") || strings.Contains(text, "LIVE ARENA PREVIEW") {
-		t.Fatalf("editor still renders the old policy dashboard")
+	if text := string(editor); !strings.Contains(text, "<bot-chart-editor") || !strings.Contains(text, "STATES &amp; TRANSITIONS") {
+		t.Fatalf("editor is not rendered as the htmlc bot-chart-editor form component")
+	} else if strings.Contains(text, `<textarea id="definition"`) || strings.Contains(text, "FULL DEFINITION") {
+		t.Fatalf("editor still foregrounds the raw Definition JSON")
+	}
+	response, err = http.Get(server.URL + "/scripts/index.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scriptIndex, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(scriptIndex), "bot-chart-editor") {
+		t.Fatalf("htmlc script index = %d %q", response.StatusCode, scriptIndex)
 	}
 
 	response, err = http.Get(server.URL + "/definitions/bot/vocabulary")
@@ -539,10 +647,19 @@ func TestBotDefinitionWorkbenchExposesFullDefinitionAndVocabulary(t *testing.T) 
 	}
 	var vocabulary struct {
 		Actions []struct {
-			Name    string          `json:"name"`
-			Version string          `json:"version"`
-			Example json.RawMessage `json:"example"`
+			Name       string           `json:"name"`
+			Version    string           `json:"version"`
+			Parameters []map[string]any `json:"parameters"`
+			Events     []string         `json:"events"`
+			Example    json.RawMessage  `json:"example"`
 		} `json:"actions"`
+		Conditions []struct {
+			Name       string           `json:"name"`
+			Version    string           `json:"version"`
+			Parameters []map[string]any `json:"parameters"`
+			Events     []string         `json:"events"`
+			Example    json.RawMessage  `json:"example"`
+		} `json:"conditions"`
 		Events []struct {
 			Name string `json:"name"`
 		} `json:"events"`
@@ -551,12 +668,31 @@ func TestBotDefinitionWorkbenchExposesFullDefinitionAndVocabulary(t *testing.T) 
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || len(vocabulary.Actions) != 3 || len(vocabulary.Events) != 3 {
+	if response.StatusCode != http.StatusOK || len(vocabulary.Actions) < 6 || len(vocabulary.Conditions) < 6 || len(vocabulary.Events) != 3 {
 		t.Fatalf("vocabulary = %d %+v", response.StatusCode, vocabulary)
 	}
+	actionNames := map[string]bool{}
 	for _, action := range vocabulary.Actions {
-		if action.Name == "" || action.Version == "" || !json.Valid(action.Example) {
+		if action.Name == "" || action.Version == "" || len(action.Events) == 0 || !json.Valid(action.Example) {
 			t.Fatalf("incomplete action vocabulary entry: %+v", action)
+		}
+		actionNames[action.Name] = true
+	}
+	conditionNames := map[string]bool{}
+	for _, condition := range vocabulary.Conditions {
+		if condition.Name == "" || condition.Version == "" || len(condition.Events) == 0 || !json.Valid(condition.Example) {
+			t.Fatalf("incomplete condition vocabulary entry: %+v", condition)
+		}
+		conditionNames[condition.Name] = true
+	}
+	for _, name := range []string{"arena.bot.move", "arena.bot.move-toward", "arena.bot.shoot", "arena.bot.wander"} {
+		if !actionNames[name] {
+			t.Errorf("action vocabulary omits %q", name)
+		}
+	}
+	for _, name := range []string{"arena.bot.target-exists", "arena.bot.target-within", "arena.bot.opponent-in-sights", "arena.bot.health-below", "arena.bot.power-at-least", "arena.bot.tick-every"} {
+		if !conditionNames[name] {
+			t.Errorf("condition vocabulary omits %q", name)
 		}
 	}
 
@@ -584,7 +720,7 @@ func TestBotDefinitionWorkbenchExposesFullDefinitionAndVocabulary(t *testing.T) 
 		}
 	}
 	active.Transitions = transitions
-	definition.RevisionSalt = "free-form-no-observe"
+	definition.RevisionSalt = "free-form-no-decisions"
 	definitionData, err = statejson.Marshal(definition)
 	if err != nil {
 		t.Fatal(err)

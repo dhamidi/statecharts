@@ -274,9 +274,25 @@ type botModel struct {
 	NextSequence uint64 `json:"next_sequence"`
 }
 
-func buildBotChart() (*statecharts.Chart, error) {
+type botReferences struct {
+	start            statecharts.GoActionRef
+	stop             statecharts.GoActionRef
+	move             statecharts.GoActionRef
+	moveToward       statecharts.GoActionRef
+	shoot            statecharts.GoActionRef
+	wander           statecharts.GoActionRef
+	targetExists     statecharts.GoConditionRef
+	targetWithin     statecharts.GoConditionRef
+	opponentInSights statecharts.GoConditionRef
+	healthBelow      statecharts.GoConditionRef
+	powerAtLeast     statecharts.GoConditionRef
+	tickEvery        statecharts.GoConditionRef
+}
+
+func newBotBuilder() (*statecharts.Builder[botModel], botReferences) {
 	bot := statecharts.New(botKind, func() *botModel { return &botModel{} }, statecharts.Version("v1"))
-	start := bot.Action("start", func(data *botModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	refs := botReferences{}
+	refs.start = bot.Action("start", func(data *botModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		event, _ := ec.Event()
 		var config botConfig
 		if err := decodeTaggedStruct(event.Data, botConfigTag, &config); err != nil {
@@ -295,44 +311,142 @@ func buildBotChart() (*statecharts.Chart, error) {
 		ec.Send("subscriber.add", statecharts.SendOptions{Target: statecharts.Identifier(config.Match), Data: subscribe})
 		return nil
 	})
-	observe := bot.Action("observe", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) error {
-		var policy botPolicy
+	refs.move = bot.Action("move", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) error {
 		if len(args) != 1 {
-			return fmt.Errorf("bot observe requires one policy argument")
+			return fmt.Errorf("bot move requires one direction argument")
 		}
-		if err := decodeTaggedStruct(args[0], botPolicyTag, &policy); err != nil {
-			return err
-		}
-		event, _ := ec.Event()
-		var snapshot arenaSnapshot
-		if err := decodeTaggedStruct(event.Data, snapshotTag, &snapshot); err != nil {
-			return err
-		}
-		self := snapshotPlayer(snapshot, data.Player)
-		if self.LastSequence > data.NextSequence {
-			data.NextSequence = self.LastSequence
-		}
-		if snapshot.Tick <= data.LastTick {
-			return nil
-		}
-		data.LastTick = snapshot.Tick
-		action := chooseBotAction(snapshot, data.Player, policy)
-		if action == "" {
-			return nil
-		}
-		data.NextSequence++
-		input, err := taggedStruct(inputTag, playerInput{Player: data.Player, Lease: ec.SessionID(), Sequence: data.NextSequence, Action: action})
+		direction, err := botStringArgument(args, 0, "direction", actionUp, actionDown, actionLeft, actionRight)
 		if err != nil {
 			return err
 		}
-		ec.Send("player.input", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: input})
-		return nil
+		return emitBotAction(data, ec, direction)
 	})
-	policy, err := taggedStruct(botPolicyTag, defaultBotPolicy())
-	if err != nil {
-		return nil, err
-	}
-	stop := bot.Action("stop", func(data *botModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
+	refs.moveToward = bot.Action("move-toward", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) error {
+		if len(args) != 1 {
+			return fmt.Errorf("bot move-toward requires one target argument")
+		}
+		targetKind, err := botStringArgument(args, 0, "target", botTargetNearest, botTargetOpponent, botTargetPowerup)
+		if err != nil {
+			return err
+		}
+		snapshot, self, err := botSnapshot(data, ec)
+		if err != nil {
+			return err
+		}
+		target, creature, ok := nearestBotTarget(snapshot, self, targetKind)
+		if !ok {
+			return consumeBotTick(data, ec, snapshot, "")
+		}
+		return consumeBotTick(data, ec, snapshot, botRoute(snapshot, self, target, creature))
+	})
+	refs.shoot = bot.Action("shoot", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) error {
+		if len(args) != 0 {
+			return fmt.Errorf("bot shoot takes no arguments")
+		}
+		return emitBotAction(data, ec, actionShoot)
+	})
+	refs.wander = bot.Action("wander", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) error {
+		if len(args) != 0 {
+			return fmt.Errorf("bot wander takes no arguments")
+		}
+		snapshot, self, err := botSnapshot(data, ec)
+		if err != nil {
+			return err
+		}
+		return consumeBotTick(data, ec, snapshot, botFallbackAction(snapshot, self))
+	})
+	refs.targetExists = bot.Condition("target-exists", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
+		if len(args) != 1 {
+			return false, fmt.Errorf("bot target-exists requires one target argument")
+		}
+		targetKind, err := botStringArgument(args, 0, "target", botTargetNearest, botTargetOpponent, botTargetPowerup)
+		if err != nil {
+			return false, err
+		}
+		snapshot, self, err := botSnapshot(data, ec)
+		if err != nil {
+			return false, err
+		}
+		_, _, ok := nearestBotTarget(snapshot, self, targetKind)
+		return ok, nil
+	})
+	refs.targetWithin = bot.Condition("target-within", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
+		if len(args) != 2 {
+			return false, fmt.Errorf("bot target-within requires target and distance arguments")
+		}
+		targetKind, err := botStringArgument(args, 0, "target", botTargetNearest, botTargetOpponent, botTargetPowerup)
+		if err != nil {
+			return false, err
+		}
+		distance, err := botIntArgument(args, 1, "distance", 0)
+		if err != nil {
+			return false, err
+		}
+		snapshot, self, err := botSnapshot(data, ec)
+		if err != nil {
+			return false, err
+		}
+		target, _, ok := nearestBotTarget(snapshot, self, targetKind)
+		return ok && abs(target.X-self.X)+abs(target.Y-self.Y) <= distance, nil
+	})
+	refs.opponentInSights = bot.Condition("opponent-in-sights", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
+		if len(args) != 1 {
+			return false, fmt.Errorf("bot opponent-in-sights requires one range argument")
+		}
+		rangeLimit, err := botIntArgument(args, 0, "range", 1)
+		if err != nil {
+			return false, err
+		}
+		snapshot, self, err := botSnapshot(data, ec)
+		if err != nil {
+			return false, err
+		}
+		for _, other := range snapshot.Creatures {
+			if other.ID == self.ID || !other.Connected {
+				continue
+			}
+			distance := abs(other.X-self.X) + abs(other.Y-self.Y)
+			direction, aligned := alignedDirection(self, tile{X: other.X, Y: other.Y})
+			if distance <= rangeLimit && aligned && direction == self.Facing && botLineClear(snapshot, self, tile{X: other.X, Y: other.Y}) {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	refs.healthBelow = bot.Condition("health-below", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
+		if len(args) != 1 {
+			return false, fmt.Errorf("bot health-below requires one health argument")
+		}
+		threshold, err := botIntArgument(args, 0, "health", 1)
+		if err != nil {
+			return false, err
+		}
+		_, self, err := botSnapshot(data, ec)
+		return self.Health < threshold, err
+	})
+	refs.powerAtLeast = bot.Condition("power-at-least", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
+		if len(args) != 1 {
+			return false, fmt.Errorf("bot power-at-least requires one power argument")
+		}
+		threshold, err := botIntArgument(args, 0, "power", 0)
+		if err != nil {
+			return false, err
+		}
+		_, self, err := botSnapshot(data, ec)
+		return self.Power >= threshold, err
+	})
+	refs.tickEvery = bot.Condition("tick-every", func(data *botModel, ec statecharts.ExecContext, args []statecharts.Value) (bool, error) {
+		if len(args) != 1 {
+			return false, fmt.Errorf("bot tick-every requires one interval argument")
+		}
+		interval, err := botIntArgument(args, 0, "interval", 1)
+		if err != nil {
+			return false, err
+		}
+		snapshot, _, err := botSnapshot(data, ec)
+		return err == nil && snapshot.Tick%uint64(interval) == 0, err
+	})
+	refs.stop = bot.Action("stop", func(data *botModel, ec statecharts.ExecContext, _ []statecharts.Value) error {
 		if data.Match == "" {
 			return nil
 		}
@@ -345,67 +459,131 @@ func buildBotChart() (*statecharts.Chart, error) {
 		ec.Send("player.disconnect", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: disconnect})
 		return nil
 	})
+	return bot, refs
+}
+
+func buildBotChart() (*statecharts.Chart, error) {
+	bot, refs := newBotBuilder()
+	nearest, _ := statecharts.StringValue(botTargetNearest)
+	opponent, _ := statecharts.StringValue(botTargetOpponent)
+	powerup, _ := statecharts.StringValue(botTargetPowerup)
+	right, _ := statecharts.StringValue(actionRight)
 	return bot.Build(statecharts.Compound(botKind, "active", statecharts.Children(
 		statecharts.Atomic("active",
-			statecharts.On("bot.start", statecharts.Then(start.Call())),
-			statecharts.On("match.snapshot", statecharts.Then(observe.Call(statecharts.GoLiteral(policy)))),
-			statecharts.On("bot.stop", statecharts.Target("stopped"), statecharts.Then(stop.Call())),
+			statecharts.On("bot.start", statecharts.Then(refs.start.Call())),
+			statecharts.On("match.snapshot", statecharts.If(refs.opponentInSights.If(statecharts.GoLiteral(statecharts.Int64Value(8)))), statecharts.Then(refs.shoot.Call())),
+			statecharts.On("match.snapshot", statecharts.If(refs.tickEvery.If(statecharts.GoLiteral(statecharts.Int64Value(8)))), statecharts.Then(refs.move.Call(statecharts.GoLiteral(right)))),
+			statecharts.On("match.snapshot", statecharts.If(refs.powerAtLeast.If(statecharts.GoLiteral(statecharts.Int64Value(1)))), statecharts.Then(refs.moveToward.Call(statecharts.GoLiteral(opponent)))),
+			statecharts.On("match.snapshot", statecharts.If(refs.targetExists.If(statecharts.GoLiteral(powerup))), statecharts.Then(refs.moveToward.Call(statecharts.GoLiteral(powerup)))),
+			statecharts.On("match.snapshot", statecharts.If(refs.targetExists.If(statecharts.GoLiteral(opponent))), statecharts.Then(refs.moveToward.Call(statecharts.GoLiteral(opponent)))),
+			statecharts.On("match.snapshot", statecharts.If(refs.targetExists.If(statecharts.GoLiteral(nearest))), statecharts.Then(refs.wander.Call())),
+			statecharts.On("match.snapshot", statecharts.Then(refs.wander.Call())),
+			statecharts.On("bot.stop", statecharts.Target("stopped"), statecharts.Then(refs.stop.Call())),
 		), statecharts.Final("stopped"))))
 }
 
-func chooseBotAction(snapshot arenaSnapshot, player string, policies ...botPolicy) string {
-	policy := defaultBotPolicy()
-	if len(policies) > 0 {
-		policy = policies[0]
+const (
+	botTargetNearest  = "nearest"
+	botTargetOpponent = "opponent"
+	botTargetPowerup  = "powerup"
+)
+
+func botStringArgument(args []statecharts.Value, index int, name string, allowed ...string) (string, error) {
+	if index >= len(args) {
+		return "", fmt.Errorf("bot %s argument is required", name)
 	}
-	self := snapshotPlayer(snapshot, player)
+	value, ok := args[index].AsString()
+	if !ok {
+		return "", fmt.Errorf("bot %s must be a string", name)
+	}
+	for _, candidate := range allowed {
+		if value == candidate {
+			return value, nil
+		}
+	}
+	return "", fmt.Errorf("bot %s must be one of %v", name, allowed)
+}
+
+func botIntArgument(args []statecharts.Value, index int, name string, minimum int) (int, error) {
+	if index >= len(args) {
+		return 0, fmt.Errorf("bot %s argument is required", name)
+	}
+	value, ok := args[index].AsInt64()
+	if !ok || value < int64(minimum) || value > int64(^uint(0)>>1) {
+		return 0, fmt.Errorf("bot %s must be an integer at least %d", name, minimum)
+	}
+	return int(value), nil
+}
+
+func botSnapshot(data *botModel, ec statecharts.ExecContext) (arenaSnapshot, creature, error) {
+	event, ok := ec.Event()
+	if !ok || event.Name != "match.snapshot" {
+		return arenaSnapshot{}, creature{}, fmt.Errorf("bot decision capability requires match.snapshot")
+	}
+	var snapshot arenaSnapshot
+	if err := decodeTaggedStruct(event.Data, snapshotTag, &snapshot); err != nil {
+		return arenaSnapshot{}, creature{}, err
+	}
+	self := snapshotPlayer(snapshot, data.Player)
 	if self.ID == "" {
-		return ""
+		return arenaSnapshot{}, creature{}, fmt.Errorf("bot %q is absent from match snapshot", data.Player)
 	}
-	target := tile{}
-	targetIsCreature := false
-	hasTarget := false
+	if self.LastSequence > data.NextSequence {
+		data.NextSequence = self.LastSequence
+	}
+	return snapshot, self, nil
+}
+
+func emitBotAction(data *botModel, ec statecharts.ExecContext, action string) error {
+	snapshot, _, err := botSnapshot(data, ec)
+	if err != nil {
+		return err
+	}
+	return consumeBotTick(data, ec, snapshot, action)
+}
+
+func consumeBotTick(data *botModel, ec statecharts.ExecContext, snapshot arenaSnapshot, action string) error {
+	if snapshot.Tick <= data.LastTick {
+		return nil
+	}
+	data.LastTick = snapshot.Tick
+	if action == "" {
+		return nil
+	}
+	data.NextSequence++
+	input, err := taggedStruct(inputTag, playerInput{Player: data.Player, Lease: ec.SessionID(), Sequence: data.NextSequence, Action: action})
+	if err != nil {
+		return err
+	}
+	ec.Send("player.input", statecharts.SendOptions{Target: statecharts.Identifier(data.Match), Data: input})
+	return nil
+}
+
+func nearestBotTarget(snapshot arenaSnapshot, self creature, kind string) (tile, bool, bool) {
 	best := int(^uint(0) >> 1)
-	if policy.TargetPriority != "powerups" {
+	var target tile
+	targetIsCreature := false
+	found := false
+	if kind != botTargetPowerup {
 		for _, other := range snapshot.Creatures {
-			if other.ID == player || !other.Connected {
+			if other.ID == self.ID || !other.Connected {
 				continue
 			}
 			distance := abs(other.X-self.X) + abs(other.Y-self.Y)
 			if distance < best {
-				best = distance
-				target = tile{X: other.X, Y: other.Y}
-				targetIsCreature = true
-				hasTarget = true
+				best, target, targetIsCreature, found = distance, tile{X: other.X, Y: other.Y}, true, true
 			}
 		}
 	}
-	if policy.TargetPriority != "creatures" {
+	if kind != botTargetOpponent {
 		for _, item := range snapshot.Powerups {
 			distance := abs(item.X-self.X) + abs(item.Y-self.Y)
 			if distance < best {
-				best = distance
-				target = tile{X: item.X, Y: item.Y}
-				targetIsCreature = false
-				hasTarget = true
+				best, target, targetIsCreature, found = distance, tile{X: item.X, Y: item.Y}, false, true
 			}
 		}
 	}
-	if !hasTarget {
-		return botFallbackAction(snapshot, self)
-	}
-	if targetIsCreature {
-		if direction, aligned := alignedDirection(self, target); policy.ShootRange > 0 && best <= policy.ShootRange && aligned && botLineClear(snapshot, self, target) {
-			if self.Facing == direction {
-				return actionShoot
-			}
-			return direction
-		}
-	}
-	if action := botRoute(snapshot, self, target, targetIsCreature); action != "" {
-		return action
-	}
-	return botFallbackAction(snapshot, self)
+	return target, targetIsCreature, found
 }
 
 type botDirection struct {

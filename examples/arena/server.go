@@ -21,6 +21,7 @@ func arenaHandler(runtime *arenaRuntime) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", indexHandler)
 	mux.HandleFunc("GET /editor/bots", editorHandler)
+	mux.Handle("GET /scripts/", http.StripPrefix("/scripts/", editorEngine.ScriptHandler()))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET /ws", runtime.socketHandler)
 	registerAdministrationRoutes(mux, runtime)
@@ -183,38 +184,59 @@ func registerDefinitionRoutes(mux *http.ServeMux, runtime *arenaRuntime, path st
 }
 
 func validateBotDefinition(definition statecharts.Definition) error {
-	var validateBlocks func([]statecharts.ExecutableBlock) error
-	validateBlocks = func(blocks []statecharts.ExecutableBlock) error {
+	actionCapabilities, conditionCapabilities := botCapabilitySchemas()
+	validateFunction := func(function statecharts.FunctionRef, capabilities map[statecharts.Identifier]botVocabularyCapability, events []statecharts.Identifier) error {
+		capability, known := capabilities[function.Name]
+		if !known {
+			return nil
+		}
+		if !botCapabilitySupportsEvents(capability, events) {
+			return fmt.Errorf("%s requires event %s", function.Name, strings.Join(identifiersToStrings(capability.Events), " or "))
+		}
+		if len(function.Args) != len(capability.Parameters) {
+			return fmt.Errorf("%s requires %d argument(s), got %d", function.Name, len(capability.Parameters), len(function.Args))
+		}
+		for index, parameter := range capability.Parameters {
+			if err := validateBotArgument(function.Args[index], parameter); err != nil {
+				return fmt.Errorf("%s argument %q: %w", function.Name, parameter.Name, err)
+			}
+		}
+		return nil
+	}
+	validateCondition := func(expression *statecharts.Expression, events []statecharts.Identifier) error {
+		if expression == nil || expression.Kind != "go.condition" {
+			return nil
+		}
+		function, err := goReference(*expression)
+		if err != nil {
+			return err
+		}
+		return validateFunction(function, conditionCapabilities, events)
+	}
+	var validateBlocks func([]statecharts.ExecutableBlock, []statecharts.Identifier) error
+	validateBlocks = func(blocks []statecharts.ExecutableBlock, events []statecharts.Identifier) error {
 		for _, block := range blocks {
 			for _, executable := range block {
-				if executable.Call != nil && executable.Call.Function.Name == "arena.bot.observe" {
-					args := executable.Call.Function.Args
-					if len(args) != 1 || args[0].Kind != "go.literal" {
-						return fmt.Errorf("bot observe requires one literal policy argument")
-					}
-					var policy botPolicy
-					if err := decodeTaggedStruct(args[0].Data, botPolicyTag, &policy); err != nil {
-						return fmt.Errorf("invalid bot policy: %w", err)
-					}
-					if policy.TargetPriority != "nearest" && policy.TargetPriority != "powerups" && policy.TargetPriority != "creatures" {
-						return fmt.Errorf("invalid bot target_priority %q", policy.TargetPriority)
-					}
-					if policy.ShootRange < 0 {
-						return fmt.Errorf("bot shoot_range must be non-negative")
+				if executable.Call != nil {
+					if err := validateFunction(executable.Call.Function, actionCapabilities, events); err != nil {
+						return err
 					}
 				}
 				if executable.Choose != nil {
 					for _, branch := range executable.Choose.Branches {
-						if err := validateBlocks(branch.Actions); err != nil {
+						if err := validateCondition(&branch.Condition, events); err != nil {
+							return err
+						}
+						if err := validateBlocks(branch.Actions, events); err != nil {
 							return err
 						}
 					}
-					if err := validateBlocks(executable.Choose.Else); err != nil {
+					if err := validateBlocks(executable.Choose.Else, events); err != nil {
 						return err
 					}
 				}
 				if executable.ForEach != nil {
-					if err := validateBlocks(executable.ForEach.Actions); err != nil {
+					if err := validateBlocks(executable.ForEach.Actions, events); err != nil {
 						return err
 					}
 				}
@@ -224,24 +246,27 @@ func validateBotDefinition(definition statecharts.Definition) error {
 	}
 	var visit func(statecharts.StateDefinition) error
 	visit = func(state statecharts.StateDefinition) error {
-		if err := validateBlocks(state.OnEntry); err != nil {
+		if err := validateBlocks(state.OnEntry, nil); err != nil {
 			return err
 		}
-		if err := validateBlocks(state.OnExit); err != nil {
+		if err := validateBlocks(state.OnExit, nil); err != nil {
 			return err
 		}
 		if state.Initial != nil {
-			if err := validateBlocks(state.Initial.Actions); err != nil {
+			if err := validateBlocks(state.Initial.Actions, nil); err != nil {
 				return err
 			}
 		}
 		for _, transition := range state.Transitions {
-			if err := validateBlocks(transition.Actions); err != nil {
+			if err := validateCondition(transition.Condition, transition.Events); err != nil {
+				return err
+			}
+			if err := validateBlocks(transition.Actions, transition.Events); err != nil {
 				return err
 			}
 		}
 		for _, invoke := range state.Invokes {
-			if err := validateBlocks(invoke.Finalize); err != nil {
+			if err := validateBlocks(invoke.Finalize, nil); err != nil {
 				return err
 			}
 		}
@@ -255,12 +280,24 @@ func validateBotDefinition(definition statecharts.Definition) error {
 	return visit(definition.Root)
 }
 
-type botVocabularyAction struct {
-	Name        statecharts.Identifier `json:"name"`
-	Version     string                 `json:"version"`
-	Summary     string                 `json:"summary"`
-	Example     json.RawMessage        `json:"example"`
-	Constraints []string               `json:"constraints,omitempty"`
+type botVocabularyParameter struct {
+	Name    string   `json:"name"`
+	Label   string   `json:"label"`
+	Type    string   `json:"type"`
+	Default any      `json:"default"`
+	Options []string `json:"options,omitempty"`
+	Minimum *int     `json:"minimum,omitempty"`
+}
+
+type botVocabularyCapability struct {
+	Name        statecharts.Identifier   `json:"name"`
+	Version     string                   `json:"version"`
+	Category    string                   `json:"category"`
+	Summary     string                   `json:"summary"`
+	Example     json.RawMessage          `json:"example"`
+	Parameters  []botVocabularyParameter `json:"parameters"`
+	Events      []statecharts.Identifier `json:"events"`
+	Constraints []string                 `json:"constraints,omitempty"`
 }
 
 type botVocabularyEvent struct {
@@ -269,47 +306,189 @@ type botVocabularyEvent struct {
 }
 
 type botVocabulary struct {
-	Actions     []botVocabularyAction `json:"actions"`
-	Events      []botVocabularyEvent  `json:"events"`
-	States      []string              `json:"states"`
-	Executables []string              `json:"executables"`
+	Actions     []botVocabularyCapability `json:"actions"`
+	Conditions  []botVocabularyCapability `json:"conditions"`
+	Events      []botVocabularyEvent      `json:"events"`
+	States      []string                  `json:"states"`
+	Executables []string                  `json:"executables"`
 }
 
 func botDefinitionVocabulary() (botVocabulary, error) {
-	call := func(name statecharts.Identifier, args ...statecharts.Expression) (json.RawMessage, error) {
-		executable := statecharts.NewCallExecutable(statecharts.CallDefinition{Function: statecharts.FunctionRef{Name: name, Version: "v1", Args: args}})
+	_, refs := newBotBuilder()
+	call := func(executable statecharts.Executable) (json.RawMessage, error) {
 		return json.Marshal(executable)
 	}
-	start, err := call("arena.bot.start")
+	condition := func(expression statecharts.Expression) (json.RawMessage, error) {
+		return json.Marshal(expression)
+	}
+	stringLiteral := func(value string) statecharts.Expression {
+		result, _ := statecharts.StringValue(value)
+		return statecharts.GoLiteral(result)
+	}
+	integerLiteral := func(value int64) statecharts.Expression {
+		return statecharts.GoLiteral(statecharts.Int64Value(value))
+	}
+	minimum := func(value int) *int { return &value }
+	parameter := func(name, label, typ string, defaultValue any, options []string, min *int) botVocabularyParameter {
+		return botVocabularyParameter{Name: name, Label: label, Type: typ, Default: defaultValue, Options: options, Minimum: min}
+	}
+	action := func(name statecharts.Identifier, category, summary string, events []statecharts.Identifier, executable statecharts.Executable, parameters []botVocabularyParameter, constraints ...string) (botVocabularyCapability, error) {
+		if parameters == nil {
+			parameters = []botVocabularyParameter{}
+		}
+		example, err := call(executable)
+		return botVocabularyCapability{Name: name, Version: "v1", Category: category, Summary: summary, Example: example, Parameters: parameters, Events: events, Constraints: constraints}, err
+	}
+	check := func(name statecharts.Identifier, category, summary string, events []statecharts.Identifier, expression statecharts.Expression, parameters []botVocabularyParameter, constraints ...string) (botVocabularyCapability, error) {
+		if parameters == nil {
+			parameters = []botVocabularyParameter{}
+		}
+		example, err := condition(expression)
+		return botVocabularyCapability{Name: name, Version: "v1", Category: category, Summary: summary, Example: example, Parameters: parameters, Events: events, Constraints: constraints}, err
+	}
+	var vocabulary botVocabulary
+	var err error
+	appendAction := func(capability botVocabularyCapability, capabilityErr error) {
+		if err == nil {
+			err = capabilityErr
+		}
+		vocabulary.Actions = append(vocabulary.Actions, capability)
+	}
+	appendCondition := func(capability botVocabularyCapability, capabilityErr error) {
+		if err == nil {
+			err = capabilityErr
+		}
+		vocabulary.Conditions = append(vocabulary.Conditions, capability)
+	}
+	directions := []string{actionUp, actionDown, actionLeft, actionRight}
+	targets := []string{botTargetNearest, botTargetOpponent, botTargetPowerup}
+	startEvents := []statecharts.Identifier{"bot.start"}
+	snapshotEvents := []statecharts.Identifier{"match.snapshot"}
+	stopEvents := []statecharts.Identifier{"bot.stop"}
+	appendAction(action("arena.bot.start", "lifecycle", "Join the authoritative match and subscribe to snapshots.", startEvents, refs.start.Call(), nil, "Use on bot.start."))
+	appendAction(action("arena.bot.move", "movement", "Move one cell in an explicit direction.", snapshotEvents, refs.move.Call(stringLiteral(actionRight)), []botVocabularyParameter{parameter("direction", "Direction", "enum", actionRight, directions, nil)}, "Use on match.snapshot."))
+	appendAction(action("arena.bot.move-toward", "movement", "Pathfind one cell toward the nearest selected target.", snapshotEvents, refs.moveToward.Call(stringLiteral(botTargetPowerup)), []botVocabularyParameter{parameter("target", "Target", "enum", botTargetPowerup, targets, nil)}, "Use on match.snapshot."))
+	appendAction(action("arena.bot.wander", "movement", "Choose a deterministic available direction.", snapshotEvents, refs.wander.Call(), nil, "Use on match.snapshot."))
+	appendAction(action("arena.bot.shoot", "combat", "Fire in the current facing direction.", snapshotEvents, refs.shoot.Call(), nil, "Use on match.snapshot."))
+	appendAction(action("arena.bot.stop", "lifecycle", "Unsubscribe and release the controller lease.", stopEvents, refs.stop.Call(), nil, "Use on bot.stop and transition to a final state."))
+	appendCondition(check("arena.bot.target-exists", "sensing", "Whether a target of this kind exists.", snapshotEvents, refs.targetExists.If(stringLiteral(botTargetPowerup)), []botVocabularyParameter{parameter("target", "Target", "enum", botTargetPowerup, targets, nil)}))
+	appendCondition(check("arena.bot.target-within", "sensing", "Whether the nearest selected target is within Manhattan distance.", snapshotEvents, refs.targetWithin.If(stringLiteral(botTargetOpponent), integerLiteral(5)), []botVocabularyParameter{parameter("target", "Target", "enum", botTargetOpponent, targets, nil), parameter("distance", "Distance", "integer", 5, nil, minimum(0))}))
+	appendCondition(check("arena.bot.opponent-in-sights", "combat", "Whether a clear, aligned opponent is in front of the bot.", snapshotEvents, refs.opponentInSights.If(integerLiteral(8)), []botVocabularyParameter{parameter("range", "Range", "integer", 8, nil, minimum(1))}))
+	appendCondition(check("arena.bot.health-below", "status", "Whether health is below a threshold.", snapshotEvents, refs.healthBelow.If(integerLiteral(2)), []botVocabularyParameter{parameter("health", "Health", "integer", 2, nil, minimum(1))}))
+	appendCondition(check("arena.bot.power-at-least", "status", "Whether collected power is at least a threshold.", snapshotEvents, refs.powerAtLeast.If(integerLiteral(1)), []botVocabularyParameter{parameter("power", "Power", "integer", 1, nil, minimum(0))}))
+	appendCondition(check("arena.bot.tick-every", "timing", "True on every Nth authoritative match tick.", snapshotEvents, refs.tickEvery.If(integerLiteral(8)), []botVocabularyParameter{parameter("interval", "Every N ticks", "integer", 8, nil, minimum(1))}))
 	if err != nil {
 		return botVocabulary{}, err
 	}
-	policy, err := taggedStruct(botPolicyTag, defaultBotPolicy())
-	if err != nil {
-		return botVocabulary{}, err
+	vocabulary.Events = []botVocabularyEvent{
+		{Name: "bot.start", Summary: "Runtime configuration delivered once to a new controller."},
+		{Name: "match.snapshot", Summary: "Authoritative world update used by decision conditions and actions."},
+		{Name: "bot.stop", Summary: "Rollout asks the old controller to release its lease and finish."},
 	}
-	observe, err := call("arena.bot.observe", statecharts.GoLiteral(policy))
-	if err != nil {
-		return botVocabulary{}, err
+	vocabulary.States = []string{"atomic", "compound", "parallel", "final", "history"}
+	vocabulary.Executables = []string{"call", "raise", "send", "cancel", "log", "assign", "choose", "foreach", "script"}
+	return vocabulary, nil
+}
+
+func botCapabilitySchemas() (map[statecharts.Identifier]botVocabularyCapability, map[statecharts.Identifier]botVocabularyCapability) {
+	vocabulary, _ := botDefinitionVocabulary()
+	actions := make(map[statecharts.Identifier]botVocabularyCapability, len(vocabulary.Actions))
+	conditions := make(map[statecharts.Identifier]botVocabularyCapability, len(vocabulary.Conditions))
+	for _, capability := range vocabulary.Actions {
+		actions[capability.Name] = capability
 	}
-	stop, err := call("arena.bot.stop")
-	if err != nil {
-		return botVocabulary{}, err
+	for _, capability := range vocabulary.Conditions {
+		conditions[capability.Name] = capability
 	}
-	return botVocabulary{
-		Actions: []botVocabularyAction{
-			{Name: "arena.bot.start", Version: "v1", Summary: "Join the authoritative match and subscribe to snapshots.", Example: start, Constraints: []string{"Call while handling bot.start before strategy actions."}},
-			{Name: "arena.bot.observe", Version: "v1", Summary: "Read the current match.snapshot and emit one ordinary player input.", Example: observe, Constraints: []string{"Requires one arena.bot-policy/v1 go.literal.", "target_priority: nearest | powerups | creatures", "shoot_range: 0 disables shooting"}},
-			{Name: "arena.bot.stop", Version: "v1", Summary: "Unsubscribe and release the controller lease.", Example: stop, Constraints: []string{"Call while handling bot.stop and transition to a final state for clean rollout."}},
-		},
-		Events: []botVocabularyEvent{
-			{Name: "bot.start", Summary: "Runtime configuration delivered once to a new controller."},
-			{Name: "match.snapshot", Summary: "Authoritative world update; strategy actions inspect this event."},
-			{Name: "bot.stop", Summary: "Rollout asks the old controller to release its lease and finish."},
-		},
-		States:      []string{"atomic", "compound", "parallel", "final", "history"},
-		Executables: []string{"call", "raise", "send", "cancel", "log", "assign", "choose", "foreach", "script"},
-	}, nil
+	return actions, conditions
+}
+
+func botCapabilitySupportsEvents(capability botVocabularyCapability, events []statecharts.Identifier) bool {
+	if len(events) == 0 {
+		return false
+	}
+	for _, event := range events {
+		found := false
+		for _, supported := range capability.Events {
+			if event == supported {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func identifiersToStrings(identifiers []statecharts.Identifier) []string {
+	result := make([]string, len(identifiers))
+	for index, identifier := range identifiers {
+		result[index] = string(identifier)
+	}
+	return result
+}
+
+func validateBotArgument(expression statecharts.Expression, parameter botVocabularyParameter) error {
+	if expression.Kind != "go.literal" {
+		return fmt.Errorf("must be a literal")
+	}
+	switch parameter.Type {
+	case "enum":
+		value, ok := expression.Data.AsString()
+		if !ok {
+			return fmt.Errorf("must be a string")
+		}
+		for _, option := range parameter.Options {
+			if value == option {
+				return nil
+			}
+		}
+		return fmt.Errorf("must be one of %v", parameter.Options)
+	case "integer":
+		value, ok := expression.Data.AsInt64()
+		if !ok {
+			return fmt.Errorf("must be an integer")
+		}
+		if parameter.Minimum != nil && value < int64(*parameter.Minimum) {
+			return fmt.Errorf("must be at least %d", *parameter.Minimum)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported parameter type %q", parameter.Type)
+	}
+}
+
+func goReferenceName(expression statecharts.Expression) (statecharts.Identifier, bool) {
+	function, err := goReference(expression)
+	return function.Name, err == nil
+}
+
+func goReference(expression statecharts.Expression) (statecharts.FunctionRef, error) {
+	shape, ok := expression.Data.AsMap()
+	if !ok {
+		return statecharts.FunctionRef{}, fmt.Errorf("Go reference must be a map")
+	}
+	name, nameOK := shape["name"].AsString()
+	version, versionOK := shape["version"].AsString()
+	arguments, argumentsOK := shape["args"].AsList()
+	if !nameOK || !versionOK || !argumentsOK || name == "" || version == "" {
+		return statecharts.FunctionRef{}, fmt.Errorf("invalid Go reference")
+	}
+	function := statecharts.FunctionRef{Name: statecharts.Identifier(name), Version: version, Args: make([]statecharts.Expression, len(arguments))}
+	for index, argument := range arguments {
+		encoded, ok := argument.AsMap()
+		if !ok {
+			return statecharts.FunctionRef{}, fmt.Errorf("Go reference argument %d must be an expression", index)
+		}
+		kind, ok := encoded["kind"].AsString()
+		if !ok || kind == "" {
+			return statecharts.FunctionRef{}, fmt.Errorf("Go reference argument %d has no kind", index)
+		}
+		function.Args[index] = statecharts.Expression{Kind: statecharts.Identifier(kind), Data: encoded["data"].Clone()}
+	}
+	return function, nil
 }
 
 func readMatchDefinition(request *http.Request) (statecharts.Definition, error) {

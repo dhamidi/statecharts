@@ -81,25 +81,19 @@ publication.
 
 ## Live-edit the bot chart
 
-Open `/editor/bots` to edit the complete canonical bot Definition. The
-workbench lists the registered Go action vocabulary with insertable examples,
-validates the whole statechart, publishes it as a new immutable revision, and
-rolls that revision out to one canary or the entire fleet. You can add states,
-transitions, delayed sends, internal events, and multiple strategy phases; the
-editor does not reduce the chart to a settings form.
+Open `/editor/bots` to build the complete bot Definition with a form-based
+state and transition editor. It is an `htmlc` custom element backed by the
+registered Go capability vocabulary. Conditions such as `target-exists`,
+`opponent-in-sights`, `health-below`, `power-at-least`, and `tick-every` can be
+combined with `move`, `move-toward`, `wander`, and `shoot` actions in ordered
+transitions. This makes the decision tree itself editable rather than hiding
+it behind a fixed policy struct. Canonical JSON remains available under the
+advanced escape hatch.
 
-The `arena.bot.observe` action is one available strategy primitive. It accepts
-one `go.literal`, tagged `arena.bot-policy/v1`, whose payload is:
-
-```json
-{"target_priority":"nearest","shoot_range":64}
-```
-
-`target_priority` is `nearest`, `powerups`, or `creatures`. `shoot_range` is a
-non-negative Manhattan distance; zero disables shooting. Every occurrence of
-this action receives argument validation, but the action itself is optional
-and may appear any number of times. Publishing does not alter running
-controllers. Roll out one canary or all bots explicitly:
+The workbench validates the whole statechart, publishes it as a new immutable
+revision, and rolls that revision out to one canary or the entire fleet.
+Publishing does not alter running controllers. Roll out one canary or all bots
+explicitly:
 
 ```sh
 curl -fsS http://127.0.0.1:8080/definitions/bot > bot.json
