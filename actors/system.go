@@ -226,6 +226,12 @@ func defaultSystemConfig() systemConfig {
 type System struct {
 	cfg systemConfig
 
+	observationsMu sync.Mutex
+	observations   map[uint64]*observationSubscriber
+	observationID  uint64
+	observationSeq uint64
+	observerCount  atomic.Int64
+
 	chartsMu sync.Mutex
 	charts   map[statecharts.Identifier]*chartRegistry
 
@@ -280,6 +286,8 @@ type actorEntry struct {
 	durable     bool
 	initialized atomic.Bool
 	terminal    atomic.Bool
+	discovered  atomic.Bool
+	observedEnd atomic.Bool
 	terminalAt  atomic.Int64 // UnixNano; zero means unknown
 	residency   atomic.Uint32
 
@@ -305,9 +313,10 @@ func NewSystem(opts ...Option) *System {
 		opt(&cfg)
 	}
 	s := &System{
-		cfg:    cfg,
-		charts: map[statecharts.Identifier]*chartRegistry{},
-		table:  map[statecharts.Identifier]*actorEntry{},
+		cfg:          cfg,
+		charts:       map[statecharts.Identifier]*chartRegistry{},
+		table:        map[statecharts.Identifier]*actorEntry{},
+		observations: map[uint64]*observationSubscriber{},
 	}
 	s.dispatchCond = sync.NewCond(&s.dispatchMu)
 	s.armSweep()
@@ -384,18 +393,24 @@ func (s *System) Publish(ctx context.Context, definition statecharts.Definition)
 	}
 
 	s.chartsMu.Lock()
-	defer s.chartsMu.Unlock()
 	if s.charts[kind] != registry {
+		s.chartsMu.Unlock()
 		return "", fmt.Errorf("actors: Publish: chart %q registry changed", kind)
 	}
 	if retained, exists := registry.revisions[chart.Revision()]; exists {
 		if !retained.DefinitionArtifact().Equal(artifact) {
+			s.chartsMu.Unlock()
 			return "", statecharts.ErrDefinitionCollision
 		}
 	} else {
 		registry.revisions[chart.Revision()] = chart
 	}
+	previous := registry.current
 	registry.current = chart.Revision()
+	s.chartsMu.Unlock()
+	if previous != chart.Revision() && s.observerCount.Load() != 0 {
+		s.publishObservation(Observation{Kind: ObservationDefinitionPublished, Definition: &DefinitionPublication{ChartID: kind, PreviousRevision: previous, Revision: chart.Revision()}})
+	}
 	return chart.Revision(), nil
 }
 
@@ -858,6 +873,7 @@ func (s *System) pinDurableEntry(entry *actorEntry, metadata statecharts.ActorMe
 	entry.startedAt = metadata.StartedAt
 	entry.initialized.Store(true)
 	entry.startLive = startLive
+	s.notifyDiscovered(entry)
 	return nil
 }
 
@@ -904,6 +920,9 @@ func (s *System) entryFor(name, kind statecharts.Identifier, revision statechart
 	s.table[name] = e
 	s.actorIDs = append(s.actorIDs, name)
 	s.actorIDsDirty = true
+	if !durable {
+		s.notifyDiscovered(e)
+	}
 	return e, nil
 }
 
@@ -1083,6 +1102,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 		if !entry.durable {
 			entry.terminalAt.Store(s.cfg.clock.Now().UTC().UnixNano())
 			entry.terminal.Store(true)
+			s.notifyTerminal(entry)
 			s.reapTerminalWhenDone(entry)
 			return nil
 		}
@@ -1106,6 +1126,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 		}
 		entry.terminalAt.Store(metadata.TerminalAt.UnixNano())
 		entry.terminal.Store(true)
+		s.notifyTerminal(entry)
 		s.reapTerminalWhenDone(entry)
 		return nil
 	}
@@ -1124,6 +1145,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			statecharts.WithLogger(s.cfg.logger),
 			statecharts.WithIngressHook(ingressHook),
 			statecharts.WithCompletionHook(completionHook),
+			statecharts.WithMacrostepObserver(systemMacrostepObserver{s: s, entry: entry}),
 			statecharts.WithTimerFiredDetailsHook(statecharts.LoggingTimerFiredDetailsHook(s.cfg.storage, sessionID, s.cfg.clock)),
 			statecharts.WithDeliveryNamespace(deliveryNamespace),
 		)
@@ -1151,6 +1173,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 			statecharts.WithClock(s.cfg.clock),
 			statecharts.WithLogger(s.cfg.logger), statecharts.WithIngressHook(ingressHook),
 			statecharts.WithCompletionHook(completionHook),
+			statecharts.WithMacrostepObserver(systemMacrostepObserver{s: s, entry: entry}),
 			statecharts.WithSessionID(sessionID))
 		inst, err = chart.NewInstance(opts...)
 		if err == nil {
@@ -1174,6 +1197,9 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 
 func (s *System) notifyResidency(entry *actorEntry, state ResidencyState) {
 	entry.residency.Store(uint32(residencyCode(state)))
+	if s.observerCount.Load() != 0 {
+		s.publishObservation(Observation{Kind: ObservationResidencyChanged, Actor: actorInfoPointer(s.infoForEntry(entry))})
+	}
 	if s.cfg.onResidency != nil {
 		s.cfg.onResidency(ResidencyChange{ActorID: entry.name, State: state})
 	}
@@ -1696,6 +1722,9 @@ func (s *System) Stop(ctx context.Context) error {
 		entries = append(entries, e)
 	}
 	s.tableMu.Unlock()
+	if firstStop {
+		s.closeObservationSubscriptions()
+	}
 
 	var dispatchDone <-chan struct{}
 	if firstStop {

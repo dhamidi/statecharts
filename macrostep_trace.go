@@ -56,7 +56,9 @@ func cloneTraceEvent(event *Event) *Event {
 	return &clone
 }
 
-func cloneMacrostepTrace(trace MacrostepTrace) MacrostepTrace {
+// Clone returns an independently owned copy of the trace, including all
+// events, values, and slices.
+func (trace MacrostepTrace) Clone() MacrostepTrace {
 	trace.Trigger = cloneTraceEvent(trace.Trigger)
 	trace.Before = append([]Identifier(nil), trace.Before...)
 	trace.After = append([]Identifier(nil), trace.After...)
@@ -70,3 +72,5 @@ func cloneMacrostepTrace(trace MacrostepTrace) MacrostepTrace {
 	}
 	return trace
 }
+
+func cloneMacrostepTrace(trace MacrostepTrace) MacrostepTrace { return trace.Clone() }
