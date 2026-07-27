@@ -14,8 +14,34 @@ import (
 	"github.com/coder/websocket"
 	"github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
+	"github.com/dhamidi/statecharts/inspector"
+	inspectorhttp "github.com/dhamidi/statecharts/inspector/http"
 	statejson "github.com/dhamidi/statecharts/syntax/json"
 )
+
+func TestInspectorMountExposesArenaSystem(t *testing.T) {
+	runtime, err := setupArena(t.Context(), runtimeOptions{Bots: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.stop(context.Background()) })
+	service := inspector.New(inspector.WithAuthorizer(inspector.AllowAll()))
+	t.Cleanup(service.Close)
+	if err := service.RegisterSystem("arena", runtime.system); err != nil {
+		t.Fatal(err)
+	}
+	h := arenaHandler(runtime, inspectorhttp.NewHandler(service))
+	for _, path := range []string{"/inspect/", "/inspect/v1/systems"} {
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d %s", path, response.Code, response.Body.String())
+		}
+		if path != "/inspect/" && !strings.Contains(response.Body.String(), `"systems":["arena"]`) {
+			t.Fatalf("systems = %s", response.Body.String())
+		}
+	}
+}
 
 func TestArenaMechanicsAreDeterministicAndRejectStaleInput(t *testing.T) {
 	world := newWorld(11, 9, 42)

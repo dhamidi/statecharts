@@ -224,8 +224,13 @@ func (rt *counterRuntime) stop(ctx context.Context) error {
 	return errors.Join(countersErr, uiErr, closeErr)
 }
 
-func counterHandler(rt *counterRuntime) http.Handler {
+func counterHandler(rt *counterRuntime, inspectorHandlers ...http.Handler) http.Handler {
 	mux := http.NewServeMux()
+	if len(inspectorHandlers) > 0 && inspectorHandlers[0] != nil {
+		mounted := http.StripPrefix("/inspect", inspectorHandlers[0])
+		mux.Handle("GET /inspect/", mounted)
+		mux.Handle("POST /inspect/", mounted)
+	}
 	mux.HandleFunc("GET /", pageHandler(func() []projection { p, _ := rt.query(context.Background(), colors); return p }))
 	mux.HandleFunc("GET /datastar.js", datastarHandler)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })

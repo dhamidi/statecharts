@@ -17,6 +17,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/dhamidi/statecharts/inspector"
+	inspectorhttp "github.com/dhamidi/statecharts/inspector/http"
 )
 
 func main() {
@@ -61,9 +64,14 @@ func runServe(ctx context.Context, args []string) error {
 		defer cancel()
 		_ = runtime.stop(stopCtx)
 	}()
+	inspection := inspector.New(inspector.WithAuthorizer(inspector.AllowAll()))
+	defer inspection.Close()
+	if err := inspection.RegisterSystem("counters", runtime.counters); err != nil {
+		return err
+	}
 	server := &http.Server{
 		Addr:        *addr,
-		Handler:     counterHandler(runtime),
+		Handler:     counterHandler(runtime, inspectorhttp.NewHandler(inspection)),
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	ln, err := net.Listen("tcp", *addr)

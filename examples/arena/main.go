@@ -12,6 +12,9 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/dhamidi/statecharts/inspector"
+	inspectorhttp "github.com/dhamidi/statecharts/inspector/http"
 )
 
 func main() {
@@ -44,12 +47,17 @@ func runServe(ctx context.Context, arguments []string) error {
 		return err
 	}
 	defer runtime.stop(context.Background())
+	inspection := inspector.New(inspector.WithAuthorizer(inspector.AllowAll()))
+	defer inspection.Close()
+	if err := inspection.RegisterSystem("arena", runtime.system); err != nil {
+		return err
+	}
 	listener, err := net.Listen("tcp", *address)
 	if err != nil {
 		return err
 	}
 	server := &http.Server{
-		Handler:           arenaHandler(runtime),
+		Handler:           arenaHandler(runtime, inspectorhttp.NewHandler(inspection)),
 		ReadHeaderTimeout: 5 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}

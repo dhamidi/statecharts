@@ -17,8 +17,13 @@ import (
 
 const maxDefinitionBytes = 4 << 20
 
-func arenaHandler(runtime *arenaRuntime) http.Handler {
+func arenaHandler(runtime *arenaRuntime, inspectorHandlers ...http.Handler) http.Handler {
 	mux := http.NewServeMux()
+	if len(inspectorHandlers) > 0 && inspectorHandlers[0] != nil {
+		mounted := http.StripPrefix("/inspect", inspectorHandlers[0])
+		mux.Handle("GET /inspect/", mounted)
+		mux.Handle("POST /inspect/", mounted)
+	}
 	mux.HandleFunc("GET /", indexHandler)
 	mux.HandleFunc("GET /editor/bots", editorHandler)
 	mux.Handle("GET /scripts/", http.StripPrefix("/scripts/", editorEngine.ScriptHandler()))

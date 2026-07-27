@@ -59,6 +59,58 @@ func request(t *testing.T, h http.Handler, method, target string, body []byte) *
 	return w
 }
 
+func TestEmbeddedUIAssetsAndStripPrefix(t *testing.T) {
+	h, _, _ := testHandler(t, nil)
+	for _, tc := range []struct{ path, contentType, cache string }{
+		{"/", "text/html", "no-cache"},
+		{"/assets/v1/app.js", "text/javascript", "immutable"},
+		{"/assets/v1/app.css", "text/css", "immutable"},
+	} {
+		w := request(t, h, http.MethodGet, tc.path, nil)
+		if w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Content-Type"), tc.contentType) || !strings.Contains(w.Header().Get("Cache-Control"), tc.cache) || w.Body.Len() == 0 {
+			t.Errorf("GET %s = %d type=%q cache=%q bytes=%d", tc.path, w.Code, w.Header().Get("Content-Type"), w.Header().Get("Cache-Control"), w.Body.Len())
+		}
+	}
+	shell := request(t, h, http.MethodGet, "/", nil).Body.String()
+	shellHeaders := request(t, h, http.MethodGet, "/", nil).Header()
+	if !strings.Contains(shellHeaders.Get("Content-Security-Policy"), "connect-src 'self'") || shellHeaders.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("shell security headers: CSP=%q Referrer-Policy=%q", shellHeaders.Get("Content-Security-Policy"), shellHeaders.Get("Referrer-Policy"))
+	}
+	if strings.Contains(shell, "http://") || strings.Contains(shell, "https://") || !strings.Contains(shell, `src="assets/v1/app.js"`) {
+		t.Fatalf("shell has an external or non-relative dependency: %s", shell)
+	}
+	js := request(t, h, http.MethodGet, "/assets/v1/app.js", nil).Body.String()
+	if strings.Contains(js, "cdn.") || strings.Contains(js, "https://") || !strings.Contains(js, "customElements.define") {
+		t.Fatal("application is not a dependency-free Web Components bundle")
+	}
+	for _, marker := range []string{
+		`get(observation, "actor")`, `get(history, "entries")`, `get(this._data, "currentAvailable")`,
+		`get(record, "reason")`, `get(record, "dropped")`, `TIMELINE_LIMIT = 200`,
+		`RECENT_PAGE_LIMIT = 1000`, `id: "ID"`, `"paged out"`,
+	} {
+		if !strings.Contains(js, marker) {
+			t.Errorf("application is missing wire/operational contract marker %q", marker)
+		}
+	}
+	for _, obsolete := range []string{`ActorID`, `capital(history,'Events')`, `['','counter','match','bot']`} {
+		if strings.Contains(js, obsolete) {
+			t.Errorf("application retains obsolete wire or example-specific marker %q", obsolete)
+		}
+	}
+	mounted := http.StripPrefix("/inspect", h)
+	for _, path := range []string{"/inspect/", "/inspect/assets/v1/app.js", "/inspect/v1/systems"} {
+		if w := request(t, mounted, http.MethodGet, path, nil); w.Code != http.StatusOK {
+			t.Errorf("mounted GET %s = %d %s", path, w.Code, w.Body.String())
+		}
+	}
+	for _, path := range []string{"/", "/assets/v1/app.js"} {
+		w := request(t, h, http.MethodPost, path, nil)
+		if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") != http.MethodGet {
+			t.Errorf("POST %s = %d Allow=%q", path, w.Code, w.Header().Get("Allow"))
+		}
+	}
+}
+
 func TestJSONEndpointsAndPaginationValidation(t *testing.T) {
 	h, _, _ := testHandler(t, nil)
 	for _, target := range []string{

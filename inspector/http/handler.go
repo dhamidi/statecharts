@@ -4,6 +4,7 @@
 package inspectorhttp
 
 import (
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,12 @@ import (
 	"github.com/dhamidi/statecharts/actors"
 	"github.com/dhamidi/statecharts/inspector"
 )
+
+// uiFiles contains the complete browser application. It deliberately has no
+// runtime asset or module dependencies.
+//
+//go:embed ui/*
+var uiFiles embed.FS
 
 const (
 	maxBodyBytes = 64 << 10
@@ -41,6 +48,12 @@ type wireError struct {
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
+	case "/":
+		h.asset(w, r, "ui/index.html", "text/html; charset=utf-8", "no-cache")
+	case "/assets/v1/app.js":
+		h.asset(w, r, "ui/app.js", "text/javascript; charset=utf-8", "public, max-age=31536000, immutable")
+	case "/assets/v1/app.css":
+		h.asset(w, r, "ui/app.css", "text/css; charset=utf-8", "public, max-age=31536000, immutable")
 	case "/v1/systems":
 		h.systems(w, r)
 	case "/v1/actors":
@@ -60,6 +73,26 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "endpoint not found")
 	}
+}
+
+func (h *handler) asset(w http.ResponseWriter, r *http.Request, name, contentType, cache string) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	data, err := uiFiles.ReadFile(name)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "asset not found")
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", cache)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if name == "ui/index.html" {
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'self'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
