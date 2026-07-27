@@ -110,6 +110,7 @@ type compiledTransition struct {
 	actions           []actionBlock
 	internal          bool
 	source            *compiledState
+	definitionIndex   int
 }
 
 // States returns every state's ID in document order.

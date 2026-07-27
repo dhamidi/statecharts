@@ -78,12 +78,14 @@ func compileDefinitionState(c *Chart, s *StateDefinition, parent *compiledState,
 		if err != nil {
 			return nil, err
 		}
+		cs.initial.definitionIndex = -1
 	}
 	for i := range s.Transitions {
 		t, e := compileDefinitionTransition(&s.Transitions[i], cs, p, fmt.Sprintf("%s.transitions[%d]", path, i))
 		if e != nil {
 			return nil, e
 		}
+		t.definitionIndex = i
 		cs.transitions = append(cs.transitions, t)
 	}
 	for i := range s.Invokes {

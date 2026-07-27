@@ -75,6 +75,7 @@ type interpretation struct {
 	// error is picked up via hookErr by Instance.run.
 	timerFiredHook func(sendID, target, typ Identifier, ev Event) error
 	hookErr        error
+	macrostepTrace *MacrostepTrace
 }
 
 // pendingSendRecord is the interpreter-core-owned bookkeeping for one
@@ -1272,15 +1273,7 @@ func (ip *interpretation) exitInterpreter() {
 	}
 }
 
-func (ip *interpretation) enterStates(transitions []*compiledTransition) {
-	ordered, forDefault := ip.computeEntrySet(transitions)
-	for _, s := range ordered {
-		ip.enterState(s, forDefault[s])
-	}
-}
-
-func (ip *interpretation) exitStates(transitions []*compiledTransition) {
-	exitSet := ip.computeExitSet(transitions)
+func (ip *interpretation) exitStates(exitSet map[*compiledState]bool) {
 	ordered := sortDesc(exitSet)
 
 	// Record history for every history pseudostate belonging to an exited
@@ -1444,18 +1437,36 @@ func (ip *interpretation) removeConflictingTransitions(enabled []*compiledTransi
 
 // --- microstep / macrostep -----------------------------------------------
 
-func (ip *interpretation) microstep(transitions []*compiledTransition) {
-	ip.exitStates(transitions)
+func (ip *interpretation) microstep(trigger *Event, transitions []*compiledTransition) {
+	exitSet := ip.computeExitSet(transitions)
+	entrySet, forDefault := ip.computeEntrySet(transitions)
+	if ip.macrostepTrace != nil {
+		step := MicrostepTrace{Trigger: trigger}
+		for _, transition := range transitions {
+			step.Transitions = append(step.Transitions, TransitionRef{Source: transition.source.id, Index: transition.definitionIndex})
+		}
+		for _, state := range sortAsc(exitSet) {
+			step.Exited = append(step.Exited, state.id)
+		}
+		for _, state := range entrySet {
+			step.Entered = append(step.Entered, state.id)
+		}
+		ip.macrostepTrace.Microsteps = append(ip.macrostepTrace.Microsteps, step)
+	}
+	ip.exitStates(exitSet)
 	for _, t := range transitions {
 		ip.runActionBlocks(t.actions)
 	}
-	ip.enterStates(transitions)
+	for _, s := range entrySet {
+		ip.enterState(s, forDefault[s])
+	}
 }
 
 // runToStable drains eventless transitions and the internal queue until
 // neither yields further progress (a "macrostep" tail, SCXML mainEventLoop).
 func (ip *interpretation) runToStable() {
 	for ip.running {
+		var trigger *Event
 		transitions := ip.selectEventlessTransitions()
 		if len(transitions) == 0 {
 			if len(ip.internalQueue) == 0 {
@@ -1475,9 +1486,10 @@ func (ip *interpretation) runToStable() {
 			ip.internalQueue = ip.internalQueue[1:]
 			ip.lastEvent, ip.hasLastEvent = ev, true
 			transitions = ip.selectTransitions(ev)
+			trigger = &ev
 		}
 		if len(transitions) > 0 {
-			ip.microstep(transitions)
+			ip.microstep(trigger, transitions)
 		}
 	}
 }
@@ -1520,7 +1532,15 @@ func (ip *interpretation) start() {
 	}
 
 	ip.running = true
-	for _, s := range sortAsc(entrySet) {
+	orderedEntry := sortAsc(entrySet)
+	if ip.macrostepTrace != nil {
+		step := MicrostepTrace{}
+		for _, s := range orderedEntry {
+			step.Entered = append(step.Entered, s.id)
+		}
+		ip.macrostepTrace.Microsteps = append(ip.macrostepTrace.Microsteps, step)
+	}
+	for _, s := range orderedEntry {
 		ip.enterState(s, forDefault[s])
 	}
 	ip.runToStable()
@@ -1541,7 +1561,7 @@ func (ip *interpretation) processNextExternal() bool {
 
 	transitions := ip.selectTransitions(ev)
 	if len(transitions) > 0 {
-		ip.microstep(transitions)
+		ip.microstep(&ev, transitions)
 	}
 	ip.runToStable()
 	return true

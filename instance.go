@@ -17,12 +17,16 @@ import (
 // request to the actor's own goroutine and wait for it to be accepted, but
 // that plumbing is entirely unexported.
 type Instance struct {
-	chart            *Chart
-	ip               *interpretation
-	session          DatamodelSession
-	closeSessionOnce sync.Once
-	clock            Clock
-	invokeHandlers   map[Identifier]InvokeHandlerFactory
+	chart                     *Chart
+	ip                        *interpretation
+	session                   DatamodelSession
+	closeSessionOnce          sync.Once
+	clock                     Clock
+	macrostepObserver         MacrostepObserver
+	macrostepSequence         uint64
+	suppressMacrostepObserver atomic.Bool
+	pendingMacrostepTraces    []MacrostepTrace
+	invokeHandlers            map[Identifier]InvokeHandlerFactory
 	// ingressHook runs on the actor goroutine immediately before an event
 	// delivered through Send/Deliver is applied. Durable runtimes use it for
 	// write-ahead logging so invocation results and IOProcessor callbacks pass
@@ -118,6 +122,14 @@ type instanceConfig struct {
 	sessionID                SessionID
 	deliveryNamespace        string
 	platformVariables        map[string]any
+	macrostepObserver        MacrostepObserver
+}
+
+// WithMacrostepObserver installs a diagnostic observer for completed live
+// macrosteps. Its Enabled method is consulted at the start of every macrostep,
+// so an observer may cheaply toggle collection after an Instance has started.
+func WithMacrostepObserver(observer MacrostepObserver) Option {
+	return func(c *instanceConfig) { c.macrostepObserver = observer }
 }
 
 // WithInvokeHandler binds one declarative invocation type in this Instance's
@@ -369,6 +381,7 @@ func newInstance(chart *Chart, ip *interpretation, session DatamodelSession, cfg
 		chart:             chart,
 		session:           session,
 		clock:             cfg.clock,
+		macrostepObserver: cfg.macrostepObserver,
 		ingressHook:       cfg.ingressHook,
 		completionHook:    cfg.completionHook,
 		inbox:             make(chan actorRequest, cfg.inboxSize),
@@ -508,20 +521,20 @@ func (in *Instance) resumeInvokesAfterReplay() {
 		ec.event, ec.hasEvent = Event{}, false
 		request, requestOK := in.ip.evaluateInvokeResumeRequest(ri, ec)
 		if !requestOK {
-			in.ip.runToStable()
+			in.drainInternalMacrostep()
 			continue
 		}
 		var run func(context.Context, InvokeIO) (Value, error)
 		factory := in.invokeHandlers[canonicalInvokeType(request.Type)]
 		if factory == nil {
 			in.ip.reportError(invokeHandlerUnavailableError{request.Type})
-			in.ip.runToStable()
+			in.drainInternalMacrostep()
 			continue
 		}
 		handler, err := makeInvokeHandler(factory, request.Type)
 		if err != nil {
 			in.ip.enqueueInternal(Event{Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id, Data: PlatformErrorValue(ErrEventCommunication, err)})
-			in.ip.runToStable()
+			in.drainInternalMacrostep()
 			continue
 		}
 		resumable, ok := handler.(ResumableInvokeHandler)
@@ -530,7 +543,7 @@ func (in *Instance) resumeInvokesAfterReplay() {
 				Name: ErrEventCommunication, Type: EventPlatform, InvokeID: id,
 				Data: PlatformErrorValue(ErrEventCommunication, fmt.Errorf("statecharts: Rehydrate: invoke %q handler type %q cannot resume", id, request.Type)),
 			})
-			in.ip.runToStable()
+			in.drainInternalMacrostep()
 			continue
 		}
 		request = cloneInvokeRequest(request)
@@ -688,12 +701,88 @@ func (in *Instance) takeTimerHookError() error {
 	return err
 }
 
+func (in *Instance) observerEnabled() (enabled bool) {
+	if in.macrostepObserver == nil || in.suppressMacrostepObserver.Load() {
+		return false
+	}
+	defer func() { _ = recover() }()
+	return in.macrostepObserver.Enabled()
+}
+
+func (in *Instance) currentConfigurationIDs() []Identifier {
+	states := sortAsc(in.ip.configuration)
+	ids := make([]Identifier, len(states))
+	for i, state := range states {
+		ids[i] = state.id
+	}
+	return ids
+}
+
+func (in *Instance) beginMacrostepTrace(trigger *Event) {
+	if !in.observerEnabled() {
+		return
+	}
+	in.macrostepSequence++
+	in.ip.macrostepTrace = &MacrostepTrace{
+		Sequence:  in.macrostepSequence,
+		Timestamp: in.clock.Now().UTC(),
+		Trigger:   cloneTraceEvent(trigger),
+		Before:    in.currentConfigurationIDs(),
+	}
+}
+
+func (in *Instance) cancelMacrostepTrace() { in.ip.macrostepTrace = nil }
+
+func (in *Instance) finishMacrostepTrace() {
+	if in.ip.macrostepTrace == nil {
+		return
+	}
+	trace := *in.ip.macrostepTrace
+	trace.After = in.currentConfigurationIDs()
+	trace.Terminal = !in.ip.running
+	in.pendingMacrostepTraces = append(in.pendingMacrostepTraces, trace)
+	in.ip.macrostepTrace = nil
+}
+
+func (in *Instance) emitMacrostepTraces() {
+	traces := in.pendingMacrostepTraces
+	in.pendingMacrostepTraces = nil
+	for i := range traces {
+		trace := &traces[i]
+		if trace.Terminal && i == len(traces)-1 {
+			if err := in.Err(); err != nil {
+				trace.TerminalError = err.Error()
+			}
+		}
+		published := cloneMacrostepTrace(*trace)
+		func() {
+			defer func() { _ = recover() }()
+			in.macrostepObserver.ObserveMacrostep(published)
+		}()
+	}
+}
+
 func (in *Instance) drainQueuedEvents() {
-	for in.ip.running && in.ip.processNextExternal() {
+	for in.ip.running && len(in.ip.externalQueue) > 0 {
+		trigger := &in.ip.externalQueue[0]
+		in.beginMacrostepTrace(trigger)
+		if !in.ip.processNextExternal() {
+			in.cancelMacrostepTrace()
+			break
+		}
+		in.finishMacrostepTrace()
 	}
-	if in.ip.running {
-		in.ip.runToStable()
+	in.drainInternalMacrostep()
+}
+
+func (in *Instance) drainInternalMacrostep() {
+	if !in.ip.running || len(in.ip.internalQueue) == 0 {
+		return
 	}
+	trigger := in.ip.internalQueue[0]
+	in.beginMacrostepTrace(&trigger)
+	in.ip.runToStable()
+	in.finishMacrostepTrace()
 }
 
 // finishReplay atomically makes delayed sends live and reconciles invocations.
@@ -742,7 +831,9 @@ func (in *Instance) run() {
 	}()
 
 	if !in.ip.restored {
+		in.beginMacrostepTrace(nil)
 		in.ip.start()
+		in.finishMacrostepTrace()
 	} else if !in.deferTimerActivation.Load() {
 		if err := in.activatePendingTimers(in.clock); err != nil {
 			in.ip.exitInterpreter()
@@ -756,6 +847,7 @@ func (in *Instance) run() {
 	}
 	in.publishConfig()
 	in.finishNaturalCompletion()
+	in.emitMacrostepTraces()
 	close(in.readyCh)
 
 	for in.ip.running {
@@ -827,6 +919,7 @@ func (in *Instance) run() {
 		if completionErr := in.finishNaturalCompletion(); reqErr == nil {
 			reqErr = completionErr
 		}
+		in.emitMacrostepTraces()
 
 		if snapOut != nil {
 			snap, err := in.buildSnapshot()

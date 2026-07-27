@@ -205,6 +205,7 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 	// Reconstruct deterministic bookkeeping during bootstrap and replay, but
 	// start neither invocations nor timers that could repeat real-world work.
 	in.suppressInvoke.Store(true)
+	in.suppressMacrostepObserver.Store(true)
 	in.deferTimerActivation.Store(true)
 	in.deferCompletionHook.Store(true)
 	keepInstance := false
@@ -286,6 +287,7 @@ func rehydrateInstanceFromFactory(ctx context.Context, chart *Chart, sessionFact
 	}
 
 	in.suppressInvoke.Store(false)
+	in.suppressMacrostepObserver.Store(false)
 	for _, g := range gates {
 		g.goLive()
 	}
