@@ -231,6 +231,11 @@ type System struct {
 
 	tableMu sync.Mutex
 	table   map[statecharts.Identifier]*actorEntry
+	// actorIDs avoids rebuilding the table's key set for every directory page.
+	// Spawn only appends and marks it dirty; the next directory query sorts it
+	// once, so the actor hot path never pays O(n) insertion cost.
+	actorIDs      []statecharts.Identifier
+	actorIDsDirty bool
 
 	// admissionMu makes the residency check, any required eviction, and the
 	// publication of the newly started Instance one atomic admission. Entry
@@ -273,8 +278,10 @@ type actorEntry struct {
 	sessionID   statecharts.SessionID
 	startedAt   time.Time
 	durable     bool
-	initialized bool
+	initialized atomic.Bool
 	terminal    atomic.Bool
+	terminalAt  atomic.Int64 // UnixNano; zero means unknown
+	residency   atomic.Uint32
 
 	// mu serializes activation (page-in) and eviction (page-out) for this
 	// one name, so at most one live Instance for it ever exists at a time
@@ -556,7 +563,7 @@ func (s *System) CollectDefinition(ctx context.Context, kind statecharts.Identif
 
 	s.tableMu.Lock()
 	for _, entry := range s.table {
-		if entry.initialized && entry.revision == revision && !entry.terminal.Load() {
+		if entry.initialized.Load() && entry.revision == revision && !entry.terminal.Load() {
 			s.tableMu.Unlock()
 			return statecharts.DefinitionReferenced, nil
 		}
@@ -755,7 +762,7 @@ func (s *System) Spawn(ctx context.Context, name ActorID, kind statecharts.Ident
 func (s *System) prepareDurableEntry(entry *actorEntry, kind statecharts.Identifier) error {
 	s.tableMu.Lock()
 	defer s.tableMu.Unlock()
-	if entry.initialized {
+	if entry.initialized.Load() {
 		if entry.kind != kind {
 			return fmt.Errorf("actors: %q was spawned as kind %q, not %q: %w", entry.name, entry.kind, kind, ErrKindMismatch)
 		}
@@ -839,7 +846,7 @@ func validateSpawnMetadata(metadata statecharts.ActorMetadata, name, kind statec
 func (s *System) pinDurableEntry(entry *actorEntry, metadata statecharts.ActorMetadata, startLive bool) error {
 	s.tableMu.Lock()
 	defer s.tableMu.Unlock()
-	if entry.initialized {
+	if entry.initialized.Load() {
 		if entry.revision != metadata.Revision || entry.sessionID != metadata.SessionID {
 			return statecharts.ErrActorCollision
 		}
@@ -849,7 +856,7 @@ func (s *System) pinDurableEntry(entry *actorEntry, metadata statecharts.ActorMe
 	entry.revision = metadata.Revision
 	entry.sessionID = metadata.SessionID
 	entry.startedAt = metadata.StartedAt
-	entry.initialized = true
+	entry.initialized.Store(true)
 	entry.startLive = startLive
 	return nil
 }
@@ -872,7 +879,7 @@ func (s *System) entryFor(name, kind statecharts.Identifier, revision statechart
 		return nil, fmt.Errorf("actors: Spawn: %w", ErrSystemStopped)
 	}
 	if e, ok := s.table[name]; ok {
-		if !e.initialized {
+		if !e.initialized.Load() {
 			if e.durable != durable {
 				return nil, fmt.Errorf("actors: %q durability is fixed at its first Spawn (durable=%v): %w", name, e.durable, ErrDurabilityMismatch)
 			}
@@ -887,12 +894,16 @@ func (s *System) entryFor(name, kind statecharts.Identifier, revision statechart
 		return e, nil
 	}
 	e := &actorEntry{name: name, kind: kind, durable: durable}
+	e.residency.Store(uint32(residencyPagedOutCode))
 	if !durable {
 		e.revision = revision
 		e.sessionID = statecharts.SessionID(name)
-		e.initialized = true
+		e.startedAt = s.cfg.clock.Now().UTC()
+		e.initialized.Store(true)
 	}
 	s.table[name] = e
+	s.actorIDs = append(s.actorIDs, name)
+	s.actorIDsDirty = true
 	return e, nil
 }
 
@@ -902,7 +913,7 @@ func (s *System) ActorRevision(actorID ActorID) (statecharts.RevisionID, bool) {
 	s.tableMu.Lock()
 	defer s.tableMu.Unlock()
 	entry, ok := s.table[actorID]
-	if !ok || !entry.initialized {
+	if !ok || !entry.initialized.Load() {
 		return "", false
 	}
 	return entry.revision, true
@@ -916,7 +927,7 @@ func (s *System) resolve(name statecharts.Identifier) (*actorEntry, bool) {
 	s.tableMu.Lock()
 	defer s.tableMu.Unlock()
 	e, ok := s.table[name]
-	return e, ok && e.initialized
+	return e, ok && e.initialized.Load()
 }
 
 func (s *System) address(name statecharts.Identifier) statecharts.Identifier {
@@ -1070,6 +1081,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 	}
 	completionHook := func() error {
 		if !entry.durable {
+			entry.terminalAt.Store(s.cfg.clock.Now().UTC().UnixNano())
 			entry.terminal.Store(true)
 			s.reapTerminalWhenDone(entry)
 			return nil
@@ -1092,6 +1104,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 		default:
 			return fmt.Errorf("actors: mark %q terminal returned unknown result %d", entry.name, result)
 		}
+		entry.terminalAt.Store(metadata.TerminalAt.UnixNano())
 		entry.terminal.Store(true)
 		s.reapTerminalWhenDone(entry)
 		return nil
@@ -1160,6 +1173,7 @@ func (s *System) activateLocked(ctx context.Context, entry *actorEntry) (err err
 }
 
 func (s *System) notifyResidency(entry *actorEntry, state ResidencyState) {
+	entry.residency.Store(uint32(residencyCode(state)))
 	if s.cfg.onResidency != nil {
 		s.cfg.onResidency(ResidencyChange{ActorID: entry.name, State: state})
 	}
