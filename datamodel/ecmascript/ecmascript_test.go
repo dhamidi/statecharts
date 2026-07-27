@@ -518,6 +518,94 @@ func TestUndeclaredGlobalMutationMakesSnapshotUnavailable(t *testing.T) {
 	}
 }
 
+func TestInspectionExportsOnlyDeclaredIndependentCanonicalData(t *testing.T) {
+	chart, err := statecharts.Build(
+		statecharts.Atomic("active", statecharts.On("mutate", statecharts.Then(
+			statecharts.NewScriptExecutable(statecharts.ScriptDefinition{Expr: source(t, `declared.n = 2; globalThis.undeclared = "hidden"`)}),
+		))),
+		model(t),
+		statecharts.WithData(statecharts.DataDefinition{ID: "declared", Expr: ptr(source(t, `({n: 1, nested: ["kept"]})`))}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := chart.NewInstance(statecharts.WithSessionID("private-session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.Stop(context.Background()) })
+	if err := instance.Send(t.Context(), statecharts.Event{Name: "mutate"}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := instance.Inspect(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported, ok := first.Datamodel.AsMap()
+	if !ok || len(exported) != 1 {
+		t.Fatalf("exported data = %#v, want only declared", exported)
+	}
+	declared, _ := exported["declared"].AsMap()
+	if n, _ := declared["n"].AsNumber(); n != "2" {
+		t.Fatalf("declared.n = %q", n)
+	}
+	declared["n"], _ = statecharts.NumberValue("99")
+	second, err := instance.Inspect(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported, _ = second.Datamodel.AsMap()
+	declared, _ = exported["declared"].AsMap()
+	if n, _ := declared["n"].AsNumber(); n != "2" {
+		t.Fatalf("inspection mutated session: n=%q", n)
+	}
+}
+
+func TestInspectionUnexportableDeclaredValueIsNonFatal(t *testing.T) {
+	chart, err := statecharts.Build(
+		statecharts.Atomic("active", statecharts.On("function", statecharts.Then(
+			statecharts.NewScriptExecutable(statecharts.ScriptDefinition{Expr: source(t, `declared = () => 42`)}),
+		)), statecharts.On("recover", statecharts.Then(
+			statecharts.NewScriptExecutable(statecharts.ScriptDefinition{Expr: source(t, `declared = "alive"`)}),
+		))),
+		model(t), statecharts.WithData(statecharts.DataDefinition{ID: "declared", Expr: ptr(source(t, `"initial"`))}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := chart.NewInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.Stop(context.Background()) })
+	if err := instance.Send(t.Context(), statecharts.Event{Name: "function"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.Inspect(t.Context()); err == nil || !strings.Contains(err.Error(), `inspect data "declared"`) {
+		t.Fatalf("Inspect error = %v", err)
+	}
+	if instance.Err() != nil {
+		t.Fatalf("terminal error = %v", instance.Err())
+	}
+	if err := instance.Send(t.Context(), statecharts.Event{Name: "recover"}); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := instance.Inspect(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, _ := inspection.Datamodel.AsMap()
+	if got, _ := values["declared"].AsString(); got != "alive" {
+		t.Fatalf("declared = %q", got)
+	}
+}
+
 func TestSynchronousPromiseJobsDrainWithinTheSameTurn(t *testing.T) {
 	chart, err := statecharts.Build(
 		statecharts.Compound("root", "active", statecharts.Children(

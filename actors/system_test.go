@@ -68,6 +68,9 @@ func (actorTestDatamodelSession) ForEach(statecharts.ExecContext, statecharts.Co
 	return nil
 }
 
+func (actorTestDatamodelSession) Inspect() (statecharts.Value, error) {
+	return statecharts.Value{}, nil
+}
 func (actorTestDatamodelSession) EncodeSnapshot() ([]byte, error) { return nil, nil }
 func (actorTestDatamodelSession) DecodeSnapshot([]byte) error     { return nil }
 func (actorTestDatamodelSession) Close() error                    { return nil }

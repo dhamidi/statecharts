@@ -71,6 +71,7 @@ const (
 	reqStop
 	reqTimerFired
 	reqSnapshot
+	reqInspect
 	reqCheckpoint
 	reqActiveInvokes
 	reqReplayTimerFired
@@ -82,11 +83,12 @@ type actorRequest struct {
 	event      Event
 	fn         func() // reqTimerFired only
 	checkpoint func(Snapshot) error
-	entry      LogEntry            // reqReplayTimerFired only
-	clock      Clock               // reqFinishReplay only
-	reply      chan error          // reqSend/reqStop/reqCheckpoint/reqReplayTimerFired/reqFinishReplay
-	snapOut    chan snapshotResult // reqSnapshot only
-	invokesOut chan bool           // reqActiveInvokes only
+	entry      LogEntry              // reqReplayTimerFired only
+	clock      Clock                 // reqFinishReplay only
+	reply      chan error            // reqSend/reqStop/reqCheckpoint/reqReplayTimerFired/reqFinishReplay
+	snapOut    chan snapshotResult   // reqSnapshot only
+	inspectOut chan inspectionResult // reqInspect only
+	invokesOut chan bool             // reqActiveInvokes only
 }
 
 type deferredCompletionRequest struct {
@@ -764,6 +766,7 @@ func (in *Instance) run() {
 		}
 
 		var snapOut chan snapshotResult
+		var inspectOut chan inspectionResult
 		var invokesOut chan bool
 		var reqErr error
 		switch req.kind {
@@ -791,6 +794,8 @@ func (in *Instance) run() {
 			reqErr = in.takeTimerHookError()
 		case reqSnapshot:
 			snapOut = req.snapOut
+		case reqInspect:
+			inspectOut = req.inspectOut
 		case reqCheckpoint:
 			var snap Snapshot
 			snap, reqErr = in.buildSnapshot()
@@ -826,6 +831,10 @@ func (in *Instance) run() {
 		if snapOut != nil {
 			snap, err := in.buildSnapshot()
 			snapOut <- snapshotResult{snap, err}
+		}
+		if inspectOut != nil {
+			inspection, err := in.buildInspection()
+			inspectOut <- inspectionResult{inspection, err}
 		}
 		if invokesOut != nil {
 			invokesOut <- len(in.ip.invokesByID) > 0

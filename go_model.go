@@ -1,6 +1,7 @@
 package statecharts
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -41,12 +42,28 @@ type GoSnapshotCodec[D any] struct {
 	Decode func([]byte) (*D, error)
 }
 
+// GoInspectionCodec converts application-owned D into canonical inspector
+// data. It is independent of the opaque snapshot codec. Implementations must
+// not mutate D; the returned Value is cloned before it leaves the session.
+type GoInspectionCodec[D any] struct {
+	Encode func(*D) (Value, error)
+}
+
+// GoInspectionValueTag identifies the tagged Value returned by a Go
+// datamodel session's Inspect method.
+const GoInspectionValueTag = "statecharts.go-datamodel/v1"
+
 // GoModelOption configures a GoModel.
 type GoModelOption[D any] func(*GoModel[D])
 
 // WithGoSnapshotCodec replaces the default encoding/json codec for D.
 func WithGoSnapshotCodec[D any](codec GoSnapshotCodec[D]) GoModelOption[D] {
 	return func(model *GoModel[D]) { model.codec = codec }
+}
+
+// WithGoInspectionCodec replaces the default JSON-shaped conversion for D.
+func WithGoInspectionCodec[D any](codec GoInspectionCodec[D]) GoModelOption[D] {
+	return func(model *GoModel[D]) { model.inspectionCodec = codec }
 }
 
 type goRegistration[D any] struct {
@@ -60,10 +77,11 @@ type goRegistration[D any] struct {
 // GoModel is the default datamodel. It combines a typed D factory with a
 // model-local registry of stable, named host behavior.
 type GoModel[D any] struct {
-	mu            sync.RWMutex
-	factory       func() *D
-	codec         GoSnapshotCodec[D]
-	registrations map[string]goRegistration[D]
+	mu              sync.RWMutex
+	factory         func() *D
+	codec           GoSnapshotCodec[D]
+	inspectionCodec GoInspectionCodec[D]
+	registrations   map[string]goRegistration[D]
 }
 
 // NewGoModel creates an independently scoped Go datamodel registry.
@@ -79,6 +97,19 @@ func NewGoModel[D any](factory func() *D, options ...GoModelOption[D]) *GoModel[
 			return &d, nil
 		},
 	}
+	m.inspectionCodec = GoInspectionCodec[D]{Encode: func(d *D) (Value, error) {
+		encoded, err := json.Marshal(d)
+		if err != nil {
+			return Value{}, err
+		}
+		decoder := json.NewDecoder(bytes.NewReader(encoded))
+		decoder.UseNumber()
+		var shaped any
+		if err := decoder.Decode(&shaped); err != nil {
+			return Value{}, err
+		}
+		return ValueFromJSON(shaped)
+	}}
 	for _, option := range options {
 		if option != nil {
 			option(m)
@@ -227,14 +258,15 @@ type goCompiled[D any] struct {
 type goProgramOwner struct{ marker byte }
 
 type goProgram[D any] struct {
-	owner         *goProgramOwner
-	factory       func() *D
-	codec         GoSnapshotCodec[D]
-	fingerprint   []byte
-	compiled      map[string]*goCompiled[D]
-	functions     map[string]*goCompiled[D]
-	declarations  []Identifier
-	dataLocations map[Identifier]*goCompiled[D]
+	owner           *goProgramOwner
+	factory         func() *D
+	codec           GoSnapshotCodec[D]
+	inspectionCodec GoInspectionCodec[D]
+	fingerprint     []byte
+	compiled        map[string]*goCompiled[D]
+	functions       map[string]*goCompiled[D]
+	declarations    []Identifier
+	dataLocations   map[Identifier]*goCompiled[D]
 }
 
 type goCompile[D any] struct {
@@ -268,14 +300,14 @@ func (m *GoModel[D]) Compile(def *Definition) (DatamodelProgram, error) {
 	for k, v := range m.registrations {
 		registry[k] = v
 	}
-	factory, codec := m.factory, m.codec
+	factory, codec, inspectionCodec := m.factory, m.codec, m.inspectionCodec
 	m.mu.RUnlock()
-	if factory == nil || codec.Encode == nil || codec.Decode == nil {
-		return nil, fmt.Errorf("statecharts: Go model requires non-nil factory and snapshot codec")
+	if factory == nil || codec.Encode == nil || codec.Decode == nil || inspectionCodec.Encode == nil {
+		return nil, fmt.Errorf("statecharts: Go model requires non-nil factory, snapshot codec, and inspection codec")
 	}
 	p := &goProgram[D]{
 		owner:   &goProgramOwner{},
-		factory: factory, codec: codec,
+		factory: factory, codec: codec, inspectionCodec: inspectionCodec,
 		compiled:      make(map[string]*goCompiled[D]),
 		functions:     make(map[string]*goCompiled[D]),
 		dataLocations: make(map[Identifier]*goCompiled[D]),
@@ -609,7 +641,7 @@ func (p *goProgram[D]) NewSession(SessionOptions) (_ DatamodelSession, err error
 	if d == nil {
 		return nil, fmt.Errorf("statecharts: Go model factory returned nil")
 	}
-	s := &goSession[D]{owner: p.owner, data: d, codec: p.codec, values: map[Identifier]Value{}}
+	s := &goSession[D]{owner: p.owner, data: d, codec: p.codec, inspectionCodec: p.inspectionCodec, values: map[Identifier]Value{}}
 	for _, id := range p.declarations {
 		s.values[id] = NullValue()
 	}
@@ -617,10 +649,11 @@ func (p *goProgram[D]) NewSession(SessionOptions) (_ DatamodelSession, err error
 }
 
 type goSession[D any] struct {
-	owner  *goProgramOwner
-	data   *D
-	codec  GoSnapshotCodec[D]
-	values map[Identifier]Value
+	owner           *goProgramOwner
+	data            *D
+	codec           GoSnapshotCodec[D]
+	inspectionCodec GoInspectionCodec[D]
+	values          map[Identifier]Value
 }
 
 func recoverGo(errp *error) {
@@ -632,6 +665,12 @@ func recoverGo(errp *error) {
 func recoverGoSnapshotCodec(errp *error) {
 	if value := recover(); value != nil {
 		*errp = fmt.Errorf("statecharts: Go snapshot codec panicked: %v", value)
+	}
+}
+
+func recoverGoInspectionCodec(errp *error) {
+	if value := recover(); value != nil {
+		*errp = fmt.Errorf("statecharts: Go inspection codec panicked: %v", value)
 	}
 }
 func asCompiled[D any](e CompiledExpression, owner *goProgramOwner) (*goCompiled[D], error) {
@@ -766,6 +805,29 @@ type goSnapshot struct {
 	Version int                  `json:"version"`
 	Data    []byte               `json:"data"`
 	Values  map[Identifier]Value `json:"values"`
+}
+
+// Inspect exports D and declared model variables without using snapshot
+// encoding. The envelope identifies this Go-specific application shape.
+func (s *goSession[D]) Inspect() (_ Value, err error) {
+	defer recoverGoInspectionCodec(&err)
+	data, err := s.inspectionCodec.Encode(s.data)
+	if err != nil {
+		return Value{}, fmt.Errorf("statecharts: inspect Go data: %w", err)
+	}
+	variables := make(map[string]Value, len(s.values))
+	for id, value := range s.values {
+		variables[string(id)] = value.Clone()
+	}
+	variableValue, err := MapValue(variables)
+	if err != nil {
+		return Value{}, err
+	}
+	payload, err := MapValue(map[string]Value{"data": data.Clone(), "variables": variableValue})
+	if err != nil {
+		return Value{}, err
+	}
+	return TaggedValue(GoInspectionValueTag, payload)
 }
 
 func (s *goSession[D]) EncodeSnapshot() (_ []byte, err error) {

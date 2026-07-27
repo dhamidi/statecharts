@@ -291,6 +291,20 @@ func (s *session) ForEach(context statecharts.ExecContext, expression statechart
 	return nil
 }
 
+// Inspect exports only declared application data. System bindings live
+// outside this map and are therefore never exposed.
+func (s *session) Inspect() (statecharts.Value, error) {
+	values := make(map[string]statecharts.Value, len(s.program.declarations))
+	for _, id := range sortedDeclarations(s.program.declarations) {
+		value, err := s.exportData(id)
+		if err != nil {
+			return statecharts.Value{}, fmt.Errorf("ecmascript: inspect data %q: %w", id, err)
+		}
+		values[string(id)] = value.Clone()
+	}
+	return statecharts.MapValue(values)
+}
+
 // SnapshotIncompatibleError reports declared ECMAScript data that cannot be
 // represented as canonical Value data. Replay remains the source of truth.
 type SnapshotIncompatibleError struct {

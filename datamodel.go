@@ -58,6 +58,10 @@ type DatamodelSession interface {
 	Execute(ExecContext, CompiledExpression) error
 	ForEach(ExecContext, CompiledExpression, IterationBindings, func() error) error
 
+	// Inspect returns an independently owned canonical representation of the
+	// application-owned model state.
+	Inspect() (Value, error)
+
 	// EncodeSnapshot returns opaque, model-owned cache bytes.
 	EncodeSnapshot() ([]byte, error)
 	// DecodeSnapshot atomically replaces this fresh session's restorable model

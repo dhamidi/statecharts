@@ -177,6 +177,16 @@ func (s *recordingSession) EncodeSnapshot() ([]byte, error) {
 	return json.Marshal(wire)
 }
 
+func (s *recordingSession) Inspect() (Value, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	values := make(map[string]Value, len(s.values))
+	for name, value := range s.values {
+		values[name] = value.Clone()
+	}
+	return MapValue(values)
+}
+
 func (s *recordingSession) DecodeSnapshot(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
