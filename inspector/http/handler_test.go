@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	statecharts "github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
@@ -375,6 +376,50 @@ func TestSSEFlushesThroughUnwrappingMiddlewareAndEndsWhenServiceCloses(t *testin
 	<-done
 	if !strings.Contains(inner.String(), "event: error\n") {
 		t.Fatalf("closed stream = %q", inner.String())
+	}
+}
+
+func TestSSERepeatedConnectDisconnectReturnsEveryHandler(t *testing.T) {
+	h, _, service := testHandler(t, nil)
+	for range 50 {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		request := httptest.NewRequest(http.MethodGet, "/v1/stream?system=test", nil).WithContext(ctx)
+		response := newFlushRecorder()
+		done := make(chan struct{})
+		go func() {
+			h.ServeHTTP(response, request)
+			close(done)
+		}()
+		select {
+		case <-response.flushed:
+		case <-ctx.Done():
+			t.Fatal("SSE handler did not establish its stream")
+		}
+		cancel()
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			t.Fatal("SSE handler did not return after disconnect")
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		service.Close()
+		close(done)
+	}()
+	timer := time.NewTimer(2 * time.Second)
+	select {
+	case <-done:
+		if !timer.Stop() {
+			<-timer.C
+		}
+	case <-timer.C:
+		t.Fatal("service close did not join stream drainers after repeated disconnects")
 	}
 }
 
