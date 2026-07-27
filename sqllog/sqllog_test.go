@@ -567,8 +567,8 @@ func TestNewRejectsPreDefinitionAndActorSchema(t *testing.T) {
 	if _, err := db.Exec(`UPDATE statechart_schema SET version = 2`); err != nil {
 		t.Fatalf("mark schema as pre-revision: %v", err)
 	}
-	if _, err := sqllog.New(db, sqllog.SQLite); err == nil || !strings.Contains(err.Error(), "want 3") {
-		t.Fatalf("New pre-revision schema error = %v, want current version 3 rejection", err)
+	if _, err := sqllog.New(db, sqllog.SQLite); err == nil || !strings.Contains(err.Error(), "want 4") {
+		t.Fatalf("New pre-revision schema error = %v, want current version 4 rejection", err)
 	}
 }
 

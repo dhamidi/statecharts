@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/dhamidi/statecharts"
@@ -408,27 +409,71 @@ func (l *Storage) GetActor(ctx context.Context, actorID statecharts.Identifier) 
 	return metadata, true, nil
 }
 
-// ListNonTerminalActors implements statecharts.ActorStore.
-func (l *Storage) ListNonTerminalActors(ctx context.Context) ([]statecharts.ActorMetadata, error) {
+// QueryActors implements statecharts.ActorStore with an indexed keyset query.
+func (l *Storage) QueryActors(ctx context.Context, query statecharts.ActorMetadataQuery) (statecharts.ActorMetadataPage, error) {
+	query, after, err := query.Validate()
+	if err != nil {
+		return statecharts.ActorMetadataPage{}, err
+	}
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("sqllog: begin actor list: %w", err)
+		return statecharts.ActorMetadataPage{}, fmt.Errorf("sqllog: begin actor query: %w", err)
 	}
 	defer tx.Rollback()
-	stored, err := listActors(ctx, tx, ``)
-	if err != nil {
-		return nil, fmt.Errorf("sqllog: list active actors: %w", err)
+	clauses := []string{"actor_id > ?"}
+	args := []any{after}
+	if query.ActorIDPrefix != "" {
+		clauses = append(clauses, "substr(actor_id,1,length(?)) = ?")
+		args = append(args, query.ActorIDPrefix, query.ActorIDPrefix)
 	}
-	actors := make([]statecharts.ActorMetadata, 0, len(stored))
-	for _, actor := range stored {
-		if actor.Lifecycle == statecharts.ActorLifecycleActive {
-			actors = append(actors, actor)
+	if query.ChartID != "" {
+		clauses = append(clauses, "chart_id = ?")
+		args = append(args, query.ChartID)
+	}
+	if query.Revision != "" {
+		clauses = append(clauses, "revision = ?")
+		args = append(args, query.Revision)
+	}
+	if query.Lifecycle != "" {
+		clauses = append(clauses, "lifecycle = ?")
+		args = append(args, query.Lifecycle)
+	}
+	args = append(args, query.Limit+1)
+	where := " WHERE " + strings.Join(clauses, " AND ") + " ORDER BY actor_id LIMIT ?"
+	rows, err := tx.QueryContext(ctx, `SELECT actor_id,chart_id,revision,session_id,durable,lifecycle,started_at,terminal_at FROM statechart_actor`+where, args...)
+	if err != nil {
+		return statecharts.ActorMetadataPage{}, fmt.Errorf("sqllog: query actors: %w", err)
+	}
+	var actors []statecharts.ActorMetadata
+	for rows.Next() {
+		actor, scanErr := scanActor(rows)
+		if scanErr != nil {
+			rows.Close()
+			return statecharts.ActorMetadataPage{}, scanErr
+		}
+		actors = append(actors, actor)
+	}
+	if err := rows.Close(); err != nil {
+		return statecharts.ActorMetadataPage{}, err
+	}
+	if err := rows.Err(); err != nil {
+		return statecharts.ActorMetadataPage{}, err
+	}
+	for _, actor := range actors {
+		if err := validateStoredActor(ctx, tx, actor); err != nil {
+			return statecharts.ActorMetadataPage{}, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("sqllog: commit actor list: %w", err)
+	page := statecharts.ActorMetadataPage{}
+	if len(actors) > query.Limit {
+		actors = actors[:query.Limit]
+		page.Next = statecharts.ActorMetadataCursorFor(actors[len(actors)-1].ActorID)
 	}
-	return actors, nil
+	if err := tx.Commit(); err != nil {
+		return statecharts.ActorMetadataPage{}, fmt.Errorf("sqllog: commit actor query: %w", err)
+	}
+	page.Actors = actors
+	return page, nil
 }
 
 // MarkActorTerminal implements statecharts.ActorStore.

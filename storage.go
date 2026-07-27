@@ -2,6 +2,7 @@ package statecharts
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -79,6 +80,76 @@ type ActorMetadata struct {
 	Lifecycle  ActorLifecycle
 	StartedAt  time.Time
 	TerminalAt time.Time
+}
+
+const (
+	// DefaultActorMetadataPageLimit is used when ActorMetadataQuery.Limit is zero.
+	DefaultActorMetadataPageLimit = 50
+	// MaxActorMetadataPageLimit is the largest accepted actor directory page.
+	MaxActorMetadataPageLimit = 200
+)
+
+// ActorMetadataCursor is an opaque, storage-independent position in the
+// ActorID ordering. Callers should only retain and return cursor values from a
+// previous ActorMetadataPage.
+type ActorMetadataCursor string
+
+// ActorMetadataQuery selects durable actor metadata. An empty Lifecycle
+// selects both active and terminal actors, making the default suitable for a
+// complete directory traversal. After is exclusive. Limit zero uses
+// DefaultActorMetadataPageLimit; negative or oversized limits are rejected.
+type ActorMetadataQuery struct {
+	After         ActorMetadataCursor
+	Limit         int
+	ActorIDPrefix string
+	ChartID       Identifier
+	Revision      RevisionID
+	Lifecycle     ActorLifecycle
+}
+
+// ActorMetadataPage owns its Actors slice and contains Next only when another
+// matching actor exists.
+type ActorMetadataPage struct {
+	Actors []ActorMetadata
+	Next   ActorMetadataCursor
+}
+
+// Validate normalizes the limit and decodes the exclusive ActorID cursor.
+// Storage implementations use this method to ensure identical validation.
+func (q ActorMetadataQuery) Validate() (normalized ActorMetadataQuery, after Identifier, err error) {
+	normalized = q
+	if normalized.Limit == 0 {
+		normalized.Limit = DefaultActorMetadataPageLimit
+	}
+	if normalized.Limit < 0 || normalized.Limit > MaxActorMetadataPageLimit {
+		return ActorMetadataQuery{}, "", fmt.Errorf("statecharts: actor metadata query limit %d must be between 1 and %d, or zero for the default", q.Limit, MaxActorMetadataPageLimit)
+	}
+	if normalized.ChartID != "" {
+		if _, err := NewIdentifier(string(normalized.ChartID)); err != nil {
+			return ActorMetadataQuery{}, "", fmt.Errorf("statecharts: actor metadata query chart ID: %w", err)
+		}
+	}
+	if normalized.Lifecycle != "" && normalized.Lifecycle != ActorLifecycleActive && normalized.Lifecycle != ActorLifecycleTerminal {
+		return ActorMetadataQuery{}, "", fmt.Errorf("statecharts: actor metadata query lifecycle %q is unknown", normalized.Lifecycle)
+	}
+	if normalized.After == "" {
+		return normalized, "", nil
+	}
+	raw, decodeErr := base64.RawURLEncoding.DecodeString(string(normalized.After))
+	if decodeErr != nil || len(raw) < 2 || raw[0] != 1 {
+		return ActorMetadataQuery{}, "", fmt.Errorf("statecharts: invalid actor metadata cursor")
+	}
+	after, err = NewIdentifier(string(raw[1:]))
+	if err != nil {
+		return ActorMetadataQuery{}, "", fmt.Errorf("statecharts: invalid actor metadata cursor")
+	}
+	return normalized, after, nil
+}
+
+// ActorMetadataCursorFor returns the opaque cursor following actorID.
+func ActorMetadataCursorFor(actorID Identifier) ActorMetadataCursor {
+	raw := append([]byte{1}, []byte(actorID)...)
+	return ActorMetadataCursor(base64.RawURLEncoding.EncodeToString(raw))
 }
 
 // Validate checks active or terminal persisted metadata. BeginActor accepts
@@ -163,8 +234,9 @@ type ActorStore interface {
 	// ErrInvalidActorMetadata before replay can begin.
 	GetActor(ctx context.Context, actorID Identifier) (ActorMetadata, bool, error)
 
-	// ListNonTerminalActors returns all active durable actors in ActorID order.
-	ListNonTerminalActors(ctx context.Context) ([]ActorMetadata, error)
+	// QueryActors returns durable metadata in ActorID ascending order without
+	// activating actors. Filters are combined, and the cursor is exclusive.
+	QueryActors(ctx context.Context, query ActorMetadataQuery) (ActorMetadataPage, error)
 
 	// MarkActorTerminal atomically releases actorID's revision reference. It
 	// is idempotent and preserves the first terminal timestamp.

@@ -97,10 +97,19 @@ func registerAdministrationRoutes(mux *http.ServeMux, runtime *counterRuntime) {
 		writeJSON(w, definitionStatus{ChartID: counterKind, Revision: revision})
 	})
 	mux.HandleFunc("GET /actors", func(w http.ResponseWriter, request *http.Request) {
-		metadata, err := runtime.storage.ListNonTerminalActors(request.Context())
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		var metadata []statecharts.ActorMetadata
+		query := statecharts.ActorMetadataQuery{Lifecycle: statecharts.ActorLifecycleActive}
+		for {
+			page, err := runtime.storage.QueryActors(request.Context(), query)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			metadata = append(metadata, page.Actors...)
+			if page.Next == "" {
+				break
+			}
+			query.After = page.Next
 		}
 		result := actorList{Actors: make([]actorStatus, len(metadata))}
 		for index, actor := range metadata {

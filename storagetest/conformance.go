@@ -406,6 +406,92 @@ func Run(t *testing.T, factory Factory) {
 		}
 	})
 
+	t.Run("actor metadata query paginates and filters", func(t *testing.T) {
+		store := factory(t)
+		ctx := context.Background()
+		counter := fixtureArtifact(t, "counter", "v1")
+		counterV2 := fixtureArtifact(t, "counter", "v2")
+		gauge := fixtureArtifact(t, "gauge", "v1")
+		for _, artifact := range []statecharts.DefinitionArtifact{counter, counterV2, gauge} {
+			putArtifact(t, store, artifact)
+		}
+		actors := []statecharts.ActorMetadata{
+			fixtureActor(counter, "alpha-1"), fixtureActor(counterV2, "alpha-2"),
+			fixtureActor(gauge, "alpha-3"), fixtureActor(counter, "beta-1"),
+			fixtureActor(gauge, "delta-1"),
+		}
+		for _, actor := range actors {
+			if _, _, err := store.BeginActor(ctx, actor); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, _, err := store.MarkActorTerminal(ctx, "alpha-2", actors[1].StartedAt.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+
+		var got []statecharts.Identifier
+		query := statecharts.ActorMetadataQuery{Limit: 2}
+		for {
+			page, err := store.QueryActors(ctx, query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, actor := range page.Actors {
+				got = append(got, actor.ActorID)
+			}
+			if page.Next == "" {
+				break
+			}
+			query.After = page.Next
+		}
+		want := []statecharts.Identifier{"alpha-1", "alpha-2", "alpha-3", "beta-1", "delta-1"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("paged ActorIDs = %v, want %v", got, want)
+		}
+		page, err := store.QueryActors(ctx, statecharts.ActorMetadataQuery{Limit: 3})
+		if err != nil || page.Next == "" || len(page.Actors) != 3 {
+			t.Fatalf("non-boundary page = %#v, %v", page, err)
+		}
+		page, err = store.QueryActors(ctx, statecharts.ActorMetadataQuery{Limit: 5})
+		if err != nil || page.Next != "" || len(page.Actors) != 5 {
+			t.Fatalf("exact-boundary page = %#v, %v", page, err)
+		}
+		page.Actors[0].ActorID = "mutated"
+		owned, err := store.QueryActors(ctx, statecharts.ActorMetadataQuery{Limit: 1})
+		if err != nil || len(owned.Actors) != 1 || owned.Actors[0].ActorID != "alpha-1" {
+			t.Fatalf("query result is not independently owned: %#v, %v", owned, err)
+		}
+
+		checks := []struct {
+			query statecharts.ActorMetadataQuery
+			want  []statecharts.Identifier
+		}{
+			{statecharts.ActorMetadataQuery{ActorIDPrefix: "alpha-"}, []statecharts.Identifier{"alpha-1", "alpha-2", "alpha-3"}},
+			{statecharts.ActorMetadataQuery{ChartID: gauge.ChartID}, []statecharts.Identifier{"alpha-3", "delta-1"}},
+			{statecharts.ActorMetadataQuery{Revision: counter.Revision}, []statecharts.Identifier{"alpha-1", "beta-1"}},
+			{statecharts.ActorMetadataQuery{Lifecycle: statecharts.ActorLifecycleTerminal}, []statecharts.Identifier{"alpha-2"}},
+			{statecharts.ActorMetadataQuery{Lifecycle: statecharts.ActorLifecycleActive}, []statecharts.Identifier{"alpha-1", "alpha-3", "beta-1", "delta-1"}},
+		}
+		for _, check := range checks {
+			page, err := store.QueryActors(ctx, check.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids := make([]statecharts.Identifier, len(page.Actors))
+			for i := range page.Actors {
+				ids[i] = page.Actors[i].ActorID
+			}
+			if !reflect.DeepEqual(ids, check.want) {
+				t.Fatalf("query %#v IDs = %v, want %v", check.query, ids, check.want)
+			}
+		}
+		for _, query := range []statecharts.ActorMetadataQuery{{Limit: -1}, {Limit: 201}, {After: "not-a-cursor"}} {
+			if _, err := store.QueryActors(ctx, query); err == nil {
+				t.Fatalf("QueryActors(%#v) accepted invalid query", query)
+			}
+		}
+	})
+
 	t.Run("listing references and terminal release are authoritative", func(t *testing.T) {
 		store := factory(t)
 		ctx := context.Background()
@@ -419,12 +505,13 @@ func Run(t *testing.T, factory Factory) {
 				t.Fatal(err)
 			}
 		}
-		active, err := store.ListNonTerminalActors(ctx)
+		page, err := store.QueryActors(ctx, statecharts.ActorMetadataQuery{Lifecycle: statecharts.ActorLifecycleActive})
+		active := page.Actors
 		if err != nil || len(active) != 3 {
-			t.Fatalf("ListNonTerminalActors = %#v, %v", active, err)
+			t.Fatalf("QueryActors = %#v, %v", active, err)
 		}
 		if got := []statecharts.Identifier{active[0].ActorID, active[1].ActorID, active[2].ActorID}; !reflect.DeepEqual(got, []statecharts.Identifier{"blue", "green", "red"}) {
-			t.Fatalf("ListNonTerminalActors order = %v", got)
+			t.Fatalf("QueryActors order = %v", got)
 		}
 		wantRevisions := []statecharts.RevisionID{v1.Revision, v2.Revision}
 		sort.Slice(wantRevisions, func(i, j int) bool { return wantRevisions[i] < wantRevisions[j] })

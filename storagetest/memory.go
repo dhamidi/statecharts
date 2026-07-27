@@ -7,6 +7,7 @@ import (
 	"iter"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -208,23 +209,37 @@ func (s *MemoryStore) GetActor(ctx context.Context, actorID statecharts.Identifi
 	return metadata, true, nil
 }
 
-func (s *MemoryStore) ListNonTerminalActors(ctx context.Context) ([]statecharts.ActorMetadata, error) {
+func (s *MemoryStore) QueryActors(ctx context.Context, query statecharts.ActorMetadataQuery) (statecharts.ActorMetadataPage, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return statecharts.ActorMetadataPage{}, err
+	}
+	query, after, err := query.Validate()
+	if err != nil {
+		return statecharts.ActorMetadataPage{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := make([]statecharts.ActorMetadata, 0, len(s.actors))
 	for _, actor := range s.actors {
 		if err := s.validateStoredActorLocked(actor); err != nil {
-			return nil, err
+			return statecharts.ActorMetadataPage{}, err
 		}
-		if actor.Lifecycle == statecharts.ActorLifecycleActive {
-			result = append(result, actor)
+		if actor.ActorID <= after || !strings.HasPrefix(string(actor.ActorID), query.ActorIDPrefix) ||
+			(query.ChartID != "" && actor.ChartID != query.ChartID) ||
+			(query.Revision != "" && actor.Revision != query.Revision) ||
+			(query.Lifecycle != "" && actor.Lifecycle != query.Lifecycle) {
+			continue
 		}
+		result = append(result, actor)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].ActorID < result[j].ActorID })
-	return result, nil
+	page := statecharts.ActorMetadataPage{}
+	if len(result) > query.Limit {
+		result = result[:query.Limit]
+		page.Next = statecharts.ActorMetadataCursorFor(result[len(result)-1].ActorID)
+	}
+	page.Actors = append([]statecharts.ActorMetadata(nil), result...)
+	return page, nil
 }
 
 func (s *MemoryStore) MarkActorTerminal(ctx context.Context, actorID statecharts.Identifier, terminalAt time.Time) (statecharts.ActorMetadata, statecharts.ActorTerminalResult, error) {

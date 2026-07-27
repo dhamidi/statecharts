@@ -38,6 +38,9 @@ var createTableDDL = map[Dialect][]string{
 			CHECK ((lifecycle = 'active' AND terminal_at IS NULL) OR (lifecycle = 'terminal' AND terminal_at IS NOT NULL))
 		)`,
 		`CREATE INDEX IF NOT EXISTS statechart_actor_active_revision ON statechart_actor(revision) WHERE lifecycle = 'active'`,
+		`CREATE INDEX IF NOT EXISTS statechart_actor_chart_actor ON statechart_actor(chart_id, actor_id)`,
+		`CREATE INDEX IF NOT EXISTS statechart_actor_revision_actor ON statechart_actor(revision, actor_id)`,
+		`CREATE INDEX IF NOT EXISTS statechart_actor_lifecycle_actor ON statechart_actor(lifecycle, actor_id)`,
 		`CREATE TABLE IF NOT EXISTS statechart_log (
 			session_id        TEXT    NOT NULL,
 			seq               INTEGER NOT NULL,

@@ -44,7 +44,7 @@ func New(db *sql.DB, dialect Dialect) (*Storage, error) {
 	return &Storage{db: db, dialect: dialect}, nil
 }
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 func initializeSchema(db *sql.DB, dialect Dialect) (err error) {
 	statements, err := ddlFor(dialect)
