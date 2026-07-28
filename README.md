@@ -613,6 +613,10 @@ systems, but each system owns isolated durable storage.
   workspace with ephemeral connection actors, resumable clients, streamed
   provider work, tool leasing, and capability registries kept outside model
   snapshots.
+- [`examples/subscriptions`](examples/subscriptions) models durable subscription
+  billing with parallel billing and entitlement regions, the ECMAScript
+  datamodel, a deliberately adversarial fake payment IOProcessor, persistent
+  idempotency and callback jobs, SSE projections, and the embedded inspector.
 
 ## Standards coverage
 

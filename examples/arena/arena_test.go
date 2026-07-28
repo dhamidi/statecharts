@@ -31,13 +31,13 @@ func TestInspectorMountExposesArenaSystem(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := arenaHandler(runtime, inspectorhttp.NewHandler(service))
-	for _, path := range []string{"/inspect/", "/inspect/v1/systems"} {
+	for _, path := range []string{"/inspect", "/inspect/", "/inspect/v1/systems"} {
 		response := httptest.NewRecorder()
 		h.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
 		if response.Code != http.StatusOK {
 			t.Fatalf("GET %s = %d %s", path, response.Code, response.Body.String())
 		}
-		if path != "/inspect/" && !strings.Contains(response.Body.String(), `"systems":["arena"]`) {
+		if path == "/inspect/v1/systems" && !strings.Contains(response.Body.String(), `"systems":["arena"]`) {
 			t.Fatalf("systems = %s", response.Body.String())
 		}
 	}

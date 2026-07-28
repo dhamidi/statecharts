@@ -228,6 +228,8 @@ func counterHandler(rt *counterRuntime, inspectorHandlers ...http.Handler) http.
 	mux := http.NewServeMux()
 	if len(inspectorHandlers) > 0 && inspectorHandlers[0] != nil {
 		mounted := http.StripPrefix("/inspect", inspectorHandlers[0])
+		mux.Handle("GET /inspect", mounted)
+		mux.Handle("POST /inspect", mounted)
 		mux.Handle("GET /inspect/", mounted)
 		mux.Handle("POST /inspect/", mounted)
 	}

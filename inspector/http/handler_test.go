@@ -29,7 +29,7 @@ func testHandler(t *testing.T, received chan<- statecharts.Event, options ...ins
 		}
 		return nil
 	})
-	chart, err := b.Build(statecharts.Atomic("active", statecharts.On("message", statecharts.Then(record.Do()))))
+	chart, err := b.Build(statecharts.Atomic("active", statecharts.On("message", statecharts.Then(record.Call()))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,8 +64,8 @@ func TestEmbeddedUIAssetsAndStripPrefix(t *testing.T) {
 	h, _, _ := testHandler(t, nil)
 	for _, tc := range []struct{ path, contentType, cache string }{
 		{"/", "text/html", "no-cache"},
-		{"/assets/v1/app.js", "text/javascript", "immutable"},
-		{"/assets/v1/app.css", "text/css", "immutable"},
+		{"/assets/v2/app.js", "text/javascript", "no-cache"},
+		{"/assets/v2/app.css", "text/css", "no-cache"},
 	} {
 		w := request(t, h, http.MethodGet, tc.path, nil)
 		if w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Content-Type"), tc.contentType) || !strings.Contains(w.Header().Get("Cache-Control"), tc.cache) || w.Body.Len() == 0 {
@@ -74,13 +74,16 @@ func TestEmbeddedUIAssetsAndStripPrefix(t *testing.T) {
 	}
 	shell := request(t, h, http.MethodGet, "/", nil).Body.String()
 	shellHeaders := request(t, h, http.MethodGet, "/", nil).Header()
-	if !strings.Contains(shellHeaders.Get("Content-Security-Policy"), "connect-src 'self'") || shellHeaders.Get("Referrer-Policy") != "no-referrer" {
+	if !strings.Contains(shellHeaders.Get("Content-Security-Policy"), "connect-src 'self'") ||
+		!strings.Contains(shellHeaders.Get("Content-Security-Policy"), "base-uri 'self'") ||
+		shellHeaders.Get("Referrer-Policy") != "no-referrer" {
 		t.Fatalf("shell security headers: CSP=%q Referrer-Policy=%q", shellHeaders.Get("Content-Security-Policy"), shellHeaders.Get("Referrer-Policy"))
 	}
-	if strings.Contains(shell, "http://") || strings.Contains(shell, "https://") || !strings.Contains(shell, `src="assets/v1/app.js"`) {
+	if strings.Contains(shell, "http://") || strings.Contains(shell, "https://") ||
+		!strings.Contains(shell, `<base href="/">`) || !strings.Contains(shell, `src="assets/v2/app.js"`) {
 		t.Fatalf("shell has an external or non-relative dependency: %s", shell)
 	}
-	js := request(t, h, http.MethodGet, "/assets/v1/app.js", nil).Body.String()
+	js := request(t, h, http.MethodGet, "/assets/v2/app.js", nil).Body.String()
 	if strings.Contains(js, "cdn.") || strings.Contains(js, "https://") || !strings.Contains(js, "customElements.define") {
 		t.Fatal("application is not a dependency-free Web Components bundle")
 	}
@@ -99,12 +102,18 @@ func TestEmbeddedUIAssetsAndStripPrefix(t *testing.T) {
 		}
 	}
 	mounted := http.StripPrefix("/inspect", h)
-	for _, path := range []string{"/inspect/", "/inspect/assets/v1/app.js", "/inspect/v1/systems"} {
+	for _, path := range []string{"/inspect", "/inspect/", "/inspect/assets/v2/app.js", "/inspect/v1/systems"} {
 		if w := request(t, mounted, http.MethodGet, path, nil); w.Code != http.StatusOK {
 			t.Errorf("mounted GET %s = %d %s", path, w.Code, w.Body.String())
 		}
 	}
-	for _, path := range []string{"/", "/assets/v1/app.js"} {
+	for _, path := range []string{"/inspect", "/inspect/"} {
+		shell := request(t, mounted, http.MethodGet, path, nil).Body.String()
+		if !strings.Contains(shell, `<base href="/inspect/">`) {
+			t.Errorf("mounted GET %s does not preserve the mount base: %s", path, shell)
+		}
+	}
+	for _, path := range []string{"/", "/assets/v2/app.js"} {
 		w := request(t, h, http.MethodPost, path, nil)
 		if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") != http.MethodGet {
 			t.Errorf("POST %s = %d Allow=%q", path, w.Code, w.Header().Get("Allow"))
@@ -126,6 +135,20 @@ func TestJSONEndpointsAndPaginationValidation(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || result.Data == nil || result.Error != nil {
 			t.Fatalf("GET %s envelope = %#v, %v", target, result, err)
 		}
+	}
+	definitionResponse := request(t, h, http.MethodGet, "/v1/definition?system=test&id=actor", nil)
+	var definition struct {
+		Data struct {
+			PinnedSource json.RawMessage `json:"pinnedSource"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(definitionResponse.Body.Bytes(), &definition); err != nil {
+		t.Fatalf("decode definition source: %v", err)
+	}
+	source := string(definition.Data.PinnedSource)
+	if !strings.Contains(source, `"kind":"atomic"`) || !strings.Contains(source, `"kind":"call"`) ||
+		!strings.Contains(source, `"name":"http-test.record"`) {
+		t.Fatalf("editable definition source does not preserve behavior: %s", source)
 	}
 	for _, target := range []string{"/v1/actors?system=test&limit=no", "/v1/actors?system=test&durable=no", "/v1/recent?system=test&cursor=-1"} {
 		if w := request(t, h, http.MethodGet, target, nil); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"code":"invalid_request"`) {

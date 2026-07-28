@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Subscription Operations</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div><span class="product">Subscription Operations</span><span class="environment">LOCAL PROCESSOR</span></div>
+    <nav aria-label="Service status"><span id="connection" class="connection offline" role="status" aria-live="polite">Offline</span><a href="/inspect" target="_blank" rel="noopener">Open inspector</a></nav>
+  </header>
+  <main><subscription-console></subscription-console></main>
+  <div id="announcer" class="sr-only" aria-live="polite"></div>
+</body>
+</html>

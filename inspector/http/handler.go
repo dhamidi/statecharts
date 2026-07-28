@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	statecharts "github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
 	"github.com/dhamidi/statecharts/inspector"
+	definitionjson "github.com/dhamidi/statecharts/syntax/json"
 )
 
 // uiFiles contains the complete browser application. It deliberately has no
@@ -25,9 +27,10 @@ import (
 var uiFiles embed.FS
 
 const (
-	maxBodyBytes = 64 << 10
-	streamBuffer = 64
-	recentLimit  = 1000
+	maxBodyBytes      = 64 << 10
+	streamBuffer      = 64
+	recentLimit       = 1000
+	uiBasePlaceholder = "__STATECHARTS_INSPECTOR_BASE__"
 )
 
 type handler struct{ service *inspector.Service }
@@ -48,12 +51,12 @@ type wireError struct {
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
-	case "/":
+	case "", "/":
 		h.asset(w, r, "ui/index.html", "text/html; charset=utf-8", "no-cache")
-	case "/assets/v1/app.js":
-		h.asset(w, r, "ui/app.js", "text/javascript; charset=utf-8", "public, max-age=31536000, immutable")
-	case "/assets/v1/app.css":
-		h.asset(w, r, "ui/app.css", "text/css; charset=utf-8", "public, max-age=31536000, immutable")
+	case "/assets/v2/app.js":
+		h.asset(w, r, "ui/app.js", "text/javascript; charset=utf-8", "no-cache")
+	case "/assets/v2/app.css":
+		h.asset(w, r, "ui/app.css", "text/css; charset=utf-8", "no-cache")
 	case "/v1/systems":
 		h.systems(w, r)
 	case "/v1/actors":
@@ -84,15 +87,35 @@ func (h *handler) asset(w http.ResponseWriter, r *http.Request, name, contentTyp
 		writeError(w, http.StatusNotFound, "not_found", "asset not found")
 		return
 	}
+	if name == "ui/index.html" {
+		data = []byte(strings.ReplaceAll(string(data), uiBasePlaceholder, html.EscapeString(requestBase(r))))
+	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", cache)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if name == "ui/index.html" {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'self'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+}
+
+func requestBase(r *http.Request) string {
+	base := r.RequestURI
+	if query := strings.IndexByte(base, '?'); query >= 0 {
+		base = base[:query]
+	}
+	if base == "" || !strings.HasPrefix(base, "/") || strings.HasPrefix(base, "//") {
+		base = r.URL.EscapedPath()
+	}
+	if base == "" {
+		base = "/"
+	}
+	if !strings.HasSuffix(base, "/") {
+		base += "/"
+	}
+	return base
 }
 
 func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
@@ -224,7 +247,24 @@ func (h *handler) definition(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, envelope{Data: result})
+	pinnedSource, err := definitionjson.MarshalIndent(result.Pinned, "", "  ")
+	if err != nil {
+		writeServiceError(w, fmt.Errorf("inspector HTTP: encode pinned definition: %w", err))
+		return
+	}
+	response := struct {
+		actors.ActorDefinition
+		PinnedSource  json.RawMessage `json:"pinnedSource"`
+		CurrentSource json.RawMessage `json:"currentSource,omitempty"`
+	}{ActorDefinition: result, PinnedSource: pinnedSource}
+	if result.CurrentAvailable {
+		response.CurrentSource, err = definitionjson.MarshalIndent(result.Current, "", "  ")
+		if err != nil {
+			writeServiceError(w, fmt.Errorf("inspector HTTP: encode current definition: %w", err))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, envelope{Data: response})
 }
 
 func (h *handler) history(w http.ResponseWriter, r *http.Request) {

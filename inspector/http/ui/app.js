@@ -24,6 +24,66 @@ const wireNames = {
 };
 const get = (object, key) => object?.[key] ?? object?.[wireNames[key] || key[0].toUpperCase() + key.slice(1)];
 const field = (label, value) => [el("dt", {}, label), el("dd", {}, value ?? "—")];
+const compact = value => {
+  const text = String(value ?? "—");
+  return text.length > 28 ? `${text.slice(0, 16)}…${text.slice(-8)}` : text;
+};
+
+const relativeSeconds = timestamp => {
+  const elapsed = Math.max(0, (Date.now() - Date.parse(timestamp)) / 1000);
+  if (!Number.isFinite(elapsed)) return "time unknown";
+  return `${elapsed < 1 ? elapsed.toFixed(2) : elapsed < 10 ? elapsed.toFixed(1) : Math.round(elapsed)}s ago`;
+};
+
+const eventTypeName = type => ["external", "internal", "platform"][Number(type)] || String(type ?? "unknown");
+
+const macrostepSummary = macrostep => {
+  const trigger = get(macrostep, "trigger");
+  const before = (get(macrostep, "before") || []).map(String);
+  const after = (get(macrostep, "after") || []).map(String);
+  const microsteps = get(macrostep, "microsteps") || [];
+  const parts = [trigger ? `${get(trigger, "name") || "(unnamed event)"} [${eventTypeName(get(trigger, "type"))}]` : "initialization"];
+  const sameConfiguration = before.length === after.length && before.every((state, index) => state === after[index]);
+  parts.push(sameConfiguration ? `state unchanged: ${after.join(", ") || "empty"}` : `${before.join(", ") || "∅"} → ${after.join(", ") || "∅"}`);
+  const triggerName = String(get(trigger, "name") || "");
+  const followups = [...new Set(microsteps.map(step => String(get(get(step, "trigger"), "name") || "")).filter(name => name && name !== triggerName))];
+  if (followups.length) parts.push(`then ${followups.join(", ")}`);
+  if (get(macrostep, "terminal")) parts.push(get(macrostep, "terminalError") ? `terminal: ${get(macrostep, "terminalError")}` : "terminal");
+  return parts.join(" · ");
+};
+
+const macrostepTransitionRefs = macrostep => (get(macrostep, "microsteps") || []).flatMap(step => get(step, "transitions") || [])
+  .map(ref => ({ source: String(get(ref, "source")), index: get(ref, "index") }));
+
+const observationCategory = kind => {
+  if (kind === "macrostep") return "macrostep";
+  if (kind === "residency.changed") return "residency";
+  if (kind === "actor.discovered" || kind === "actor.terminal") return "lifecycle";
+  return kind;
+};
+
+const observationSummary = (kind, actor, macrostep) => {
+  if (macrostep) return macrostepSummary(macrostep);
+  if (kind === "residency.changed") return `residency changed to ${get(actor, "residency") || "unknown"}`;
+  if (kind === "actor.discovered") return "actor discovered";
+  if (kind === "actor.terminal") return "actor reached a terminal state";
+  return kind;
+};
+
+const copyableValue = (value, label) => {
+  const text = String(value ?? "—");
+  const feedback = el("span", { class: "copy-feedback", "aria-live": "polite" });
+  const button = el("button", { type: "button", class: "copy-value", "aria-label": `Copy full ${label}`, onclick: async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      feedback.textContent = "Copied";
+    } catch (_) {
+      feedback.textContent = "Copy failed — select the value to copy it.";
+    }
+  } }, "Copy");
+  return el("span", { class: "full-value", title: text },
+    el("span", { class: "identifier", tabindex: "0", "aria-label": `${label}: ${text}` }, compact(text)), button, feedback);
+};
 
 const api = async (path, options) => {
   const response = await fetch(path, options);
@@ -116,7 +176,11 @@ class ValueEditor extends HTMLElement {
   child(value, update) {
     const child = document.createElement("value-editor");
     child.value = value;
-    child.addEventListener("value-change", () => update(child.value));
+    child.addEventListener("value-change", () => {
+      // A render can detach an entire recursive editor tree. Events already
+      // queued by that old tree must not modify the replacement value.
+      if (child.isConnected && this.contains(child)) update(child.value);
+    });
     return child;
   }
 
@@ -125,10 +189,10 @@ class ValueEditor extends HTMLElement {
     const value = this._value;
     const kinds = ["null", "bool", "number", "string", "list", "map", "tagged"];
     const kind = el("select", {
-      "aria-label": "Value kind",
+      "aria-label": "Payload type",
       onchange: event => { this.value = canonicalValue(event.target.value); this.changed(); },
     }, ...kinds.map(name => el("option", { value: name, ...(name === value.kind ? { selected: "" } : {}) }, name)));
-    const row = el("div", { class: "row" }, kind);
+    const row = el("div", { class: "row payload-row" }, el("label", {}, el("span", {}, "Payload type"), kind));
 
     if (value.kind === "bool") {
       row.append(el("select", { "aria-label": "Boolean value", onchange: event => { value.bool = event.target.value === "true"; this.changed(); } },
@@ -156,29 +220,36 @@ class ValueEditor extends HTMLElement {
 
   renderMap(box, map) {
     for (const [key, item] of Object.entries(map)) {
-      const message = el("span", { class: "map-error", "aria-live": "polite" });
+      const errorID = `map-error-${Math.random().toString(36).slice(2)}`;
+      const message = el("span", { class: "map-error", id: errorID });
       const child = this.child(item, next => {
         if (!Object.hasOwn(map, key)) return;
         Object.defineProperty(map, key, { value: next, writable: true, configurable: true, enumerable: true });
         this.changed();
       });
-      const keyInput = el("input", { value: key, "aria-label": "Map key" });
+      const keyInput = el("input", { value: key, "aria-label": "Map key", "aria-describedby": errorID });
       keyInput.addEventListener("change", () => {
         const next = keyInput.value;
+        if (next.length === 0) {
+          message.textContent = "Map keys cannot be empty.";
+          keyInput.setAttribute("aria-invalid", "true");
+          return;
+        }
         if (next !== key && Object.hasOwn(map, next)) {
           message.textContent = `Key “${next}” already exists.`;
-          keyInput.value = key;
+          keyInput.setAttribute("aria-invalid", "true");
           return;
         }
         const current = map[key];
         delete map[key];
         Object.defineProperty(map, next, { value: current, writable: true, configurable: true, enumerable: true });
         message.textContent = "";
+        keyInput.removeAttribute("aria-invalid");
         this.render();
         this.changed();
       });
       box.append(el("div", { class: "map-entry" }, keyInput, child,
-        el("button", { type: "button", onclick: () => { delete map[key]; this.render(); this.changed(); } }, "Remove"), message));
+        el("button", { type: "button", "aria-label": `Remove map entry “${key}”`, onclick: () => { delete map[key]; this.render(); this.changed(); } }, "Remove"), message));
     }
     box.append(el("button", { type: "button", onclick: () => {
       let key = "key";
@@ -217,21 +288,29 @@ class ActorDirectory extends HTMLElement {
 
   render() {
     this.replaceChildren(el("aside", {},
-      el("div", { class: "toolbar" },
-        el("input", { type: "search", placeholder: "Actor ID prefix", "aria-label": "Search actors", oninput: event => { this.filters.prefix = event.target.value; } }),
-        el("button", { onclick: () => { this.cursor = ""; this.load(); } }, "Refresh")),
-      el("div", { class: "filters" },
-        el("input", { type: "text", placeholder: "Any kind", "aria-label": "kind", oninput: event => { this.filters.kind = event.target.value.trim(); } }),
-        this.select("durable", ["", "true", "false"]), this.select("lifecycle", ["", "active", "terminal"]),
-        this.select("residency", ["", "resident", "paged out", "hydrating"])),
+      el("div", { class: "directory-heading toolbar" }, el("h2", {}, "Actors"),
+        el("button", { onclick: () => { this.cursor = ""; this.load(); }, "aria-label": "Refresh actor directory" }, "Refresh directory")),
+      el("form", { class: "filters", onsubmit: event => { event.preventDefault(); this.cursor = ""; this.load(); } },
+        this.input("prefix", "Actor ID", "Actor ID prefix"),
+        el("details", { class: "filter-disclosure" }, el("summary", {}, "More filters"),
+          el("div", { class: "filter-grid" }, this.input("kind", "Kind", "Any kind"),
+            this.select("durable", ["", "true", "false"]), this.select("lifecycle", ["", "active", "terminal"]),
+            this.select("residency", ["", "resident", "paged out", "hydrating"]))),
+        el("button", { type: "submit" }, "Apply filters")),
       this.message = el("p", { class: "muted" }, "Choose a system."),
       this.list = el("ul", { class: "directory" }),
-      this.more = el("button", { onclick: () => this.load(true), disabled: "" }, "Next page")));
+      this.more = el("button", { onclick: () => this.load(true), disabled: "" }, "Load more")));
+  }
+
+  input(name, label, placeholder) {
+    const input = el("input", { type: name === "prefix" ? "search" : "text", placeholder, "aria-label": name, oninput: event => { this.filters[name] = event.target.value.trim(); } });
+    return el("label", {}, el("span", {}, label), input);
   }
 
   select(name, values) {
-    return el("select", { "aria-label": name, onchange: event => { this.filters[name] = event.target.value; this.cursor = ""; this.load(); } },
+    const select = el("select", { "aria-label": name, onchange: event => { this.filters[name] = event.target.value; } },
       ...values.map(value => el("option", { value }, value || `Any ${name}`)));
+    return el("label", {}, el("span", {}, name[0].toUpperCase() + name.slice(1)), select);
   }
 
   async load(append = false) {
@@ -252,11 +331,11 @@ class ActorDirectory extends HTMLElement {
         const id = String(get(actor, "id"));
         if (present.has(id)) continue;
         present.add(id);
-        const button = el("button", { "aria-current": String(id === this.selected), onclick: () => {
+        const button = el("button", { title: id, "aria-current": String(id === this.selected), onclick: () => {
           this.selected = id;
           this.dispatchEvent(new CustomEvent("actor-select", { detail: id, bubbles: true }));
           this.loadSelection();
-        } }, el("strong", { class: "actor-id" }, id),
+        } }, el("strong", { class: "actor-id" }, compact(id)),
         el("span", { class: "actor-meta" }, `${get(actor, "kind") || "unknown"} · ${get(actor, "residency") || "unknown"}`));
         button.dataset.actorId = id;
         this.list.append(el("li", {}, button));
@@ -280,40 +359,328 @@ class ActorDirectory extends HTMLElement {
 customElements.define("actor-directory", ActorDirectory);
 
 class DefinitionView extends HTMLElement {
-  set data(value) { this._data = value; this.render(); }
-  set selectedTransitions(value) { this._selectedTransitions = value || new Set(); if (this._data) this.render(); }
+  set data(value) {
+    const signature = [get(value, "pinnedRevision"), get(value, "currentRevision"), get(value, "currentAvailable")].join("\u0000");
+    this._data = value;
+    if (signature !== this._signature) {
+      this._signature = signature;
+      this.render();
+    } else {
+      this.updateRuntime();
+    }
+  }
+  set active(value) { this._active = value || new Set(); this.updateRuntime(); }
+  get active() { return this._active || new Set(); }
+  set selectedTransitions(value) { this._selectedTransitions = value || new Set(); this.updateRuntime(); }
 
   render() {
     this.replaceChildren();
     if (!this._data) return;
     const pinned = get(this._data, "pinned");
     const currentAvailable = Boolean(get(this._data, "currentAvailable"));
+    const sameRevision = currentAvailable && get(this._data, "pinnedRevision") === get(this._data, "currentRevision");
     this.append(el("h2", {}, "Definition"), el("dl", { class: "facts revision-facts" },
-      ...field("Pinned revision", get(this._data, "pinnedRevision") || "—"),
-      ...field("Current revision", currentAvailable ? get(this._data, "currentRevision") || "—" : "unavailable")));
-    if (pinned) this.append(this.definitionSection("Pinned", pinned, true));
-    if (currentAvailable) this.append(this.definitionSection("Current", get(this._data, "current"), false));
+      ...field("Pinned revision", copyableValue(get(this._data, "pinnedRevision"), "pinned revision")),
+      ...field("Current revision", sameRevision ? "same as pinned" : currentAvailable ? copyableValue(get(this._data, "currentRevision"), "current revision") : "unavailable")));
+    this.search = el("input", { type: "search", placeholder: "State, event, condition, or action", "aria-label": "Search definition",
+      oninput: event => this.applySearch(event.target.value) });
+    this.searchStatus = el("span", { class: "muted search-status", "aria-live": "polite" });
+    this.append(el("label", { class: "definition-search" }, el("span", {}, "Find behavior"), this.search, this.searchStatus));
+    if (pinned) this.append(this.definitionSection(sameRevision ? "Pinned · current" : "Pinned", pinned, true, get(this._data, "pinnedSource")));
+    if (sameRevision) this.append(el("p", { class: "muted same-definition" }, "Current is the same as pinned."));
+    else if (currentAvailable) this.append(this.definitionSection("Current", get(this._data, "current"), false, get(this._data, "currentSource")));
     else this.append(el("section", {}, el("h3", {}, "Current"), el("p", { class: "muted" }, "Current definition is unavailable.")));
+    this.updateRuntime();
   }
 
-  definitionSection(label, definition, pinned) {
-    const section = el("section", {}, el("h3", {}, label));
-    section.append(this.state(get(definition, "root"), pinned));
+  definitionSection(label, definition, pinned, source) {
+    const chartID = String(get(definition, "id") || "");
+    const section = el("section", { class: "definition-tree", "data-revision-role": pinned ? "pinned" : "current" },
+      el("h3", {}, label),
+      el("dl", { class: "facts definition-facts" },
+        ...field("Chart", chartID || "—"), ...field("Name", get(definition, "name") || "—"),
+        ...field("Datamodel", get(definition, "datamodel") || "—"),
+        ...field("Data binding", get(definition, "dataBinding") || "early")));
+    if ((get(definition, "data") || []).length) section.append(this.dataDefinitions("Chart data", get(definition, "data")));
+    section.append(this.state(get(definition, "root"), pinned, chartID, true));
+    const sourceValue = source || definition;
+    section.append(el("details", { class: "definition-source" }, el("summary", {}, "Complete definition JSON"),
+      el("pre", { class: "code" }, JSON.stringify(sourceValue, null, 2))));
     return section;
   }
 
-  state(state, pinned) {
+  state(state, pinned, chartID, root = false) {
     if (!state) return el("p", { class: "muted" }, "Unavailable");
     const id = stateID(state);
-    const active = this.active?.has(id);
-    const node = el("div", { class: `state${active ? " active" : ""}` }, el("strong", {}, `${active ? "● active" : "○ inactive"} ${id} [${stateKind(get(state, "kind"))}]`));
+    const transitions = get(state, "transitions") || [];
+    const selected = transitions.some((_, index) => pinned && this._selectedTransitions?.has(`${id}\u0000${index}`));
+    const active = this.active.has(id);
+    const node = el("details", { class: `state state-def${active ? " active" : ""}`, "data-state-id": id,
+      "data-search": JSON.stringify(state).toLocaleLowerCase(), ...(root || active || selected ? { open: "" } : {}) },
+      el("summary", { class: "state-summary" },
+        el("span", { class: "state-status", "aria-label": active ? "active state" : "inactive state" }, active ? "●" : "○"),
+        el("strong", {}, id), el("span", { class: "behavior-meta" }, stateKind(get(state, "kind")))));
+    const body = el("div", { class: "state-body" });
+    if (stateKind(get(state, "kind")) === "history") {
+      body.append(el("p", { class: "behavior-line" }, `History: ${Number(get(state, "history")) === 1 ? "deep" : "shallow"}`));
+    }
+    if (get(state, "initial")) body.append(this.transition(get(state, "initial"), "initial", id, pinned, chartID, true));
+    body.append(this.renderBlocks(get(state, "onEntry"), "Entry actions", chartID));
+    body.append(this.renderBlocks(get(state, "onExit"), "Exit actions", chartID));
     (get(state, "transitions") || []).forEach((transition, index) => {
-      const selected = pinned && this._selectedTransitions?.has(`${id}\u0000${index}`);
-      node.append(el("span", { class: `transition${selected ? " selected" : ""}` },
-        `${selected ? "▶ selected" : "→"} ${(get(transition, "targets") || []).join(", ") || "(internal)"} on ${(get(transition, "events") || []).join(", ") || "always"}`));
+      body.append(this.transition(transition, index, id, pinned, chartID));
     });
-    for (const child of get(state, "children") || []) node.append(this.state(child, pinned));
+    if ((get(state, "data") || []).length) body.append(this.dataDefinitions("State data", get(state, "data")));
+    if ((get(state, "invokes") || []).length) body.append(this.invocations(get(state, "invokes"), chartID));
+    if (get(state, "doneData")) body.append(this.doneData(get(state, "doneData")));
+    const children = get(state, "children") || [];
+    if (children.length) {
+      const childList = el("div", { class: "child-states" }, el("h4", {}, `Child states · ${children.length}`));
+      for (const child of children) childList.append(this.state(child, pinned, chartID));
+      body.append(childList);
+    }
+    node.append(body);
+    node.dataset.search = `${JSON.stringify(state)} ${node.textContent}`.toLocaleLowerCase();
     return node;
+  }
+
+  transition(transition, index, state, pinned, chartID, initial = false) {
+    const key = `${state}\u0000${index}`;
+    const selected = pinned && this._selectedTransitions?.has(key);
+    const events = get(transition, "events") || [];
+    const targets = get(transition, "targets") || [];
+    const type = get(transition, "type") || "external";
+    const trigger = initial ? "initial" : events.length ? `on ${events.join(", ")}` : "eventless";
+    const destination = targets.length ? `→ ${targets.join(", ")}` : "targetless";
+    const node = el("details", { class: `transition${selected ? " selected" : ""}`, "data-transition-key": key,
+      "data-transition-state": state, "data-transition-index": String(index),
+      "data-search": JSON.stringify(transition).toLocaleLowerCase(), ...(selected ? { open: "" } : {}) },
+      el("summary", { tabindex: "-1" }, el("span", { class: "selection-marker" }, selected ? "▶" : "○"),
+        el("strong", {}, trigger), el("span", { class: "behavior-meta" }, `${destination} · ${type}${initial ? "" : ` · ${state}[${index}]`}`)));
+    const body = el("div", { class: "transition-body" });
+    if (get(transition, "condition")) body.append(this.expression("Condition", get(transition, "condition")));
+    body.append(this.renderBlocks(get(transition, "actions"), "Actions", chartID));
+    if (!body.children.length) body.append(el("p", { class: "muted" }, "No condition or actions."));
+    node.append(body);
+    node.dataset.search = `${JSON.stringify(transition)} ${node.textContent}`.toLocaleLowerCase();
+    return node;
+  }
+
+  renderBlocks(blocks, label, chartID) {
+    if (!(blocks || []).length) return document.createDocumentFragment();
+    const group = el("div", { class: "behavior-group" }, el("h4", {}, label));
+    blocks.forEach((block, blockIndex) => {
+      const list = el("ol", { class: "action-list", ...(blocks.length > 1 ? { "aria-label": `${label} block ${blockIndex + 1}` } : {}) });
+      for (const action of block || []) list.append(el("li", {}, this.executable(action, chartID)));
+      if (!list.children.length) list.append(el("li", { class: "muted" }, "Empty block"));
+      group.append(list);
+    });
+    group.dataset.search = group.textContent.toLocaleLowerCase();
+    return group;
+  }
+
+  executable(action, chartID) {
+    const kind = String(get(action, "kind") || "unknown");
+    const value = get(action, kind);
+    if (kind === "call") {
+      const fn = get(value, "function") || {};
+      const fullName = String(get(fn, "name") || "(unnamed)");
+      const name = chartID && fullName.startsWith(`${chartID}.`) ? fullName.slice(chartID.length + 1) : fullName;
+      const version = get(fn, "version");
+      const node = el("div", { class: "action call", title: fullName }, el("strong", {}, `call ${name}${version ? `@${version}` : ""}`));
+      const args = get(fn, "args") || [];
+      args.forEach((argument, index) => node.append(this.expression(`Argument ${index + 1}`, argument)));
+      return node;
+    }
+    if (kind === "raise") {
+      const node = this.actionDetails(`raise ${get(value, "event") || "dynamic event"}`, kind);
+      this.appendExpressions(node, value, [["eventExpr", "Event"], ["data", "Data"]]);
+      return node;
+    }
+    if (kind === "send") {
+      const event = get(value, "event") || "dynamic event";
+      const target = get(value, "target") || (get(value, "targetExpr") ? "dynamic target" : "default target");
+      const node = this.actionDetails(`send ${event} → ${target}`, kind);
+      for (const [name, label] of [["type", "Processor"], ["id", "Send ID"], ["delay", "Delay"]]) {
+        if (get(value, name)) node.append(el("p", { class: "behavior-line" }, `${label}: ${get(value, name)}`));
+      }
+      this.appendExpressions(node, value, [["eventExpr", "Event"], ["targetExpr", "Target"], ["typeExpr", "Processor"],
+        ["idLocation", "ID location"], ["delayExpr", "Delay"], ["content", "Content"]]);
+      if ((get(value, "params") || []).length) node.append(this.params(get(value, "params")));
+      return node;
+    }
+    if (kind === "cancel") {
+      const node = this.actionDetails(`cancel ${get(value, "sendID") || "dynamic send"}`, kind);
+      this.appendExpressions(node, value, [["sendIDExpr", "Send ID"]]);
+      return node;
+    }
+    if (kind === "log") {
+      const node = this.actionDetails(`log${get(value, "label") ? ` ${get(value, "label")}` : ""}`, kind);
+      this.appendExpressions(node, value, [["labelExpr", "Label"], ["expr", "Value"]]);
+      return node;
+    }
+    if (kind === "assign") {
+      const node = this.actionDetails("assign", kind);
+      this.appendExpressions(node, value, [["location", "Location"], ["expr", "Value"]]);
+      return node;
+    }
+    if (kind === "choose") {
+      const branches = get(value, "branches") || [];
+      const node = this.actionDetails(`choose · ${branches.length} branch${branches.length === 1 ? "" : "es"}`, kind);
+      branches.forEach((branch, index) => {
+        const branchNode = el("details", { class: "action-branch" }, el("summary", {}, `Branch ${index + 1}`),
+          this.expression("Condition", get(branch, "condition")), this.renderBlocks(get(branch, "actions"), "Actions", chartID));
+        node.append(branchNode);
+      });
+      if ((get(value, "else") || []).length) node.append(el("div", { class: "action-branch" }, el("strong", {}, "Else"), this.renderBlocks(get(value, "else"), "Actions", chartID)));
+      return node;
+    }
+    if (kind === "foreach") {
+      const item = get(value, "item") || "item";
+      const index = get(value, "index");
+      const node = this.actionDetails(`foreach ${item}${index ? `, ${index}` : ""}`, kind);
+      node.append(this.expression("Array", get(value, "array")), this.renderBlocks(get(value, "actions"), "Actions", chartID));
+      return node;
+    }
+    if (kind === "script") {
+      const node = this.actionDetails("script", kind);
+      node.append(this.expression("Script", get(value, "expr")));
+      return node;
+    }
+    if (kind === "extension") {
+      const node = this.actionDetails(`extension ${get(value, "namespace") || "?"}:${get(value, "name") || "?"}`, kind);
+      const data = document.createElement("canonical-value");
+      data.value = get(value, "data");
+      node.append(data);
+      return node;
+    }
+    return el("details", { class: `action ${kind}` }, el("summary", {}, kind), el("pre", { class: "code" }, JSON.stringify(action, null, 2)));
+  }
+
+  actionDetails(summary, kind) {
+    return el("details", { class: `action ${kind}` }, el("summary", {}, summary));
+  }
+
+  appendExpressions(node, object, fields) {
+    for (const [name, label] of fields) if (get(object, name)) node.append(this.expression(label, get(object, name)));
+  }
+
+  expression(label, expression) {
+    if (!expression) return el("span", { class: "muted" }, `${label}: —`);
+    const kind = get(expression, "kind") || "unknown";
+    const data = get(expression, "data");
+    const scalar = ["string", "number", "bool"].includes(get(data, "kind")) ? ` · ${get(data, get(data, "kind"))}` : "";
+    const canonical = document.createElement("canonical-value");
+    canonical.value = data;
+    return el("details", { class: "expression" }, el("summary", {}, `${label}: ${kind}${scalar}`), canonical);
+  }
+
+  params(values) {
+    const group = el("div", { class: "behavior-group" }, el("h5", {}, "Parameters"));
+    for (const parameter of values || []) {
+      const row = el("div", { class: "parameter" }, el("strong", {}, get(parameter, "name") || "(unnamed)"));
+      if (get(parameter, "expr")) row.append(this.expression("Value", get(parameter, "expr")));
+      if (get(parameter, "location")) row.append(this.expression("Location", get(parameter, "location")));
+      group.append(row);
+    }
+    return group;
+  }
+
+  dataDefinitions(label, values) {
+    const group = el("details", { class: "state-behavior" }, el("summary", {}, `${label} · ${values.length}`));
+    for (const definition of values) {
+      const row = el("div", { class: "data-definition" }, el("strong", {}, get(definition, "id") || "(unnamed)"));
+      if (get(definition, "source")) row.append(el("span", { class: "behavior-meta" }, `source ${get(definition, "source")}`));
+      if (get(definition, "expr")) row.append(this.expression("Initial value", get(definition, "expr")));
+      if (get(definition, "content")) row.append(this.expression("Content", get(definition, "content")));
+      group.append(row);
+    }
+    group.dataset.search = group.textContent.toLocaleLowerCase();
+    return group;
+  }
+
+  invocations(values, chartID) {
+    const group = el("details", { class: "state-behavior" }, el("summary", {}, `Invocations · ${values.length}`));
+    values.forEach((invoke, index) => {
+      const identity = get(invoke, "id") || get(invoke, "definitionId") || get(invoke, "src") || `Invocation ${index + 1}`;
+      const node = el("details", { class: "invocation" }, el("summary", {}, identity));
+      for (const [name, label] of [["definitionId", "Definition"], ["type", "Type"], ["src", "Source"]]) {
+        if (get(invoke, name)) node.append(el("p", { class: "behavior-line" }, `${label}: ${get(invoke, name)}`));
+      }
+      if (get(invoke, "autoForward")) node.append(el("p", { class: "behavior-line" }, "Autoforward: enabled"));
+      this.appendExpressions(node, invoke, [["idLocation", "ID location"], ["typeExpr", "Type"], ["srcExpr", "Source"], ["content", "Content"]]);
+      if ((get(invoke, "params") || []).length) node.append(this.params(get(invoke, "params")));
+      node.append(this.renderBlocks(get(invoke, "finalize"), "Finalize actions", chartID));
+      group.append(node);
+    });
+    group.dataset.search = group.textContent.toLocaleLowerCase();
+    return group;
+  }
+
+  doneData(value) {
+    const node = el("details", { class: "state-behavior" }, el("summary", {}, "Done data"));
+    if ((get(value, "params") || []).length) node.append(this.params(get(value, "params")));
+    if (get(value, "content")) node.append(this.expression("Content", get(value, "content")));
+    node.dataset.search = node.textContent.toLocaleLowerCase();
+    return node;
+  }
+
+  applySearch(value) {
+    const query = String(value || "").trim().toLocaleLowerCase();
+    let matches = 0;
+    for (const transition of this.querySelectorAll(".transition")) {
+      transition.hidden = Boolean(query) && !transition.dataset.search.includes(query);
+      if (query && !transition.hidden) {
+        matches++;
+        transition.open = true;
+      }
+    }
+    for (const behavior of this.querySelectorAll(".state-body > .behavior-group, .state-body > .state-behavior")) {
+      behavior.hidden = Boolean(query) && !behavior.dataset.search.includes(query);
+    }
+    for (const state of [...this.querySelectorAll(".state-def")].reverse()) {
+      state.hidden = Boolean(query) && !state.dataset.search.includes(query);
+      if (query && !state.hidden) state.open = true;
+    }
+    if (this.searchStatus) this.searchStatus.textContent = query ? `${matches} matching transition${matches === 1 ? "" : "s"}` : "";
+  }
+
+  updateRuntime() {
+    if (!this.isConnected && !this.children.length) return;
+    for (const state of this.querySelectorAll(".state-def")) {
+      const active = this.active.has(state.dataset.stateId);
+      state.classList.toggle("active", active);
+      const marker = state.querySelector(":scope > .state-summary > .state-status");
+      if (marker) {
+        marker.textContent = active ? "●" : "○";
+        marker.setAttribute("aria-label", active ? "active state" : "inactive state");
+      }
+      if (active) state.open = true;
+    }
+    for (const transition of this.querySelectorAll(".transition")) {
+      const selected = transition.closest(".definition-tree")?.dataset.revisionRole === "pinned" && this._selectedTransitions?.has(transition.dataset.transitionKey);
+      transition.classList.toggle("selected", Boolean(selected));
+      const marker = transition.querySelector(":scope > summary > .selection-marker");
+      if (marker) marker.textContent = selected ? "▶" : "○";
+      if (selected) {
+        transition.open = true;
+        for (let parent = transition.parentElement; parent; parent = parent.parentElement) if (parent.matches?.("details.state-def")) parent.open = true;
+      }
+    }
+  }
+
+  focusTransition(state, index) {
+    const transition = [...this.querySelectorAll('.definition-tree[data-revision-role="pinned"] .transition')]
+      .find(node => node.dataset.transitionState === String(state) && node.dataset.transitionIndex === String(index));
+    if (!transition) return false;
+    this.closest("details.disclosure")?.setAttribute("open", "");
+    transition.hidden = false;
+    transition.open = true;
+    for (let parent = transition.parentElement; parent; parent = parent.parentElement) if (parent.matches?.("details.state-def")) parent.open = true;
+    const summary = transition.querySelector(":scope > summary");
+    summary?.focus({ preventScroll: true });
+    (summary || transition).scrollIntoView({ block: "center", behavior: "smooth" });
+    return true;
   }
 }
 customElements.define("definition-view", DefinitionView);
@@ -332,7 +699,8 @@ class EventForm extends HTMLElement {
     this.submitButton = el("button", { type: "submit" }, "Send once");
     this.replaceChildren(el("h2", {}, "Send external event"), this.form = el("form", { onsubmit: event => this.submit(event) },
       el("label", {}, "Event name ", this.name = el("input", { required: "", pattern: "[^\\s]+", "aria-label": "Event name" })),
-      this.editor, this.submitButton, this.message = el("span", { class: "muted", "aria-live": "polite" })));
+      el("fieldset", { class: "event-data" }, el("legend", {}, "Event data"), this.editor),
+      this.submitButton, this.message = el("span", { class: "muted", "aria-live": "polite" })));
   }
 
   async submit(event) {
@@ -364,14 +732,18 @@ class InspectorApp extends HTMLElement {
     this.seenSequences = new Map();
     this.selectionVersion = 0;
     this.systemGeneration = 0;
+    this.connectionGeneration = 0;
+    clearInterval(this.relativeTimer);
+    this.relativeTimer = setInterval(() => this.updateRelativeTimes(), 1000);
     this.render();
     this.loadSystems();
   }
 
   render() {
     this.replaceChildren(el("header", {}, el("h1", {}, "Statechart actor inspector"),
-      el("label", {}, "System ", this.picker = el("select", { "aria-label": "System", onchange: event => this.selectSystem(event.target.value) })),
-      this.connection = el("span", { class: "status", "data-state": "disconnected" }, "stream disconnected")),
+      el("label", { class: "system-picker" }, el("span", {}, "System"), this.picker = el("select", { "aria-label": "System", onchange: event => this.selectSystem(event.target.value) })),
+      this.connection = el("span", { class: "status", role: "status", "aria-live": "polite", "data-state": "disconnected", "data-short": "Disconnected" }, "Stream disconnected"),
+      el("button", { class: "retry-stream", onclick: () => this.connect() }, "Retry stream")),
     el("div", { class: "layout" }, this.directory = document.createElement("actor-directory"),
       this.main = el("main", {}, el("div", { class: "empty" }, "Select an actor to inspect."))));
     this.directory.addEventListener("actor-select", event => this.selectActor(event.detail));
@@ -396,24 +768,33 @@ class InspectorApp extends HTMLElement {
     this.timeline = [];
     this.seenSequences.clear();
     this.eventForm = null;
+    this.definitionView = null;
     clearTimeout(this.refreshTimer);
     clearTimeout(this.directoryTimer);
     this.directory.system = system;
+    this.classList.remove("detail-active");
     this.connect();
     this.main.replaceChildren(el("div", { class: "empty" }, "Select an actor to inspect."));
+  }
+
+  setConnectionStatus(text, state, short) {
+    this.connection.textContent = text;
+    this.connection.dataset.state = state;
+    this.connection.dataset.short = short;
   }
 
   connect() {
     this.source?.close();
     if (!this.system) return;
     const version = this.systemGeneration;
-    this.connection.textContent = "stream connecting";
-    this.connection.dataset.state = "disconnected";
+    const connection = ++this.connectionGeneration;
+    const current = () => version === this.systemGeneration && connection === this.connectionGeneration;
+    this.setConnectionStatus("Stream connecting…", "disconnected", "Connecting…");
     this.source = new EventSource(`v1/stream?${new URLSearchParams({ system: this.system })}`);
-    this.source.onopen = () => { if (version === this.systemGeneration) { this.connection.textContent = "stream connected"; this.connection.dataset.state = "connected"; } };
-    this.source.onerror = () => { if (version === this.systemGeneration) { this.connection.textContent = "stream disconnected — manual refresh available"; this.connection.dataset.state = "disconnected"; } };
-    this.source.addEventListener("gap", event => { if (version === this.systemGeneration) this.onGap(JSON.parse(event.data)); });
-    this.source.addEventListener("observation", event => { if (version === this.systemGeneration) this.onObservation(JSON.parse(event.data)); });
+    this.source.onopen = () => { if (current()) this.setConnectionStatus(`Stream connected · ${new Date().toLocaleTimeString()}`, "connected", "Connected"); };
+    this.source.onerror = () => { if (current()) this.setConnectionStatus("Stream disconnected · data retained", "disconnected", "Disconnected"); };
+    this.source.addEventListener("gap", event => { if (current()) this.onGap(JSON.parse(event.data)); });
+    this.source.addEventListener("observation", event => { if (current()) this.onObservation(JSON.parse(event.data)); });
   }
 
   rememberSequence(record) {
@@ -433,8 +814,7 @@ class InspectorApp extends HTMLElement {
 
   onGap(record) {
     if (!this.actor) {
-      this.connection.textContent = "stream gap — state refresh scheduled";
-      this.connection.dataset.state = "gap";
+      this.setConnectionStatus("Stream gap — state refresh scheduled", "gap", "Stream gap");
       this.scheduleDirectoryRefresh();
       return;
     }
@@ -446,9 +826,9 @@ class InspectorApp extends HTMLElement {
     }
     const reason = get(record, "reason") || "observations lost";
     const dropped = Number(get(record, "dropped") || 0);
-    this.connection.textContent = "stream gap — state refresh scheduled";
-    this.connection.dataset.state = "gap";
-    this.pushTimeline({ class: "gap", sequence: streamSequence, text: `Gap · ${reason}${dropped ? ` · ${dropped} dropped` : ""}` });
+    this.setConnectionStatus("Stream gap — state refresh scheduled", "gap", "Stream gap");
+    this.pushTimeline({ class: "gap", category: "gap", sequence: streamSequence,
+      timestamp: get(record, "timestamp") || new Date().toISOString(), text: `stream gap · ${reason}${dropped ? ` · ${dropped} dropped` : ""}` });
     this.scheduleDirectoryRefresh();
     if (this.actor) this.scheduleRefresh();
   }
@@ -468,9 +848,9 @@ class InspectorApp extends HTMLElement {
       this.latestTrace = macrostep;
       this.latestTraceStreamSequence = streamSequence;
     }
-    const timestamp = get(observation, "timestamp") || get(record, "timestamp") || "unknown time";
-    const sequence = macrostep ? ` · macrostep ${get(macrostep, "sequence") ?? "—"}` : "";
-    this.pushTimeline({ class: "live", sequence: streamSequence, text: `Live · ${kind} · ${timestamp}${sequence}` });
+    const timestamp = get(macrostep, "timestamp") || get(observation, "timestamp") || get(record, "timestamp") || new Date().toISOString();
+    this.pushTimeline({ class: "live", category: observationCategory(kind), sequence: streamSequence, timestamp,
+      text: observationSummary(kind, actor, macrostep), transitions: macrostep ? macrostepTransitionRefs(macrostep) : [] });
     this.scheduleRefresh();
   }
 
@@ -482,6 +862,8 @@ class InspectorApp extends HTMLElement {
     this.timeline = [];
     this.seenSequences.clear();
     this.eventForm = null;
+    this.definitionView = null;
+    this.classList.add("detail-active");
     clearTimeout(this.refreshTimer);
     const version = this.selectionVersion;
     const system = this.system;
@@ -499,7 +881,7 @@ class InspectorApp extends HTMLElement {
         const records = get(page, "records") || [];
         records.sort((a, b) => Number(get(a, "sequence") || 0) - Number(get(b, "sequence") || 0));
         if (get(page, "expired") && !records.some(record => get(record, "kind") === "gap")) {
-          this.pushTimeline({ class: "gap", text: "Gap · retained live observations expired before catch-up" });
+          this.pushTimeline({ class: "gap", category: "gap", timestamp: new Date().toISOString(), text: "stream gap · retained live observations expired before catch-up" });
         }
         for (const record of records) {
           if (get(record, "kind") === "gap") this.onGap(record);
@@ -512,7 +894,7 @@ class InspectorApp extends HTMLElement {
       this.scheduleRefresh();
     } catch (error) {
       if (version === this.selectionVersion && system === this.system && actorID === this.actor) {
-        this.pushTimeline({ class: "gap", text: `Recent lossy trace unavailable · ${error.message}` });
+        this.pushTimeline({ class: "gap", category: "gap", timestamp: new Date().toISOString(), text: `recent lossy trace unavailable · ${error.message}` });
         this.scheduleRefresh();
       }
     }
@@ -524,6 +906,7 @@ class InspectorApp extends HTMLElement {
   }
 
   scheduleRefresh() {
+    if (this.displayPaused) return;
     if (this.refreshTimer) return;
     this.refreshTimer = setTimeout(() => { this.refreshTimer = null; this.refresh(false); }, 300);
   }
@@ -548,7 +931,7 @@ class InspectorApp extends HTMLElement {
     this.refreshVersion = refreshVersion;
     const system = this.system;
     const actorID = this.actor;
-    if (showLoading) this.main.replaceChildren(el("p", {}, "Loading actor…"));
+    if (showLoading && !this.main.querySelector(".detail-shell")) this.main.replaceChildren(el("p", {}, "Loading actor…"));
     const query = new URLSearchParams({ system, id: actorID });
     try {
       const [actor, definition, history] = await Promise.all([
@@ -587,16 +970,45 @@ class InspectorApp extends HTMLElement {
     return [el("h3", {}, label), list];
   }
 
+  timelineItem(item) {
+    const time = el("time", { datetime: item.timestamp, "data-relative-time": item.timestamp }, relativeSeconds(item.timestamp));
+    const row = el("li", { class: item.class }, time, ` · ${item.text}`);
+    if (item.transitions?.length) {
+      row.append(` · ${item.transitions.length === 1 ? "transition" : `${item.transitions.length} transitions:`} `);
+      item.transitions.slice(0, 3).forEach((ref, index) => {
+        if (index) row.append(", ");
+        const key = `${ref.source}\u0000${ref.index}`;
+        row.append(el("button", { type: "button", class: "transition-ref", "data-transition-key": key,
+          "data-transition-state": ref.source, "data-transition-index": String(ref.index),
+          title: `Show transition ${ref.source}[${ref.index}] in the pinned definition`,
+          onclick: () => this.definitionView?.focusTransition(ref.source, ref.index) }, `${ref.source}[${ref.index}]`));
+      });
+      if (item.transitions.length > 3) row.append(", …");
+    } else if (item.category === "macrostep") {
+      row.append(" · no transition");
+    }
+    return row;
+  }
+
+  updateRelativeTimes() {
+    for (const node of this.main?.querySelectorAll("time[data-relative-time]") || []) {
+      node.textContent = relativeSeconds(node.dataset.relativeTime);
+    }
+  }
+
   draw(actor, definition, history) {
     const info = get(actor, "info");
     const live = get(actor, "live");
-    const facts = el("dl", { class: "facts" }, ...field("ID", get(info, "id")), ...field("Address", get(info, "address")),
-      ...field("Kind", get(info, "kind")), ...field("Revision", get(info, "revision")), ...field("Lifecycle", get(info, "lifecycle")),
+    const fullID = String(get(info, "id") ?? "—");
+    const facts = el("dl", { class: "facts" }, ...field("ID", copyableValue(fullID, "actor ID")),
+      ...field("Address", copyableValue(get(info, "address"), "actor address")),
+      ...field("Kind", get(info, "kind")), ...field("Revision", copyableValue(get(info, "revision"), "revision")), ...field("Lifecycle", get(info, "lifecycle")),
       ...field("Residency", get(info, "residency")), ...field("Durable", String(get(info, "durable"))));
     const summary = el("section", {}, el("div", { class: "toolbar" }, el("h2", {}, "Actor summary"),
-      el("button", { onclick: () => { this.directory.load(); this.refresh(); } }, "Refresh")), facts,
+      el("button", { onclick: () => { this.directory.load(); this.refresh(); }, "aria-label": "Refresh selected actor" }, "Refresh actor")), facts,
       el("p", { class: "status", "data-state": get(info, "residency") }, live ? "● Live state available" : `○ ${get(info, "residency") || "not resident"} — live state unavailable`));
-    const detail = el("section", {}, el("h2", {}, "Live actor detail"));
+    summary.classList.add("actor-summary");
+    const detail = el("section", { class: "live-detail" }, el("h2", {}, "Live actor detail"));
     if (live) {
       const configuration = get(live, "configuration") || [];
       detail.append(el("p", {}, `Active configuration: ${configuration.join(", ") || "empty"}`));
@@ -606,30 +1018,56 @@ class InspectorApp extends HTMLElement {
       for (const [key, label] of [["pendingSends", "Pending sends"], ["activeInvokes", "Active invokes"]]) {
         detail.append(el("h3", {}, label), el("pre", { class: "code dense-panel" }, JSON.stringify(get(live, key), null, 2) ?? "—"));
       }
-    } else detail.append(el("p", { class: "muted" }, "Actor is not resident; inspection did not hydrate it."));
+    } else detail.append(el("p", { class: "muted" }, "Live state unavailable: this actor is paged out. Inspection did not hydrate it; durable history is prioritized below."));
 
-    const definitionView = document.createElement("definition-view");
-    definitionView.active = new Set(live ? get(live, "configuration") || [] : []);
-    definitionView.selectedTransitions = this.transitionSet();
-    definitionView.data = definition;
+    if (!this.definitionView) this.definitionView = document.createElement("definition-view");
+    this.definitionView.active = new Set(live ? get(live, "configuration") || [] : []);
+    this.definitionView.selectedTransitions = this.transitionSet();
+    this.definitionView.data = definition;
     const entries = get(history, "entries") || [];
-    const durable = entries.map(entry => {
+    const durable = entries.slice().reverse().map(entry => {
       const event = get(entry, "event") || {};
       const data = document.createElement("canonical-value");
       data.value = get(event, "data");
+      const timestamp = get(entry, "timestamp");
+      const eventName = get(event, "name");
+      const eventSummary = eventName ? `${eventName} [${eventTypeName(get(event, "type"))}]` : get(entry, "kind") === "session_started" ? "session started" : "(no event)";
       return el("li", { class: "durable" },
-        el("strong", {}, `Persisted · seq ${get(entry, "seq")} · ${get(entry, "kind")} · ${get(entry, "timestamp")}`),
-        el("div", {}, `Event: ${get(event, "name") || "—"}`), data);
+        el("time", { datetime: timestamp, "data-relative-time": timestamp }, relativeSeconds(timestamp)),
+        ` · ${eventSummary} · persisted ${get(entry, "kind")} #${get(entry, "seq")}`,
+        data);
     });
-    const timeline = el("section", {}, el("h2", {}, "Timeline"),
+    const filteredTimeline = this.timeline.filter(item => item.class === "gap" || !this.timelineFilter || this.timelineFilter === "all" || item.category === this.timelineFilter);
+    if (!durable.length) durable.push(el("li", { class: "empty-state" }, "No persisted history"));
+    const liveItems = filteredTimeline.slice().reverse().map(item => this.timelineItem(item));
+    if (!liveItems.length) liveItems.push(el("li", { class: "empty-state" }, "No live observations yet"));
+    const timeline = el("section", { class: "timeline-panel" }, el("div", { class: "toolbar" }, el("h2", {}, "Activity"),
+      el("button", { onclick: () => { this.displayPaused = !this.displayPaused; this.draw(actor, definition, history); if (!this.displayPaused) this.refresh(); } }, this.displayPaused ? "Resume live display" : "Pause live display"),
+      el("select", { "aria-label": "Timeline event kind", onchange: event => { this.timelineFilter = event.target.value; this.draw(actor, definition, history); } },
+        ...["all", "macrostep", "residency", "lifecycle", "gap"].map(value => el("option", { value, ...(value === (this.timelineFilter || "all") ? { selected: "" } : {}) }, value === "all" ? "All event kinds" : value)))),
       el("p", { class: "muted" }, `Durable persisted history is separate from the newest ${TIMELINE_LIMIT} lossy live observations and gap markers.`),
       el("h3", {}, "Durable history"), el("ul", { class: "timeline durable-history" }, ...durable),
-      el("h3", {}, "Lossy live trace"), el("ul", { class: "timeline live-history" }, ...this.timeline.map(item => el("li", { class: item.class }, item.text))));
+      el("h3", {}, "Lossy live trace"), el("ul", { class: "timeline live-history" }, ...liveItems));
     if (!this.eventForm) this.eventForm = document.createElement("event-form");
     this.eventForm.target = { system: this.system, id: this.actor };
-    this.main.replaceChildren(summary, el("div", { class: "grid" }, detail, definitionView), timeline, this.eventForm);
+    const back = el("button", { class: "back", onclick: () => this.classList.remove("detail-active") }, "← Back to actors");
+    const shell = this.main.querySelector(".detail-shell");
+    if (shell && shell.contains(this.eventForm)) {
+      // Replace display panels individually while leaving the recursive event
+      // editor attached. This preserves draft DOM, focus and caret while every
+      // other panel continues to catch up during live traffic.
+      shell.querySelector(".detail-toolbar")?.replaceWith(el("div", { class: "detail-toolbar" }, back));
+      shell.querySelector("section.actor-summary")?.replaceWith(summary);
+      shell.querySelector("section.timeline-panel")?.replaceWith(timeline);
+      shell.querySelector("details.disclosure .live-detail")?.replaceWith(detail);
+    } else {
+      const progressive = el("details", { class: "disclosure" }, el("summary", {}, "Datamodel, queues, and definition"),
+        el("div", { class: "inspection-grid" }, this.definitionView, detail));
+      this.main.replaceChildren(el("div", { class: "detail-shell" }, el("div", { class: "detail-toolbar" }, back), summary,
+        this.eventForm, timeline, progressive));
+    }
   }
 
-  disconnectedCallback() { this.source?.close(); clearTimeout(this.refreshTimer); clearTimeout(this.directoryTimer); }
+  disconnectedCallback() { this.source?.close(); clearTimeout(this.refreshTimer); clearTimeout(this.directoryTimer); clearInterval(this.relativeTimer); }
 }
 customElements.define("inspector-app", InspectorApp);
