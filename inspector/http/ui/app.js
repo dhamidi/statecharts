@@ -1,6 +1,7 @@
 const TIMELINE_LIMIT = 200;
 const RECENT_PAGE_LIMIT = 1000;
 const SEEN_SEQUENCE_LIMIT = 1000;
+let eventSuggestionSequence = 0;
 
 const el = (tag, attrs = {}, ...children) => {
   const node = document.createElement(tag);
@@ -123,6 +124,22 @@ export function stateID(state) {
 
 const stateKind = value => ["atomic", "compound", "parallel", "final", "history"][Number(value)] || String(value ?? "unknown");
 
+export function understoodEvents(definition) {
+  const names = new Set();
+  const visit = state => {
+    if (!state) return;
+    for (const transition of get(state, "transitions") || []) {
+      for (const descriptor of get(transition, "events") || []) {
+        const name = String(descriptor).trim();
+        if (name && !name.includes("*")) names.add(name);
+      }
+    }
+    for (const child of get(state, "children") || []) visit(child);
+  };
+  visit(get(definition, "root"));
+  return [...names].sort((left, right) => left.localeCompare(right));
+}
+
 class CanonicalValue extends HTMLElement {
   set value(value) {
     this._value = value;
@@ -175,6 +192,7 @@ class ValueEditor extends HTMLElement {
 
   child(value, update) {
     const child = document.createElement("value-editor");
+    child.setAttribute("data-nested", "");
     child.value = value;
     child.addEventListener("value-change", () => {
       // A render can detach an entire recursive editor tree. Events already
@@ -187,38 +205,49 @@ class ValueEditor extends HTMLElement {
   render() {
     this.replaceChildren();
     const value = this._value;
+    const nested = this.hasAttribute("data-nested");
     const kinds = ["null", "bool", "number", "string", "list", "map", "tagged"];
     const kind = el("select", {
+      class: "payload-kind",
       "aria-label": "Payload type",
       onchange: event => { this.value = canonicalValue(event.target.value); this.changed(); },
     }, ...kinds.map(name => el("option", { value: name, ...(name === value.kind ? { selected: "" } : {}) }, name)));
-    const row = el("div", { class: "row payload-row" }, el("label", {}, el("span", {}, "Payload type"), kind));
+    const row = el("div", { class: "payload-row" }, nested ? kind : el("label", { class: "payload-type-label" }, el("span", {}, "Type"), kind));
 
     if (value.kind === "bool") {
-      row.append(el("select", { "aria-label": "Boolean value", onchange: event => { value.bool = event.target.value === "true"; this.changed(); } },
+      row.append(el("select", { class: "payload-value", "aria-label": "Boolean value", onchange: event => { value.bool = event.target.value === "true"; this.changed(); } },
         el("option", { value: "false" }, "false"),
         el("option", { value: "true", ...(value.bool ? { selected: "" } : {}) }, "true")));
     }
     if (value.kind === "number" || value.kind === "string") {
-      row.append(el("input", { value: value[value.kind] ?? "", "aria-label": `${value.kind} value`, oninput: event => { value[value.kind] = event.target.value; this.changed(); } }));
+      row.append(el("input", { class: "payload-value", value: value[value.kind] ?? "", placeholder: value.kind === "number" ? "0" : "Value", "aria-label": `${value.kind} value`, oninput: event => { value[value.kind] = event.target.value; this.changed(); } }));
     }
     if (value.kind === "tagged") {
-      row.append(el("input", { value: value.tag || "", placeholder: "tag", "aria-label": "Payload tag", oninput: event => { value.tag = event.target.value; this.changed(); } }));
+      row.append(el("input", { class: "payload-value", value: value.tag || "", placeholder: "Application tag", "aria-label": "Payload tag", oninput: event => { value.tag = event.target.value; this.changed(); } }));
     }
+    if (value.kind === "null" && !nested) row.append(el("span", { class: "null-hint" }, "No event data"));
 
     const box = el("div", { class: "value-editor" }, row);
     this.append(box);
     if (value.kind === "list") {
-      value.list.forEach((item, index) => box.append(el("div", { class: "value-entry" },
+      const collection = el("div", { class: "collection list-collection" },
+        el("div", { class: "collection-columns list-columns", "aria-hidden": "true" }, el("span", {}, "#"), el("span", {}, "Type and value"), el("span")));
+      value.list.forEach((item, index) => collection.append(el("div", { class: "value-entry" }, el("span", { class: "item-index" }, index + 1),
         this.child(item, next => { value.list[index] = next; this.changed(); }),
-        el("button", { type: "button", onclick: () => { value.list.splice(index, 1); this.render(); this.changed(); } }, "Remove"))));
-      box.append(el("button", { type: "button", onclick: () => { value.list.push(canonicalValue()); this.render(); this.changed(); } }, "Add list item"));
+        el("button", { class: "remove-entry", type: "button", title: "Remove item", "aria-label": `Remove list item ${index + 1}`, onclick: () => { value.list.splice(index, 1); this.render(); this.changed(); } }, "×"))));
+      if (!value.list.length) collection.append(el("p", { class: "collection-empty" }, "No items yet."));
+      collection.append(el("button", { class: "collection-add", type: "button", onclick: () => { value.list.push(canonicalValue()); this.render(); this.changed(); } }, "+ Add item"));
+      box.append(collection);
     }
     if (value.kind === "map") this.renderMap(box, value.map);
-    if (value.kind === "tagged") box.append(this.child(value.payload, next => { value.payload = next; this.changed(); }));
+    if (value.kind === "tagged") box.append(el("div", { class: "tagged-payload" },
+      el("span", { class: "nested-label" }, "Tagged value"),
+      this.child(value.payload, next => { value.payload = next; this.changed(); })));
   }
 
   renderMap(box, map) {
+    const collection = el("div", { class: "collection map-collection" },
+      el("div", { class: "collection-columns map-columns", "aria-hidden": "true" }, el("span", {}, "Key"), el("span", {}, "Type and value"), el("span")));
     for (const [key, item] of Object.entries(map)) {
       const errorID = `map-error-${Math.random().toString(36).slice(2)}`;
       const message = el("span", { class: "map-error", id: errorID });
@@ -248,17 +277,19 @@ class ValueEditor extends HTMLElement {
         this.render();
         this.changed();
       });
-      box.append(el("div", { class: "map-entry" }, keyInput, child,
-        el("button", { type: "button", "aria-label": `Remove map entry “${key}”`, onclick: () => { delete map[key]; this.render(); this.changed(); } }, "Remove"), message));
+      collection.append(el("div", { class: "map-entry" }, keyInput, child,
+        el("button", { class: "remove-entry", type: "button", title: "Remove field", "aria-label": `Remove map entry “${key}”`, onclick: () => { delete map[key]; this.render(); this.changed(); } }, "×"), message));
     }
-    box.append(el("button", { type: "button", onclick: () => {
+    if (!Object.keys(map).length) collection.append(el("p", { class: "collection-empty" }, "No fields yet."));
+    collection.append(el("button", { class: "collection-add", type: "button", onclick: () => {
       let key = "key";
       let suffix = 2;
       while (Object.hasOwn(map, key)) key = `key${suffix++}`;
       Object.defineProperty(map, key, { value: canonicalValue(), writable: true, configurable: true, enumerable: true });
       this.render();
       this.changed();
-    } }, "Add map entry"));
+    } }, "+ Add field"));
+    box.append(collection);
   }
 }
 customElements.define("value-editor", ValueEditor);
@@ -289,7 +320,7 @@ class ActorDirectory extends HTMLElement {
   render() {
     this.replaceChildren(el("aside", {},
       el("div", { class: "directory-heading toolbar" }, el("h2", {}, "Actors"),
-        el("button", { onclick: () => { this.cursor = ""; this.load(); }, "aria-label": "Refresh actor directory" }, "Refresh directory")),
+        el("button", { class: "quiet-action", onclick: () => { this.cursor = ""; this.load(); }, "aria-label": "Refresh actor directory" }, "Refresh")),
       el("form", { class: "filters", onsubmit: event => { event.preventDefault(); this.cursor = ""; this.load(); } },
         this.input("prefix", "Actor ID", "Actor ID prefix"),
         el("details", { class: "filter-disclosure" }, el("summary", {}, "More filters"),
@@ -299,7 +330,7 @@ class ActorDirectory extends HTMLElement {
         el("button", { type: "submit" }, "Apply filters")),
       this.message = el("p", { class: "muted" }, "Choose a system."),
       this.list = el("ul", { class: "directory" }),
-      this.more = el("button", { onclick: () => this.load(true), disabled: "" }, "Load more")));
+      this.more = el("button", { class: "load-more", onclick: () => this.load(true), disabled: "" }, "Load more")));
   }
 
   input(name, label, placeholder) {
@@ -331,18 +362,21 @@ class ActorDirectory extends HTMLElement {
         const id = String(get(actor, "id"));
         if (present.has(id)) continue;
         present.add(id);
+        const residency = get(actor, "residency") || "unknown";
         const button = el("button", { title: id, "aria-current": String(id === this.selected), onclick: () => {
           this.selected = id;
           this.dispatchEvent(new CustomEvent("actor-select", { detail: id, bubbles: true }));
           this.loadSelection();
-        } }, el("strong", { class: "actor-id" }, compact(id)),
-        el("span", { class: "actor-meta" }, `${get(actor, "kind") || "unknown"} · ${get(actor, "residency") || "unknown"}`));
+        } }, el("span", { class: "actor-primary" }, el("strong", { class: "actor-id" }, compact(id)),
+          el("span", { class: "actor-state", "data-state": residency }, residency)),
+        el("span", { class: "actor-meta" }, `${get(actor, "kind") || "unknown"}${get(actor, "durable") ? " · durable" : ""}`));
         button.dataset.actorId = id;
         this.list.append(el("li", {}, button));
       }
       this.cursor = get(page, "next") || get(page, "nextCursor") || "";
       this.more.toggleAttribute("disabled", !this.cursor);
-      this.message.textContent = items.length ? `${this.list.children.length} actor(s)` : "No actors match.";
+      const count = this.list.children.length;
+      this.message.textContent = items.length ? `${count} ${count === 1 ? "actor" : "actors"}` : "No actors match.";
     } catch (error) {
       if (generation !== this.requestGeneration || system !== this.system) return;
       this.message.textContent = error.message;
@@ -575,6 +609,22 @@ class DefinitionView extends HTMLElement {
     return el("details", { class: "expression" }, el("summary", {}, `${label}: ${kind}${scalar}`), canonical);
   }
 
+  dataExpression(label, expression) {
+    if (!expression) return el("span", { class: "muted" }, "—");
+    const kind = get(expression, "kind") || "unknown";
+    const data = get(expression, "data");
+    const dataKind = get(data, "kind");
+    if (["null", "bool", "number", "string"].includes(dataKind)) {
+      const scalar = dataKind === "null" ? "null" : String(get(data, dataKind));
+      return el("span", { class: "data-expression", title: `${label}: ${kind}` },
+        el("span", { class: "expression-kind" }, kind), el("code", { class: "data-scalar" }, scalar));
+    }
+    const canonical = document.createElement("canonical-value");
+    canonical.value = data;
+    return el("details", { class: "data-expression" },
+      el("summary", {}, el("span", { class: "expression-kind" }, kind), el("span", { class: "data-scalar" }, dataKind || "value")), canonical);
+  }
+
   params(values) {
     const group = el("div", { class: "behavior-group" }, el("h5", {}, "Parameters"));
     for (const parameter of values || []) {
@@ -587,14 +637,21 @@ class DefinitionView extends HTMLElement {
   }
 
   dataDefinitions(label, values) {
-    const group = el("details", { class: "state-behavior" }, el("summary", {}, `${label} · ${values.length}`));
+    const group = el("details", { class: "state-behavior data-definitions" },
+      el("summary", {}, el("span", {}, label), el("span", { class: "data-count" }, values.length)));
+    const table = el("div", { class: "data-table", role: "table", "aria-label": label },
+      el("div", { class: "data-table-header", role: "row" },
+        el("span", { role: "columnheader" }, "Variable"), el("span", { role: "columnheader" }, "Initial value")));
     for (const definition of values) {
-      const row = el("div", { class: "data-definition" }, el("strong", {}, get(definition, "id") || "(unnamed)"));
-      if (get(definition, "source")) row.append(el("span", { class: "behavior-meta" }, `source ${get(definition, "source")}`));
-      if (get(definition, "expr")) row.append(this.expression("Initial value", get(definition, "expr")));
-      if (get(definition, "content")) row.append(this.expression("Content", get(definition, "content")));
-      group.append(row);
+      const values = el("div", { class: "data-initializers", role: "cell" });
+      if (get(definition, "source")) values.append(el("span", { class: "data-source" }, get(definition, "source")));
+      if (get(definition, "expr")) values.append(this.dataExpression("Initial value", get(definition, "expr")));
+      if (get(definition, "content")) values.append(this.dataExpression("Content", get(definition, "content")));
+      if (!values.children.length) values.append(el("span", { class: "muted" }, "—"));
+      table.append(el("div", { class: "data-definition", role: "row" },
+        el("strong", { class: "data-name", role: "cell" }, get(definition, "id") || "(unnamed)"), values));
     }
+    group.append(table);
     group.dataset.search = group.textContent.toLocaleLowerCase();
     return group;
   }
@@ -689,18 +746,34 @@ class EventForm extends HTMLElement {
   connectedCallback() {
     if (this.form) return;
     this.value = canonicalValue();
+    this.suggestionListID = `inspector-event-names-${++eventSuggestionSequence}`;
     this.render();
   }
   set target(value) { this._target = value; }
+  set suggestions(value) {
+    this._suggestions = [...new Set(value || [])];
+    this.updateSuggestions();
+  }
+
+  updateSuggestions() {
+    if (!this.suggestionList) return;
+    this.suggestionList.replaceChildren(...(this._suggestions || []).map(name => el("option", { value: name })));
+    this.name.placeholder = this._suggestions?.length ? "Choose or enter an event" : "Enter an event name";
+  }
 
   render() {
     this.editor = document.createElement("value-editor");
     this.editor.value = this.value;
     this.submitButton = el("button", { type: "submit" }, "Send once");
-    this.replaceChildren(el("h2", {}, "Send external event"), this.form = el("form", { onsubmit: event => this.submit(event) },
-      el("label", {}, "Event name ", this.name = el("input", { required: "", pattern: "[^\\s]+", "aria-label": "Event name" })),
+    this.suggestionList = el("datalist", { id: this.suggestionListID });
+    this.replaceChildren(el("div", { class: "section-heading" }, el("div", {}, el("p", { class: "eyebrow" }, "Command"),
+      el("h2", {}, "Send external event"))),
+    this.form = el("form", { onsubmit: event => this.submit(event) },
+      el("label", {}, "Event name ", this.name = el("input", { required: "", pattern: "[^\\s]+", list: this.suggestionListID, "aria-label": "Event name" })),
+      this.suggestionList,
       el("fieldset", { class: "event-data" }, el("legend", {}, "Event data"), this.editor),
       this.submitButton, this.message = el("span", { class: "muted", "aria-live": "polite" })));
+    this.updateSuggestions();
   }
 
   async submit(event) {
@@ -740,10 +813,13 @@ class InspectorApp extends HTMLElement {
   }
 
   render() {
-    this.replaceChildren(el("header", {}, el("h1", {}, "Statechart actor inspector"),
-      el("label", { class: "system-picker" }, el("span", {}, "System"), this.picker = el("select", { "aria-label": "System", onchange: event => this.selectSystem(event.target.value) })),
-      this.connection = el("span", { class: "status", role: "status", "aria-live": "polite", "data-state": "disconnected", "data-short": "Disconnected" }, "Stream disconnected"),
-      el("button", { class: "retry-stream", onclick: () => this.connect() }, "Retry stream")),
+    this.replaceChildren(el("header", { class: "app-header" },
+      el("div", { class: "brand" }, el("span", { class: "brand-mark", "aria-hidden": "true" }, "S"),
+        el("div", {}, el("h1", {}, "Inspector"), el("p", {}, "Runtime observability"))),
+      el("div", { class: "header-controls" },
+        el("label", { class: "system-picker" }, el("span", {}, "System"), this.picker = el("select", { "aria-label": "System", onchange: event => this.selectSystem(event.target.value) })),
+        this.connection = el("span", { class: "status", role: "status", "aria-live": "polite", "data-state": "disconnected", "data-short": "Offline" }, "Offline"),
+        el("button", { class: "retry-stream", onclick: () => this.connect() }, "Reconnect"))),
     el("div", { class: "layout" }, this.directory = document.createElement("actor-directory"),
       this.main = el("main", {}, el("div", { class: "empty" }, "Select an actor to inspect."))));
     this.directory.addEventListener("actor-select", event => this.selectActor(event.detail));
@@ -791,8 +867,8 @@ class InspectorApp extends HTMLElement {
     const current = () => version === this.systemGeneration && connection === this.connectionGeneration;
     this.setConnectionStatus("Stream connecting…", "disconnected", "Connecting…");
     this.source = new EventSource(`v1/stream?${new URLSearchParams({ system: this.system })}`);
-    this.source.onopen = () => { if (current()) this.setConnectionStatus(`Stream connected · ${new Date().toLocaleTimeString()}`, "connected", "Connected"); };
-    this.source.onerror = () => { if (current()) this.setConnectionStatus("Stream disconnected · data retained", "disconnected", "Disconnected"); };
+    this.source.onopen = () => { if (current()) this.setConnectionStatus("Live", "connected", "Live"); };
+    this.source.onerror = () => { if (current()) this.setConnectionStatus("Offline · data retained", "disconnected", "Offline"); };
     this.source.addEventListener("gap", event => { if (current()) this.onGap(JSON.parse(event.data)); });
     this.source.addEventListener("observation", event => { if (current()) this.onObservation(JSON.parse(event.data)); });
   }
@@ -1000,14 +1076,24 @@ class InspectorApp extends HTMLElement {
     const info = get(actor, "info");
     const live = get(actor, "live");
     const fullID = String(get(info, "id") ?? "—");
-    const facts = el("dl", { class: "facts" }, ...field("ID", copyableValue(fullID, "actor ID")),
+    const address = String(get(info, "address") ?? "");
+    const facts = el("dl", { class: "facts actor-facts" }, ...field("ID", copyableValue(fullID, "actor ID")),
       ...field("Address", copyableValue(get(info, "address"), "actor address")),
       ...field("Kind", get(info, "kind")), ...field("Revision", copyableValue(get(info, "revision"), "revision")), ...field("Lifecycle", get(info, "lifecycle")),
       ...field("Residency", get(info, "residency")), ...field("Durable", String(get(info, "durable"))));
-    const summary = el("section", {}, el("div", { class: "toolbar" }, el("h2", {}, "Actor summary"),
-      el("button", { onclick: () => { this.directory.load(); this.refresh(); }, "aria-label": "Refresh selected actor" }, "Refresh actor")), facts,
-      el("p", { class: "status", "data-state": get(info, "residency") }, live ? "● Live state available" : `○ ${get(info, "residency") || "not resident"} — live state unavailable`));
-    summary.classList.add("actor-summary");
+    const metadata = el("details", { class: "actor-metadata" }, el("summary", {}, "Identity and revision"), facts);
+    const title = el("div", { class: "actor-title" }, el("p", { class: "eyebrow" }, "Actor"), el("h2", { title: fullID }, fullID));
+    if (address && address !== fullID) title.append(el("p", { class: "actor-address code" }, address));
+    const summary = el("section", { class: "actor-summary" },
+      el("div", { class: "actor-hero" }, title,
+      el("button", { class: "quiet-action", onclick: () => { this.directory.load(); this.refresh(); }, "aria-label": "Refresh selected actor" }, "Refresh")),
+      el("div", { class: "actor-badges" },
+        el("span", { class: "actor-badge primary", "data-state": get(info, "lifecycle") }, get(info, "lifecycle") || "unknown lifecycle"),
+        el("span", { class: "actor-badge", "data-state": get(info, "residency") }, get(info, "residency") || "unknown residency"),
+        el("span", { class: "actor-badge" }, get(info, "kind") || "unknown kind"),
+        el("span", { class: "actor-badge" }, get(info, "durable") ? "durable" : "ephemeral"),
+        el("span", { class: `actor-badge live-indicator${live ? " available" : ""}` }, live ? "live state" : "metadata only")),
+      metadata);
     const detail = el("section", { class: "live-detail" }, el("h2", {}, "Live actor detail"));
     if (live) {
       const configuration = get(live, "configuration") || [];
@@ -1018,7 +1104,7 @@ class InspectorApp extends HTMLElement {
       for (const [key, label] of [["pendingSends", "Pending sends"], ["activeInvokes", "Active invokes"]]) {
         detail.append(el("h3", {}, label), el("pre", { class: "code dense-panel" }, JSON.stringify(get(live, key), null, 2) ?? "—"));
       }
-    } else detail.append(el("p", { class: "muted" }, "Live state unavailable: this actor is paged out. Inspection did not hydrate it; durable history is prioritized below."));
+    } else detail.append(el("p", { class: "muted" }, "Live state is unavailable because inspection does not hydrate paged-out actors. Activate the actor through application traffic to inspect its current datamodel and queues."));
 
     if (!this.definitionView) this.definitionView = document.createElement("definition-view");
     this.definitionView.active = new Set(live ? get(live, "configuration") || [] : []);
@@ -1041,15 +1127,21 @@ class InspectorApp extends HTMLElement {
     if (!durable.length) durable.push(el("li", { class: "empty-state" }, "No persisted history"));
     const liveItems = filteredTimeline.slice().reverse().map(item => this.timelineItem(item));
     if (!liveItems.length) liveItems.push(el("li", { class: "empty-state" }, "No live observations yet"));
-    const timeline = el("section", { class: "timeline-panel" }, el("div", { class: "toolbar" }, el("h2", {}, "Activity"),
-      el("button", { onclick: () => { this.displayPaused = !this.displayPaused; this.draw(actor, definition, history); if (!this.displayPaused) this.refresh(); } }, this.displayPaused ? "Resume live display" : "Pause live display"),
+    const timeline = el("section", { class: "timeline-panel" }, el("div", { class: "section-heading" },
+      el("div", {}, el("p", { class: "eyebrow" }, "Signals"), el("h2", {}, "Activity")),
+      el("div", { class: "timeline-controls" },
+      el("button", { class: "quiet-action", onclick: () => { this.displayPaused = !this.displayPaused; this.draw(actor, definition, history); if (!this.displayPaused) this.refresh(); } }, this.displayPaused ? "Resume" : "Pause"),
       el("select", { "aria-label": "Timeline event kind", onchange: event => { this.timelineFilter = event.target.value; this.draw(actor, definition, history); } },
-        ...["all", "macrostep", "residency", "lifecycle", "gap"].map(value => el("option", { value, ...(value === (this.timelineFilter || "all") ? { selected: "" } : {}) }, value === "all" ? "All event kinds" : value)))),
-      el("p", { class: "muted" }, `Durable persisted history is separate from the newest ${TIMELINE_LIMIT} lossy live observations and gap markers.`),
-      el("h3", {}, "Durable history"), el("ul", { class: "timeline durable-history" }, ...durable),
-      el("h3", {}, "Lossy live trace"), el("ul", { class: "timeline live-history" }, ...liveItems));
+        ...["all", "macrostep", "residency", "lifecycle", "gap"].map(value => el("option", { value, ...(value === (this.timelineFilter || "all") ? { selected: "" } : {}) }, value === "all" ? "All events" : value))))),
+      el("p", { class: "timeline-note muted" }, `Persisted history and the newest ${TIMELINE_LIMIT} lossy live observations are shown separately.`),
+      el("div", { class: "timeline-columns" },
+        el("div", { class: "timeline-column" }, el("div", { class: "column-heading" }, el("h3", {}, "Durable history"), el("span", {}, `${entries.length} ${entries.length === 1 ? "record" : "records"}`)),
+          el("ul", { class: "timeline durable-history" }, ...durable)),
+        el("div", { class: "timeline-column" }, el("div", { class: "column-heading" }, el("h3", {}, "Live trace"), el("span", {}, `${filteredTimeline.length} ${filteredTimeline.length === 1 ? "record" : "records"}`)),
+          el("ul", { class: "timeline live-history" }, ...liveItems))));
     if (!this.eventForm) this.eventForm = document.createElement("event-form");
     this.eventForm.target = { system: this.system, id: this.actor };
+    this.eventForm.suggestions = understoodEvents(get(definition, "pinned"));
     const back = el("button", { class: "back", onclick: () => this.classList.remove("detail-active") }, "← Back to actors");
     const shell = this.main.querySelector(".detail-shell");
     if (shell && shell.contains(this.eventForm)) {
@@ -1061,10 +1153,10 @@ class InspectorApp extends HTMLElement {
       shell.querySelector("section.timeline-panel")?.replaceWith(timeline);
       shell.querySelector("details.disclosure .live-detail")?.replaceWith(detail);
     } else {
-      const progressive = el("details", { class: "disclosure" }, el("summary", {}, "Datamodel, queues, and definition"),
+      const progressive = el("details", { class: "disclosure" }, el("summary", {}, "Definition, datamodel, and queues"),
         el("div", { class: "inspection-grid" }, this.definitionView, detail));
       this.main.replaceChildren(el("div", { class: "detail-shell" }, el("div", { class: "detail-toolbar" }, back), summary,
-        this.eventForm, timeline, progressive));
+        el("div", { class: "operations-grid" }, timeline, this.eventForm), progressive));
     }
   }
 

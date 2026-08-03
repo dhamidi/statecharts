@@ -71,6 +71,25 @@ func TestEmbeddedUIBrowserInteractions(t *testing.T) {
 	waitFor(`document.querySelectorAll('.directory button[data-actor-id="actor"]').length === 1`)
 	browser("click", `button[data-actor-id="actor"]`)
 	waitFor(`document.querySelector('.facts .identifier')?.textContent === 'actor'`)
+	if got := browser("eval", `(() => {
+		const shell = document.querySelector('.detail-shell');
+		const operations = shell?.querySelector('.operations-grid');
+		return shell?.querySelector('.actor-title h2')?.textContent === 'actor' &&
+			shell?.querySelector('.actor-metadata')?.open === false &&
+			operations?.firstElementChild?.classList.contains('timeline-panel') &&
+			operations?.lastElementChild?.tagName === 'EVENT-FORM' &&
+			shell?.querySelector(':scope > .disclosure')?.open === false;
+	})()`); got != "true" {
+		t.Fatalf("actor detail does not prioritize status and activity: %s", got)
+	}
+	if got := browser("eval", `(() => {
+		const input = document.querySelector('event-form input[aria-label="Event name"]');
+		const options = [...document.querySelectorAll('event-form datalist option')].map(option => option.value);
+		return input?.getAttribute('list') && options.length === 1 && options[0] === 'message' &&
+			!document.querySelector('event-form')?.textContent.includes('Never retried');
+	})()`); got != "true" {
+		t.Fatalf("event form does not suggest declared pinned-definition events: %s", got)
+	}
 	waitFor(`document.querySelector('.durable-history .empty-state')?.textContent === 'No persisted history'`)
 	waitFor(`document.querySelector('.transition[data-transition-state="active"][data-transition-index="0"]') !== null`)
 	if got := browser("eval", `(() => {
@@ -113,9 +132,10 @@ func TestEmbeddedUIBrowserInteractions(t *testing.T) {
 			data:[{id:'local',expr:expression}],invokes:[{id:'worker',type:'task',src:'job',params:[{name:'input',expr:expression}],
 				finalize:[[call('fixture.finalize')]]}],doneData:{content:expression},
 			children:[{id:{value:'fixture.shallow'},kind:4,history:0},{id:{value:'fixture.deep'},kind:4,history:1}]};
+		const chartData = [{id:'customer_id',expr:expression},{id:'limits',expr:{kind:'test.expression',data:{version:1,kind:'map',map:{requests:{version:1,kind:'number',number:'10'}}}}}];
 		const view = document.createElement('definition-view');
 		view.id = 'definition-fixture';
-		view.data = {Pinned:{ID:'fixture',Datamodel:'test',Root:state},PinnedRevision:'fixture-v1',CurrentAvailable:false};
+		view.data = {Pinned:{ID:'fixture',Datamodel:'test',Data:chartData,Root:state},PinnedRevision:'fixture-v1',CurrentAvailable:false};
 		document.body.append(view);
 		return true;
 	})()`)
@@ -129,6 +149,18 @@ func TestEmbeddedUIBrowserInteractions(t *testing.T) {
 	browser("click", `#definition-fixture .action.choose > summary`)
 	if got := browser("eval", `document.querySelector('#definition-fixture .action.choose .action-branch')?.textContent.includes('call branch@v3') === true`); got != "true" {
 		t.Fatalf("compound executable content is not inspectable: %s", got)
+	}
+	if got := browser("eval", `(() => {
+		const group = document.querySelector('#definition-fixture .data-definitions');
+		if (!group) return false;
+		group.open = true;
+		const rows = [...group.querySelectorAll('.data-table > .data-definition')];
+		return rows.length === 2 && rows[0].querySelector('.data-expression:not(details)')?.textContent.includes('test.expression') &&
+			rows[0].querySelector('.data-scalar')?.textContent === 'source' &&
+			rows[1].querySelector('details.data-expression canonical-value') &&
+			rows.every(row => row.getBoundingClientRect().height <= 46);
+	})()`); got != "true" {
+		t.Fatalf("chart data is not rendered as compact scalar rows with expandable structured values: %s", got)
 	}
 	if got := browser("eval", `(() => { const view=document.querySelector('#definition-fixture'); const pinned=view._data.Pinned; view.data={Pinned:pinned,PinnedRevision:'fixture-v1',Current:pinned,CurrentRevision:'fixture-v2',CurrentAvailable:true}; return view.querySelectorAll('.definition-tree').length === 2; })()`); got != "true" {
 		t.Fatalf("differing pinned and current revisions are not shown separately: %s", got)
@@ -162,14 +194,26 @@ func TestEmbeddedUIBrowserInteractions(t *testing.T) {
 	browser("eval", `document.querySelector('inspector-app').onGap({Sequence:999,Kind:'gap',Reason:'browser test gap',Dropped:2}); true`)
 	waitFor(`document.querySelector('.live-history .gap')?.textContent.includes('browser test gap') === true`)
 	browser("select", `event-form select[aria-label="Payload type"]`, "map")
-	browser("click", "event-form .value-editor > button")
+	browser("click", "event-form .collection-add")
 	waitFor(`document.querySelector('event-form input[aria-label="Map key"]') !== null`)
+	if got := browser("eval", `(() => {
+		const editor = document.querySelector('event-form .value-editor');
+		const entry = editor?.querySelector('.map-entry');
+		const columns = editor?.querySelector('.collection-columns');
+		return editor?.querySelectorAll('.payload-type-label').length === 1 &&
+			columns?.textContent.includes('Key') && columns?.textContent.includes('Type and value') &&
+			entry?.querySelector(':scope > value-editor select[aria-label="Payload type"]') &&
+			entry?.querySelector('.remove-entry')?.textContent === '×' &&
+			!entry?.textContent.includes('Payload type') && !entry?.textContent.includes('Remove');
+	})()`); got != "true" {
+		t.Fatalf("event payload editor is not a compact key/type/value grid: %s", got)
+	}
 
 	browser("set", "viewport", "390", "844")
 	if got := browser("eval", `document.documentElement.scrollWidth === innerWidth`); got != "true" {
 		t.Fatalf("mobile inspector has document-level horizontal overflow: %s", got)
 	}
-	if got := browser("eval", `[...document.querySelectorAll('button,input,select')].filter(e => e.offsetParent && e.closest('main')).every(e => e.getBoundingClientRect().height >= 44)`); got != "true" {
+	if got := browser("eval", `[...document.querySelectorAll('button,input,select,summary')].filter(e => e.offsetParent && e.closest('main')).every(e => e.getBoundingClientRect().height >= 44)`); got != "true" {
 		t.Fatalf("mobile detail contains undersized controls: %s", got)
 	}
 	browser("click", ".detail-toolbar .back")
