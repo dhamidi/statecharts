@@ -802,10 +802,9 @@ func (s *System) selectDurableActor(ctx context.Context, name, kind statecharts.
 		return metadata, false, nil
 	}
 
-	artifact := current.DefinitionArtifact()
-	if _, err := s.cfg.storage.PutDefinition(ctx, artifact); err != nil {
-		return statecharts.ActorMetadata{}, false, err
-	}
+	// Register or Publish stored current before making it selectable. Do not
+	// restore it here: collection may have won after selection, in which case
+	// BeginActor must reject the stale revision instead of resurrecting it.
 	candidate := statecharts.ActorMetadata{
 		ActorID: name, ChartID: kind, Revision: current.Revision(),
 		SessionID: statecharts.SessionID(name), Durable: true,
