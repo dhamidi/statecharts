@@ -266,6 +266,23 @@ func (w *unwrapResponseWriter) Write(p []byte) (int, error) { return w.writer.Wr
 func (w *unwrapResponseWriter) WriteHeader(status int)      { w.writer.WriteHeader(status) }
 func (w *unwrapResponseWriter) Unwrap() http.ResponseWriter { return w.writer }
 
+func TestSSEWritesBytesBeforeInitialFlush(t *testing.T) {
+	h, _, _ := testHandler(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	r := httptest.NewRequest(http.MethodGet, "/v1/stream?system=test", nil).WithContext(ctx)
+	w := newFlushRecorder()
+	done := make(chan struct{})
+	go func() { h.ServeHTTP(w, r); close(done) }()
+	<-w.flushed
+	if body := w.String(); !strings.HasPrefix(body, ": connected\n\n") {
+		cancel()
+		<-done
+		t.Fatalf("initial SSE flush contained no connection bytes: %q", body)
+	}
+	cancel()
+	<-done
+}
+
 func TestSSECatchupPaginatesAndThenDeliversLive(t *testing.T) {
 	h, system, service := testHandler(t, nil,
 		inspector.WithAuthorizer(inspector.AllowAll()),

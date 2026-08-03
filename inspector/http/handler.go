@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	statecharts "github.com/dhamidi/statecharts"
 	"github.com/dhamidi/statecharts/actors"
@@ -479,6 +480,9 @@ func (h *handler) stream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	controller := http.NewResponseController(w)
 	flush := func() bool { return controller.Flush() == nil }
+	if _, err = io.WriteString(w, ": connected\n\n"); err != nil {
+		return
+	}
 	if !flush() {
 		return
 	}
@@ -546,10 +550,16 @@ func (h *handler) stream(w http.ResponseWriter, r *http.Request) {
 	if !flush() {
 		return
 	}
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-heartbeat.C:
+			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil || !flush() {
+				return
+			}
 		case record, ok := <-sub.C:
 			if !ok {
 				payload, _ := json.Marshal(envelope{Error: &wireError{"stream_closed", "inspector stream closed"}})
